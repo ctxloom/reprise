@@ -1,7 +1,10 @@
 # reprise
 
-**Code duplicate detection.** A *reprise* is a theme that returns in altered
-form — a near-duplicate.
+**Code duplicate detection** for **Rust, Python, TypeScript/TSX, Go, and
+Kotlin**. A *reprise* is a theme that returns in altered form — a near-duplicate.
+reprise finds them across a codebase — renamed, restructured, or reimplemented —
+explains each group as a shared template with marked divergences, and gates
+duplicate drift at PR time.
 
 ## The problem
 
