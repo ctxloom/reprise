@@ -8,6 +8,11 @@ use ignore::overrides::OverrideBuilder;
 use std::path::{Path, PathBuf};
 
 pub fn collect_files(root: &Path, cfg: &Config) -> anyhow::Result<Vec<(PathBuf, Lang)>> {
+    // A missing root must be a hard error (exit 2), not a silent empty scan —
+    // a typo'd CI path would otherwise report a clean green run.
+    if !root.exists() {
+        anyhow::bail!("scan root does not exist: {}", root.display());
+    }
     let mut overrides = OverrideBuilder::new(root);
     // The D8 cache lives under the scan root; never scan it (it's a hidden
     // dir, which the walker already skips — this is belt-and-braces).
