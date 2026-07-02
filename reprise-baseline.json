@@ -5,7 +5,7 @@
       "fingerprint": "051c77341061431649fff08b3e087504",
       "tier": "api-profile",
       "section": "api",
-      "divergence": 0.23859257907642561,
+      "divergence": 0.23895273745103796,
       "members": [
         {
           "file": "src/lang/kotlin.rs",
@@ -29,7 +29,7 @@
       "fingerprint": "53ececcaccccdd7d74a35a2d6df5b8fb",
       "tier": "api-profile",
       "section": "api",
-      "divergence": 0.2277408424477403,
+      "divergence": 0.22823509657164665,
       "members": [
         {
           "file": "src/lang/go.rs",
@@ -53,7 +53,7 @@
       "fingerprint": "53ececcaccccdd7d74a35a2d6df5b8fb",
       "tier": "api-profile",
       "section": "api",
-      "divergence": 0.2277408424477403,
+      "divergence": 0.22823509657164687,
       "members": [
         {
           "file": "src/lang/go.rs",
@@ -77,7 +77,7 @@
       "fingerprint": "826777ffc40086ebd1dbcb70e4b44766",
       "tier": "api-profile",
       "section": "api",
-      "divergence": 0.35751841906274506,
+      "divergence": 0.35776738921997253,
       "members": [
         {
           "file": "src/lang/go.rs",
@@ -101,7 +101,7 @@
       "fingerprint": "d288e318d4c72059436a755541aa3de4",
       "tier": "api-profile",
       "section": "api",
-      "divergence": 0.4449916435981148,
+      "divergence": 0.44406862172918427,
       "members": [
         {
           "file": "src/lang/kotlin.rs",
@@ -125,7 +125,7 @@
       "fingerprint": "e832a4594d728701fd8c4cfe372f6745",
       "tier": "api-profile",
       "section": "api",
-      "divergence": 0.45633989225582305,
+      "divergence": 0.45684069724197196,
       "members": [
         {
           "file": "src/lang/go.rs",
@@ -141,54 +141,6 @@
           "line_span": [
             398,
             430
-          ]
-        }
-      ]
-    },
-    {
-      "fingerprint": "03db62a9cb6ebfc7749b38df29952cc3",
-      "tier": "exact-normalized",
-      "section": "main",
-      "divergence": 0.0,
-      "members": [
-        {
-          "file": "src/lang/rust.rs",
-          "name": "reassign_stmts",
-          "line_span": [
-            423,
-            472
-          ]
-        },
-        {
-          "file": "src/lang/typescript.rs",
-          "name": "reassign_stmts",
-          "line_span": [
-            562,
-            609
-          ]
-        }
-      ]
-    },
-    {
-      "fingerprint": "0862d8430957536fd1f64713db70c557",
-      "tier": "exact-normalized",
-      "section": "main",
-      "divergence": 0.0,
-      "members": [
-        {
-          "file": "src/lang/python.rs",
-          "name": "replace_subscripts",
-          "line_span": [
-            563,
-            574
-          ]
-        },
-        {
-          "file": "src/lang/typescript.rs",
-          "name": "replace_subscripts",
-          "line_span": [
-            706,
-            717
           ]
         }
       ]
@@ -237,30 +189,6 @@
           "line_span": [
             529,
             558
-          ]
-        }
-      ]
-    },
-    {
-      "fingerprint": "0ff13215c566edd60de700733bff9ad3",
-      "tier": "exact-normalized",
-      "section": "main",
-      "divergence": 0.0,
-      "members": [
-        {
-          "file": "src/lang/python.rs",
-          "name": "index_uses_only",
-          "line_span": [
-            553,
-            561
-          ]
-        },
-        {
-          "file": "src/lang/typescript.rs",
-          "name": "index_uses_only",
-          "line_span": [
-            696,
-            704
           ]
         }
       ]
@@ -1003,8 +931,8 @@
           "file": "src/group.rs",
           "name": "build_inline_exact_groups",
           "line_span": [
-            73,
-            82
+            74,
+            83
           ]
         }
       ]
@@ -1076,7 +1004,7 @@
           "name": "scan",
           "line_span": [
             211,
-            283
+            284
           ]
         }
       ]
@@ -1691,8 +1619,8 @@
           "file": "src/api.rs",
           "name": "extract_calls",
           "line_span": [
-            310,
-            312
+            311,
+            313
           ]
         },
         {
@@ -1715,8 +1643,8 @@
           "file": "src/api.rs",
           "name": "extract_calls",
           "line_span": [
-            310,
-            312
+            311,
+            313
           ]
         },
         {
@@ -1859,8 +1787,8 @@
           "file": "src/group.rs",
           "name": "build_inline_exact_groups",
           "line_span": [
-            110,
-            111
+            111,
+            112
           ]
         },
         {
@@ -2027,8 +1955,8 @@
           "file": "src/group.rs",
           "name": "build_inline_exact_groups",
           "line_span": [
-            73,
-            82
+            74,
+            83
           ]
         },
         {
@@ -2507,8 +2435,8 @@
           "file": "src/group.rs",
           "name": "build_inline_exact_groups",
           "line_span": [
-            73,
-            82
+            74,
+            83
           ]
         },
         {
@@ -2659,8 +2587,8 @@
           "file": "src/api.rs",
           "name": "callee_name",
           "line_span": [
-            324,
-            326
+            325,
+            327
           ]
         }
       ]
@@ -2675,8 +2603,8 @@
           "file": "src/api.rs",
           "name": "walk",
           "line_span": [
-            324,
-            326
+            325,
+            327
           ]
         },
         {
@@ -2867,8 +2795,8 @@
           "file": "src/lib.rs",
           "name": "scan",
           "line_span": [
-            419,
-            429
+            433,
+            443
           ]
         },
         {
@@ -3419,8 +3347,8 @@
           "file": "src/api.rs",
           "name": "callee_name",
           "line_span": [
-            324,
-            328
+            325,
+            329
           ]
         },
         {
@@ -4075,8 +4003,8 @@
           "file": "src/group.rs",
           "name": "build_inline_exact_groups",
           "line_span": [
-            110,
-            111
+            111,
+            112
           ]
         }
       ]
@@ -4307,8 +4235,8 @@
           "file": "src/api.rs",
           "name": "callee_name",
           "line_span": [
-            322,
-            326
+            323,
+            327
           ]
         },
         {
@@ -4603,8 +4531,8 @@
           "file": "src/lib.rs",
           "name": "scan",
           "line_span": [
-            421,
-            426
+            435,
+            440
           ]
         }
       ]
@@ -4859,8 +4787,8 @@
           "file": "src/lib.rs",
           "name": "scan",
           "line_span": [
-            419,
-            429
+            433,
+            443
           ]
         },
         {
@@ -5530,30 +5458,6 @@
       ]
     },
     {
-      "fingerprint": "2853a702b27ae0aea0e98d63a8daaaad",
-      "tier": "near-normalized",
-      "section": "main",
-      "divergence": 0.024390243902439025,
-      "members": [
-        {
-          "file": "src/lang/python.rs",
-          "name": "true_node",
-          "line_span": [
-            306,
-            309
-          ]
-        },
-        {
-          "file": "src/lang/typescript.rs",
-          "name": "true_node",
-          "line_span": [
-            269,
-            272
-          ]
-        }
-      ]
-    },
-    {
       "fingerprint": "2d064a4f5f0cbfe2b96f005141b5de57",
       "tier": "near-normalized",
       "section": "main",
@@ -5581,30 +5485,6 @@
           "line_span": [
             300,
             348
-          ]
-        }
-      ]
-    },
-    {
-      "fingerprint": "38c6f02690a05d1b09a3e0605a989ef0",
-      "tier": "near-normalized",
-      "section": "main",
-      "divergence": 0.017241379310344827,
-      "members": [
-        {
-          "file": "src/lang/go.rs",
-          "name": "index_uses_only",
-          "line_span": [
-            498,
-            506
-          ]
-        },
-        {
-          "file": "src/lang/python.rs",
-          "name": "index_uses_only",
-          "line_span": [
-            553,
-            561
           ]
         }
       ]
@@ -5717,30 +5597,6 @@
           "line_span": [
             721,
             755
-          ]
-        }
-      ]
-    },
-    {
-      "fingerprint": "935b2ff83885030d093ff198d94dbf36",
-      "tier": "near-normalized",
-      "section": "main",
-      "divergence": 0.011764705882352941,
-      "members": [
-        {
-          "file": "src/lang/go.rs",
-          "name": "replace_index",
-          "line_span": [
-            508,
-            519
-          ]
-        },
-        {
-          "file": "src/lang/python.rs",
-          "name": "replace_subscripts",
-          "line_span": [
-            563,
-            574
           ]
         }
       ]
@@ -7211,8 +7067,8 @@
           "file": "src/check.rs",
           "name": "parses_hunk_ranges_and_deletions",
           "line_span": [
-            546,
-            553
+            547,
+            554
           ]
         }
       ]

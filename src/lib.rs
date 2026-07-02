@@ -272,6 +272,7 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
                         fingerprint: fingerprint::hex(xxhash_rust::xxh3::xxh3_128(&fp_buf)),
                         token_count: r.len as u32,
                         value: r.len as f64,
+                        note: None,
                         divergence: 0.0,
                         template: None,
                         inline_chain: None,
@@ -322,6 +323,7 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
             fingerprint: fingerprint::hex(xxhash_rust::xxh3::xxh3_128(&fp_buf)),
             token_count: r.template_tokens,
             value: f64::from(r.count - 1) * f64::from(r.template_tokens),
+            note: None,
             divergence: 0.0,
             template: None,
             inline_chain: None,
@@ -345,6 +347,7 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
             fingerprint: fingerprint::hex(ng.template_hash),
             token_count: ng.template_tokens,
             value: group::consolidation_value(&member_refs, ng.template_tokens),
+            note: None,
             divergence: ng.divergence,
             template: Some(ng.template),
             inline_chain: (!ng.inline_chains.is_empty()).then_some(ng.inline_chains),
@@ -394,6 +397,17 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
     for (g, is_test_region) in kept_regions {
         push_policied(g, is_test_region, &mut main, &mut test_groups);
     }
+
+    // Cross-tier membership subsumption (subset groups add nothing).
+    let before = main.len();
+    main = group::dedupe_subset_groups(main);
+    stats.groups_subsumed_subset = before - main.len();
+    stats.regions_substantial = main
+        .iter()
+        .filter(|g| {
+            g.tier == Tier::ExactRegion && g.token_count >= config.report.micro_region_tokens
+        })
+        .count();
 
     rank(&mut main, "g");
     rank(&mut test_groups, "t");

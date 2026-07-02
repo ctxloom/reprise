@@ -303,6 +303,7 @@ pub fn run(
                     fingerprint: e.fingerprint.clone(),
                     token_count: cur.map(|g| g.token_count).unwrap_or(0),
                     value: cur.map(|g| g.value).unwrap_or(0.0),
+                    note: None,
                     divergence: cur.map(|g| g.divergence).unwrap_or(e.divergence),
                     template: cur.and_then(|g| g.template.clone()),
                     inline_chain: None,

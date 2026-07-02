@@ -220,6 +220,7 @@ fn api_groups_for_lang(
             fingerprint: crate::fingerprint::hex(xxhash_rust::xxh3::xxh3_128(&fp_buf)),
             token_count: shared_rare,
             value: min_mass, // IDF-weighted overlap mass (spec §5.7 ranking)
+            note: None,
             divergence: 1.0 - sim,
             template: Some(evidence),
             inline_chain: None,

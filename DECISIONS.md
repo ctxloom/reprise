@@ -743,3 +743,13 @@ User decision. Cargo.toml repository/homepage set; README clone URL set. Initial
 push as a private repository (visibility is the owner's call to flip). Session/tool
 state (.claude/, .ctxloom/, .mcp.json, .codex/) added to .gitignore before the first
 commit so no local agent state ships.
+
+## D36 — Report-quality feedback round (2026-07-02)
+
+User feedback from a real scan (ctxloom/main): (a) cross-tier membership-subset
+groups (an inline-assisted superset alongside its plain-tier subset) now dedupe —
+survivor keeps the larger membership at its own tier, annotated when the dropped
+subset carried a stronger tier (`group::dedupe_subset_groups`, unit-tested with the
+reported shape); (b) the summary line reports `exact-region: N substantial of M`
+using `report.micro_region_tokens` (default 60) so the headline reflects what the
+ranking values instead of the micro-region long tail.

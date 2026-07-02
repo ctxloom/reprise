@@ -227,6 +227,10 @@ impl Default for NormalizeCfg {
 #[serde(default)]
 pub struct ReportCfg {
     pub top: usize,
+    /// Regions below this token count are "micro": still reported/ranked, but
+    /// the summary line counts substantial regions separately so the headline
+    /// number reflects what the ranking actually values.
+    pub micro_region_tokens: u32,
     /// PR mode: minimum tier that fails CI; "none" disables (Phase 3).
     pub fail_on: String,
     /// SARIF `partialFingerprints` source (spec §6.1/§9): "structural" sets our
@@ -240,6 +244,7 @@ impl Default for ReportCfg {
     fn default() -> Self {
         ReportCfg {
             top: 20,
+            micro_region_tokens: 60,
             fail_on: "exact-normalized".into(),
             sarif_fingerprint: "structural".into(),
         }

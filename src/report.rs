@@ -108,6 +108,9 @@ pub struct Group {
     pub token_count: u32,
     /// Estimated consolidation value (spec §6 ranking).
     pub value: f64,
+    /// Cross-group annotations (e.g. "subsumes a 5-member near-normalized group").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
     /// AU divergence ratio; 0 for exact tiers. Similarity = 1 - divergence.
     pub divergence: f64,
     /// Group template as pseudo-source with ⟨hole⟩ markers (near tier), or
@@ -122,6 +125,10 @@ pub struct Group {
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Stats {
+    /// Groups dropped because their member set was a subset of another group's.
+    pub groups_subsumed_subset: usize,
+    /// exact-region findings at/above `report.micro_region_tokens`.
+    pub regions_substantial: usize,
     pub files_scanned: usize,
     pub files_skipped_generated: usize,
     pub units_indexed: usize,
@@ -207,7 +214,15 @@ impl ScanReport {
         } else {
             s.findings_by_tier
                 .iter()
-                .map(|(tier, n)| format!("{tier}: {n}"))
+                .map(|(tier, n)| {
+                    // The region long tail is real but low-value; the headline
+                    // shows what the ranking actually weighs (user feedback).
+                    if tier == "exact-region" && *n > s.regions_substantial {
+                        format!("{tier}: {} substantial of {n}", s.regions_substantial)
+                    } else {
+                        format!("{tier}: {n}")
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(", ")
         };
@@ -316,6 +331,9 @@ fn render_group(out: &mut String, rank: usize, group: &Group) {
         for link in chain {
             out.push_str(&format!("    inline: {link}\n"));
         }
+    }
+    if let Some(note) = &group.note {
+        out.push_str(&format!("    note: {note}\n"));
     }
     if let Some(template) = &group.template {
         render_template_block(out, template, 12);
