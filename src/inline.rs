@@ -529,8 +529,7 @@ fn splice_body(def_idx: usize, args: Vec<NormNode>, ctx: &mut Ctx) -> Vec<NormNo
 
 /// Re-shape a spliced body's trailing bare expression per site kind.
 fn finish_tail(mut stmts: Vec<NormNode>, mode: TailMode, ctx: &Ctx) -> Vec<NormNode> {
-    if stmts.last().is_some_and(|last| !is_statement_like(last)) {
-        let last = stmts.pop().unwrap();
+    if let Some(last) = stmts.pop_if(|last| !is_statement_like(last)) {
         match mode {
             TailMode::Return => stmts.push(ctx.profile.make_return(last)),
             TailMode::Discard => stmts.push(ctx.profile.make_expr_stmt(last)),

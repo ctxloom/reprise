@@ -25,10 +25,12 @@ jobs:
         run: just bench-mutations
 
   release-smoke:
-    name: release build + wild corpus + scan smoke
+    name: release build + wild corpus + dogfood gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the dogfood drift gate diffs against a base ref
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: release build
@@ -40,3 +42,10 @@ jobs:
       # Smoke: the release binary scans its own repo without error (dogfood, spec §3).
       - name: scan smoke
         run: ./target/release/reprise scan .
+      # Full dogfood: reprise gates its own changes. New/worsened duplication
+      # (or an inconsistent update to a baselined group) fails this job.
+      - name: dogfood drift gate (reprise check)
+        run: |
+          if [ -n "${{ github.base_ref }}" ]; then BASE="origin/${{ github.base_ref }}"; else BASE="HEAD~1"; fi
+          if ! git rev-parse -q --verify "$BASE" >/dev/null; then echo "no base ref to diff against; skipping"; exit 0; fi
+          ./target/release/reprise check . --base "$BASE"
