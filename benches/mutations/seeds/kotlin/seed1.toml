@@ -1,0 +1,19 @@
+# Mutation metadata for seed1.kt (DECISIONS.md D6). Only unit-local identifiers
+# are renamed; `mutableListOf`/`add` are external and kept.
+[rename]
+summarizeScores = "collectReport"
+scores = "items"
+threshold = "cutoff"
+summaries = "lines"
+runningTotal = "acc"
+score = "points"
+grade = "band"
+
+[literals]
+"90" = "85"
+"50" = "40"
+"250" = "400"
+'"excellent"' = '"stellar"'
+'"poor"' = '"weak"'
+'"adequate"' = '"fine"'
+'"aggregate"' = '"summary"'

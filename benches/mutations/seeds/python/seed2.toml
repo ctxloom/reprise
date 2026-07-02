@@ -1,0 +1,15 @@
+[rename]
+resolve_endpoint = "make_endpoint"
+raw = "text"
+default_port = "fallback"
+secure = "tls"
+cleaned = "stripped"
+host = "server"
+port = "portno"
+head = "front"
+tail = "back"
+scheme = "proto"
+pieces = "parts"
+
+[literals]
+'"://"' = '"@@"'

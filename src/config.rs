@@ -1,0 +1,270 @@
+//! `reprise.toml` configuration (spec §9). Every key has a default; the tool
+//! must run with zero config.
+
+use serde::Deserialize;
+use std::path::Path;
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct Config {
+    pub scan: ScanCfg,
+    pub thresholds: Thresholds,
+    pub normalize: NormalizeCfg,
+    pub report: ReportCfg,
+    pub tests: TestsCfg,
+    pub retrieval: RetrievalCfg,
+    pub inline: InlineCfg,
+    pub api_profile: ApiProfileCfg,
+    pub baseline: BaselineCfg,
+    pub cache: CacheCfg,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct BaselineCfg {
+    /// Baseline file at the scan root, checked in (spec §2, §9 `[baseline]`).
+    pub file: String,
+    /// inconsistent-update findings + divergence trend on baselined groups
+    /// (spec §6).
+    pub track_drift: bool,
+}
+
+impl Default for BaselineCfg {
+    fn default() -> Self {
+        BaselineCfg {
+            file: "reprise-baseline.json".into(),
+            track_drift: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct CacheCfg {
+    /// Version-keyed per-file cache under `.reprise/cache/` (spec §4, D8/D19).
+    pub enabled: bool,
+}
+
+impl Default for CacheCfg {
+    fn default() -> Self {
+        CacheCfg { enabled: true }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct InlineCfg {
+    /// Best-effort inliner (spec §5.4, §9 `[inline]`).
+    pub enabled: bool,
+    /// Inline only callees at or below this many tokens, approximated on the
+    /// raw body tree (DECISIONS.md D18: post-fold counts under-report the
+    /// spliced mass when the callee folds).
+    pub max_callee_tokens: u32,
+    pub max_depth: u32,
+    /// Skip a call site with more than this many resolution candidates
+    /// (after the same-file → same-dir → repo-wide preference filter).
+    pub max_candidates: usize,
+}
+
+impl Default for InlineCfg {
+    fn default() -> Self {
+        InlineCfg {
+            enabled: true,
+            max_callee_tokens: 120,
+            max_depth: 2,
+            max_candidates: 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ApiProfileCfg {
+    /// api-profile tier (spec §5.7, §9 `[api_profile]`): suspicion-only.
+    pub enabled: bool,
+    /// Weighted-Jaccard threshold; expect to tighten per §7.4(d).
+    pub api_profile_sim: f64,
+    /// Units with fewer distinct rare callees emit no signature.
+    pub api_min_distinct_rare: usize,
+}
+
+impl Default for ApiProfileCfg {
+    fn default() -> Self {
+        ApiProfileCfg {
+            enabled: true,
+            // Spec §9 guessed 0.8 ("expect to tighten"); the §7.4(d) sweep
+            // went the other way: the rare>=3 signature floor carries the
+            // precision, and 0.8 leaves the tier inert (D29, CALIBRATION.md
+            // Phase 4). 0.5/3 measured 55% useful-precision at n=20.
+            api_profile_sim: 0.5,
+            api_min_distinct_rare: 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct TestsCfg {
+    /// Test-code policy (spec §5.1): separate | exclude | normal.
+    pub mode: String,
+}
+
+impl Default for TestsCfg {
+    fn default() -> Self {
+        TestsCfg {
+            mode: "separate".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct RetrievalCfg {
+    /// §5.5.4 landmark pairs — rivalry winner (§7.4b, see CALIBRATION.md;
+    /// hole-context hashes were dropped per the §5.5 rivalry clause).
+    pub landmark_pairs: bool,
+    /// Minimum shared landmark-pair hashes for a candidate. The M3b value of 4
+    /// cost real recall (D27 A/B: serde lost 15/43 pairs); 2 is recall-neutral.
+    pub shared_landmarks_min: usize,
+    /// Pair-event window for hashes with many owners; 0 = unlimited (df_cap
+    /// already bounds the quadratic). The M3b window of 3 cost 30/43 pairs (D27).
+    pub owner_pair_window: usize,
+}
+
+impl Default for RetrievalCfg {
+    fn default() -> Self {
+        RetrievalCfg {
+            landmark_pairs: true,
+            shared_landmarks_min: 2,
+            owner_pair_window: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ScanCfg {
+    /// Globs excluded from scanning, additive to .gitignore.
+    pub exclude: Vec<String>,
+    /// Path globs treated as generated code and skipped (spec §5.1).
+    pub generated_paths: Vec<String>,
+    /// Marker strings in the first 5 lines that flag a file as generated.
+    pub generated_markers: Vec<String>,
+}
+
+impl Default for ScanCfg {
+    fn default() -> Self {
+        ScanCfg {
+            exclude: Vec::new(),
+            generated_paths: vec![
+                "**/generated/**".into(),
+                "*.pb.go".into(),
+                "*_pb2.py".into(),
+            ],
+            generated_markers: vec![
+                "@generated".into(),
+                "DO NOT EDIT".into(),
+                // Go generator convention (`// Code generated by X`) — many
+                // generators omit the "DO NOT EDIT" suffix (M4a).
+                "Code generated by".into(),
+            ],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct Thresholds {
+    /// Post-normalization unit size floor — the single most important
+    /// precision knob (spec §5.1).
+    pub min_unit_tokens: u32,
+    pub min_seq_tokens: u32,
+    pub bag_min_subtree_tokens: u32,
+    pub candidate_sim: f64,
+    pub hole_hash_min_cover: f64,
+    pub histogram_min_votes: u32,
+    pub max_divergence: f64,
+    pub max_holes: u32,
+    pub fold_min_repeats: u32,
+}
+
+impl Default for Thresholds {
+    fn default() -> Self {
+        Thresholds {
+            min_unit_tokens: 40,
+            min_seq_tokens: 30,
+            bag_min_subtree_tokens: 6,
+            candidate_sim: 0.70,
+            hole_hash_min_cover: 0.5,
+            histogram_min_votes: 5,
+            // Spec §9 guessed 0.15; set empirically per §7.4(c) — see
+            // CALIBRATION.md (whole-expression AU holes on realistic
+            // subtree-substitution clones land at ~0.17).
+            max_divergence: 0.18,
+            max_holes: 5,
+            fold_min_repeats: 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct NormalizeCfg {
+    /// Literals whose identity is structural (spec §5.2.5). String literals are
+    /// compared by their inner content, numeric literals by their text.
+    pub literal_keep: Vec<String>,
+}
+
+impl Default for NormalizeCfg {
+    fn default() -> Self {
+        NormalizeCfg {
+            literal_keep: vec!["0".into(), "1".into(), "-1".into(), "".into()],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ReportCfg {
+    pub top: usize,
+    /// PR mode: minimum tier that fails CI; "none" disables (Phase 3).
+    pub fail_on: String,
+    /// SARIF `partialFingerprints` source (spec §6.1/§9): "structural" sets our
+    /// stable structural/template-hash key so an alert survives cosmetic drift
+    /// (recommended); "line" omits it so GitHub falls back to
+    /// `primaryLocationLineHash` (the churn-on-every-edit default).
+    pub sarif_fingerprint: String,
+}
+
+impl Default for ReportCfg {
+    fn default() -> Self {
+        ReportCfg {
+            top: 20,
+            fail_on: "exact-normalized".into(),
+            sarif_fingerprint: "structural".into(),
+        }
+    }
+}
+
+impl Config {
+    /// Load `reprise.toml` from the scan root if present, else defaults.
+    pub fn load(root: &Path) -> anyhow::Result<Config> {
+        let path = root.join("reprise.toml");
+        if path.is_file() {
+            let text = std::fs::read_to_string(&path)?;
+            let config: Config = toml::from_str(&text)?;
+            config.validate()?;
+            Ok(config)
+        } else {
+            Ok(Config::default())
+        }
+    }
+
+    /// Reject invalid enumerated values at load time with the full value list
+    /// (a typo in `fail_on` must not surface only when `check` runs in CI).
+    fn validate(&self) -> anyhow::Result<()> {
+        crate::report::Tier::parse_fail_on(&self.report.fail_on)
+            .map_err(|e| anyhow::anyhow!("reprise.toml [report] fail_on: {e}"))?;
+        Ok(())
+    }
+}

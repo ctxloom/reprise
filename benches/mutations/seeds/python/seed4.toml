@@ -1,0 +1,13 @@
+[rename]
+mix_rounds = "hash_rounds"
+state = "parts"
+seed = "init"
+acc = "h"
+part = "chunk"
+
+[literals]
+"7" = "9"
+"31" = "37"
+"1442695" = "999331"
+"13" = "17"
+"636413" = "777211"

@@ -1,0 +1,20 @@
+
+# ctxloom private working state (synced bundles, session/context, project id)
+*.ctxloom.bak
+.agents/
+.codex/config.toml
+
+
+# Added by cargo
+
+/target
+
+# reprise's own on-disk scan cache (dogfood scans; spec §4, DECISIONS.md D8)
+.reprise/
+
+# local agent/session tool state — never commit
+.claude/
+.ctxloom/
+.codex/
+.mcp.json
+.mcp.json.*

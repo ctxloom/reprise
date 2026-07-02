@@ -1,0 +1,42 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: lint + test + mutation gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: extractions/setup-just@v2
+      # Cache the cargo registry, git deps, and target/ across runs.
+      - uses: Swatinem/rust-cache@v2
+      - run: just lint
+      - run: just test
+      # ── Mutation-recall gate (spec §7.1) ──────────────────────────────
+      # Recall regressions on the synthetic mutation benchmark fail the build.
+      # This is the primary regression metric; keep it a distinct, visible step.
+      - name: mutation-recall gate
+        run: just bench-mutations
+
+  release-smoke:
+    name: release build + wild corpus + scan smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: release build
+        run: cargo build --release
+      # Wild-corpus recall net (DECISIONS.md D6/D31): verbatim real LLM-duplicated
+      # fixtures must still converge at their labelled tiers on the release build.
+      - name: wild-corpus recall
+        run: cargo test --release --test wild
+      # Smoke: the release binary scans its own repo without error (dogfood, spec §3).
+      - name: scan smoke
+        run: ./target/release/reprise scan .

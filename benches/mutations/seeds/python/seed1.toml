@@ -1,0 +1,16 @@
+[rename]
+summarize_scores = "build_report"
+entries = "rows"
+threshold = "cutoff"
+summaries = "lines"
+running_total = "acc"
+label = "tag"
+score = "points"
+grade = "band"
+
+[literals]
+"90" = "85"
+"50" = "40"
+"250" = "400"
+'"excellent"' = '"stellar"'
+'"poor"' = '"weak"'

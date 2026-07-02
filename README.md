@@ -1,0 +1,271 @@
+# reprise
+
+**Duplicate detection for LLM-generated code.** A *reprise* is a theme that
+returns in altered form — a near-duplicate.
+
+## The problem
+
+LLM coding assistants systematically duplicate code within a codebase. GitClear's
+2025 analysis of 211M changed lines (2020–2024) found an **8× increase in
+duplicated code blocks**, with copy/pasted lines exceeding moved (refactored)
+lines for the first time. That study counted only *Type-1* (near-literal) clones.
+The harder, more damaging residue is **divergent duplication**: the assistant
+reimplements an existing helper instead of calling it — with different identifiers,
+a `while` where the original had a `for`, an extra guard clause — and the copies
+then **drift** as a feature is added to one but not the others. That drift is where
+bugs live: Juergens et al. (ICSE 2009) found 52% of clones change inconsistently,
+and roughly every second unintentional inconsistency is a fault.
+
+reprise targets clone Types 1–3 plus the "reimplemented helper" slice of Type-4,
+**within a single codebase**, at repo-scan and PR-check granularity. It is
+**report-only** — it never transforms your code — and it is built to run in CI: its
+flagship finding, `inconsistent-update`, fires at exactly the moment a change
+edits one copy of a known duplicate group but not the others.
+
+Full design and rationale: [`docs/PLAN.md`](docs/PLAN.md) (the authoritative spec).
+Every deviation from it is logged in [`DECISIONS.md`](DECISIONS.md).
+
+## Install
+
+From source (Rust 2024 edition toolchain required):
+
+```sh
+git clone https://github.com/ctxloom/reprise && cd reprise
+cargo build --release        # binary at target/release/reprise
+just install                 # install onto your PATH (cargo install --path .)
+just install-static          # fully static Linux binary (crt-static), then install
+```
+
+crates.io publish is **coming soon** — the crate name was verified free as of
+2026-07-02 but nothing is published yet. Licensed under **BSD-3-Clause**.
+
+## The three commands
+
+reprise runs with **zero configuration**. An optional `reprise.toml` at the scan
+root tunes it — see [`docs/CONFIG.md`](docs/CONFIG.md).
+
+The examples below run against a three-file demo project whose report helpers were
+written by copy-paste-and-edit — the exact pattern reprise exists to catch:
+
+```python
+# src/report_users.py
+def active_user_report(records):
+    lines = []
+    total = 0
+    for record in records:
+        if not record.enabled:
+            continue
+        total += 1
+        lines.append(f"{record.name}: active")
+    lines.append(f"total: {total}")
+    return "\n".join(lines)
+```
+
+`src/report_orders.py` and `src/report_tasks.py` are the same shape with renamed
+variables and a different attribute (`.pending`, `.open`).
+
+### `reprise scan <path>` — full-repo scan
+
+```
+$ reprise scan .
+reprise scan: 3 files, 3 units indexed (0 below floor, 0 parse-degraded, 0 suppressed), inline [0 variants, 0 scc units, 0 ambiguity skips], 0 api signatures, cache [3 hits, 0 misses], findings [near-normalized: 1] in 3ms
+
+#1 [near-normalized] value 128 · 3 members · 64 tokens · similarity 98%
+    ./src/report_orders.py:1-10  pending_order_report
+    ./src/report_tasks.py:1-10  open_task_report
+    ./src/report_users.py:1-10  active_user_report
+    template:
+      fn v0 (v1) {
+        v2 list
+        v3 0
+        while BOOL {
+          if not __has_next (v1) {
+            break_statement
+          }
+          v4 __next (v1)
+          if not v4 ⟨h1⟩ {
+            continue_statement
+          }
+          v3 += 1
+      …
+```
+
+The three functions land in **one** group. The `template:` block is the report's
+primary evidence: it is the shared skeleton rendered as pseudo-source, with `v0…v4`
+for consistently-renamed locals and `⟨h1⟩` marking the one place the three copies
+diverge (the differing attribute). The `for` loops all normalized to the same
+`while`/`break`/`continue` core, which is why the divergence is 2% and not more.
+
+`--format json|sarif|cpd|jscpd` switches output; `--top N` caps the terminal list
+(0 = all); `--verbose` adds the weak-similarity and full test/api sections.
+
+### `reprise baseline <path>` — adopt on a legacy repo
+
+The first scan of any existing codebase will report its pre-existing duplication.
+`baseline` records all current findings, keyed by **stable structural
+fingerprints**, so subsequent `check` runs fail only on *new or worsened*
+duplication — the adoption path that keeps CI green on day one:
+
+```
+$ reprise baseline .
+baseline written: 1 findings (1 main, 0 test, 0 api, 0 weak) to ./reprise-baseline.json
+```
+
+Commit `reprise-baseline.json`. An inline `// reprise:ignore` comment on a unit's
+first line (or directly above it) suppresses that unit from all tiers; suppression
+counts appear in scan stats so they can't silently accumulate.
+
+### `reprise check <path> --base <ref>` — the drift workflow (flagship)
+
+This is what runs in CI on a PR. It diffs against a git ref, and only units the
+diff touched are gated. Its most valuable output is `inconsistent-update`: **you
+edited one member of a known duplicate group and left the others behind.**
+
+Walkthrough — baseline the demo, then add a guard clause to *one* of the three
+report functions (`report_orders.py`), simulating a feature applied to one copy:
+
+```
+$ reprise check . --base HEAD
+reprise check vs HEAD: 1 touched units of 3 indexed; baseline: 1 findings (1 matched, 0 exempt); 0 suppressed; cache [2 hits, 1 misses]; 3ms
+
+#1 [inconsistent-update] FAIL · inconsistent-update · similarity 92%
+    this change touches 1 of 3 members of a duplicate group; 2 member(s) were NOT updated:
+    touched:   src/report_orders.py:1-12  pending_order_report
+    UNTOUCHED: src/report_tasks.py:1-10  open_task_report
+    UNTOUCHED: src/report_users.py:1-10  active_user_report
+    drifting: divergence 0.016 at baseline → 0.077 now
+    template:
+      fn v0 (v1) {
+        ...
+      …
+
+FAIL: 1 finding(s) at or above fail_on exact-normalized
+```
+
+reprise names the two functions a reviewer would otherwise miss, and reports the
+**drift trend** (divergence rose from 0.016 to 0.077 since the baseline). Revert
+the edit — or apply the guard to all three — and `check` exits 0.
+
+Exit codes: **0** clean · **1** findings at or above `--fail-on` · **2** usage or
+runtime error. `--fail-on <tier>` (or `[report] fail_on`) sets the gate; `none`
+disables it.
+
+## Tier taxonomy
+
+Findings are labelled by tier, in descending confidence — this is also the CI-gate
+order (`fail_on = <tier>` fails on that tier and every stronger one). `api-profile`
+and `weak-similarity` **never** fail CI regardless of `fail_on`.
+
+| Tier | Clone type | One-line meaning |
+|---|---|---|
+| `inconsistent-update` | drift | A diff touched some but not all members of a baselined group — the untouched copies may need the same change (`check` mode only). |
+| `exact-normalized` | Type-1/2 | Whole functions identical after normalization (renames, literals, formatting, loop form all folded away). |
+| `internal-repeat` | intra-function | One function contains ≥3 near-identical statement groups — extract a loop or helper. |
+| `exact-region` | Type-2 sub-unit | An exact normalized run shared across units below whole-function scope. |
+| `near-normalized` | Type-3 | Near-miss: members share an anti-unification template with a bounded number of factorable holes. |
+| `inline-assisted` | Type-4 (helper) | Match found only after inlining a called helper — an existing helper reimplemented inline. |
+| `api-profile` | Type-4 (suspicion) | Two functions call the same rare helpers in similar contexts — same task, likely reimplemented. Suspicion-only; never fails CI. |
+| `weak-similarity` | — | Near-miss over the hole budget or with non-factorable holes; shown only with `--verbose`, never fails CI. |
+
+## Supported languages
+
+Rust, Python, TypeScript (including TSX), Go, and Kotlin. Matching is
+**same-language only** — a Python unit is never compared against a Rust one — so
+multi-language repos scan cleanly with each language partitioned independently.
+
+## Output formats
+
+| `--format` | Use |
+|---|---|
+| `terminal` (default) | Human-readable ranked report with templates. |
+| `json` | The full report model, for tooling. |
+| `sarif` | SARIF 2.1.0 for GitHub code-scanning and other consumers. |
+| `cpd` | PMD/CPD-XML — drop into an existing CPD pipeline. |
+| `jscpd` | jscpd-JSON — drop into an existing jscpd pipeline. |
+
+The SARIF emitter makes two clone-specific choices (spec §6.1): a duplicate group
+is **one result at N locations** (`relatedLocations[]`, with the template embedded
+in the message), and `partialFingerprints` is set to the **structural/template
+hash**, not a line hash. That means a code-scanning alert stays the *same* alert as
+its members drift through renames and whitespace edits, instead of churning
+closed-and-reopened on every cosmetic change. Set `[report] sarif_fingerprint =
+"line"` to fall back to GitHub's line-hash default.
+
+## Headline calibration numbers
+
+Full measured evidence, per phase, is in [`CALIBRATION.md`](CALIBRATION.md).
+Precision is **measured, not asserted** — but honestly, on small samples:
+
+- **Mutation benchmark (recall).** Type-1/Type-2 classes: **100%** (16/16). Type-3
+  classes (loop-swap, reorder, 3× unroll, subtree-sub, light-edit-every-statement),
+  tail-recursion, and the inline/mutual-recursion chain: **100% per class** — but
+  each class is only 2 variants (Rust + Python), a regression guard, not a large
+  sample. Designed-to-fail controls (tree recursion, random pairs): **0%**
+  convergence, as required.
+- **Stratified precision sample (§7.2).** 50 findings across five real repos
+  (ripgrep, flask, serde, click, gin), seeded-random (not top-value-biased),
+  single labeler: **70% overall** (35/50). Per tier: `exact-normalized` 5/5,
+  `near-normalized` 8/8, `exact-region` 17/27 (63%), `inline-assisted` 3/5,
+  `internal-repeat` 2/5 (40%, since mitigated — D30). n=50, one labeler; treat as
+  a floor.
+- **Reason to exist (§7.3 vs jscpd).** Against jscpd on unseen repos, reprise makes
+  **438 findings jscpd cannot on ripgrep, 149 on flask** — dominated by exactly the
+  Type-2/3 (renamed exact runs, near-misses) and Type-4 (inline-assisted) catches
+  jscpd's raw-token windowing can't reach. jscpd-only findings are all outside
+  reprise's declared scope (comments, non-function code, sub-floor fragments).
+- **Performance.** Warm `check --base` on a synthetic **500k-LOC** corpus: **8.1 s**
+  (against a ≤10 s gate); real repos scan in well under a second warm.
+
+## How it works
+
+Four stages, per language partition (details in [`docs/PLAN.md`](docs/PLAN.md)):
+
+1. **Normalize.** Parse with tree-sitter (error-tolerant), strip comments, **lower
+   every loop form — and tail recursion — to one minimal loop core**, abstract
+   local identifiers positionally and literals to typed buckets, and canonicalize
+   order-insensitive constructs. Source spans survive every rewrite, so findings
+   always map back to real lines.
+2. **Fingerprint.** A Merkle structural hash per unit (exact-match key), subtree-hash
+   bags with MinHash (near-miss retrieval), and Shazam-style landmark-pair hashes
+   (discriminating retrieval that degrades gracefully under local edits).
+3. **Three matching tiers.** A **sequence tier** (generalized suffix array over the
+   normalized token stream) finds exact duplicated runs; a **tree tier** retrieves
+   near-miss candidates, verifies them with an offset-histogram diagonal check, and
+   confirms with **anti-unification**; an **api-profile tier** flags same-task
+   reimplementations by shared rare-callee profiles (suspicion-only).
+4. **Anti-unification templates.** A near-miss finding is not a similarity
+   percentage — it is the least-general generalization of the group: a shared
+   template plus the holes where members diverge. The holes *are* the divergences,
+   and factorable ones double as the refactoring recipe (expression holes →
+   parameters, statement holes → closures).
+
+## Development
+
+Everything runs through [`just`](https://github.com/casey/just):
+
+```sh
+just test             # cargo test --all-targets (117 tests)
+just lint             # clippy -D warnings + cargo fmt --check
+just bench-mutations  # the mutation-recall gate (spec §7.1)
+just scan-self        # dogfood: scan reprise's own repo
+```
+
+**Dogfooding.** reprise scans itself. Its `reprise.toml` excludes `benches/**`
+because that directory is a corpus of *planted* clones (mutation seeds/variants and
+the wild-pair recall net) — including it would drown the self-scan in benchmark
+duplication rather than the tool's own code. The self-scan legitimately reports the
+**five parallel language profiles** (`src/lang/{rust,python,typescript,go,kotlin}.rs`)
+as duplication: they are deliberate parallel implementations of one trait, and
+`reprise baseline .` records them so a `check` run gates only on *new* drift.
+
+**`check` needs a commit.** `reprise check . --base HEAD` diffs against a git ref,
+so the repo must have at least one commit. A freshly-initialized repo with no
+commits has no `HEAD` — commit first, then `check` works.
+
+## Repository map
+
+- [`docs/PLAN.md`](docs/PLAN.md) — the authoritative design spec (Rev 9).
+- [`docs/CONFIG.md`](docs/CONFIG.md) — every `reprise.toml` key, defaults, and drift from the spec.
+- [`DECISIONS.md`](DECISIONS.md) — every deviation from the spec, with rationale.
+- [`CALIBRATION.md`](CALIBRATION.md) — measured recall/precision/performance, per phase.
+- [`CHANGELOG.md`](CHANGELOG.md) — release history.

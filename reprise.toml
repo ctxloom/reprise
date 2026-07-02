@@ -1,0 +1,6 @@
+# reprise scanning itself (dogfood config).
+
+[scan]
+# The mutation benchmark is a corpus of PLANTED clones (seeds + curated
+# variants) — excluding it keeps the self-scan about the tool's own code.
+exclude = ["benches/**"]

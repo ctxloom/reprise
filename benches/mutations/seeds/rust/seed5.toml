@@ -1,0 +1,15 @@
+# Curated mutation maps (DECISIONS.md D6): locals only — the helper callee
+# name stays put (it is an External and part of the unit's identity).
+[rename]
+values = "samples"
+limit = "ceiling"
+cleaned = "result"
+v = "item"
+adjusted = "fixed"
+total = "sum_all"
+c = "entry"
+
+[literals]
+"10.0" = "3.5"
+"500.0" = "750.25"
+"2.0" = "4.0"

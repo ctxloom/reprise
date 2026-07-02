@@ -1,0 +1,16 @@
+[rename]
+resolve_endpoint = "build_endpoint"
+raw = "input"
+default_port = "fallback"
+secure = "use_tls"
+trimmed = "cleaned"
+host = "server"
+port = "portno"
+left = "head"
+right = "tail"
+parsed = "value"
+scheme = "proto"
+out = "result"
+
+[literals]
+'"://"' = '"@@"'

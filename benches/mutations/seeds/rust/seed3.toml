@@ -1,0 +1,8 @@
+[rename]
+reduce_pair = "shrink_pair"
+a = "x"
+b = "y"
+log = "trace"
+
+[literals]
+'"step: {a} {b}"' = '"round: {a} {b}"'

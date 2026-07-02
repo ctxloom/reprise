@@ -1,0 +1,19 @@
+# Mutation metadata for seed1.rs (DECISIONS.md D6: mutation maps are curated per seed,
+# independent of the tool's own local/external classifier).
+[rename]
+summarize_scores = "collect_report"
+entries = "items"
+threshold = "cutoff"
+summaries = "lines"
+running_total = "acc"
+label = "tag"
+score = "points"
+grade = "band"
+
+[literals]
+# non-keep-list literals only (D6b)
+"90" = "85"
+"50" = "40"
+"250" = "400"
+'"excellent"' = '"stellar"'
+'"poor"' = '"weak"'

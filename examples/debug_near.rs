@@ -1,0 +1,77 @@
+//! Dev utility: explain why a pair of units does or doesn't converge.
+//! Usage: cargo run --example debug_near -- a.py b.py
+
+use reprise::config::Config;
+use reprise::fingerprint::{self, HashMode};
+use reprise::lang::Lang;
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let cfg = Config::default();
+    let read = |p: &str| std::fs::read_to_string(p).unwrap();
+    let lang = if args[1].ends_with(".rs") {
+        Lang::Rust
+    } else {
+        Lang::Python
+    };
+    let ua = &reprise::units_from_source(&read(&args[1]), lang, &cfg)[0];
+    let ub = &reprise::units_from_source(&read(&args[2]), lang, &cfg)[0];
+    println!(
+        "A: {} tokens={} fp={:x}",
+        ua.name, ua.token_count, ua.fingerprint
+    );
+    println!(
+        "B: {} tokens={} fp={:x}",
+        ub.name, ub.token_count, ub.fingerprint
+    );
+    if ua.fingerprint == ub.fingerprint {
+        println!("EXACT MATCH");
+        return;
+    }
+    let inv = |u: &reprise::Unit| {
+        fingerprint::subtree_inventory(
+            &u.tree,
+            cfg.thresholds.bag_min_subtree_tokens,
+            HashMode::MaskedLocals,
+        )
+    };
+    let (ia, ib) = (inv(ua), inv(ub));
+    let mut sa: Vec<u128> = ia.iter().map(|s| s.hash).collect();
+    let mut sb: Vec<u128> = ib.iter().map(|s| s.hash).collect();
+    sa.sort_unstable();
+    sa.dedup();
+    sb.sort_unstable();
+    sb.dedup();
+    let shared = sa.iter().filter(|h| sb.binary_search(h).is_ok()).count();
+    let union = sa.len() + sb.len() - shared;
+    println!(
+        "bag: |A|={} |B|={} shared={} jaccard={:.3} (threshold {})",
+        sa.len(),
+        sb.len(),
+        shared,
+        shared as f64 / union as f64,
+        cfg.thresholds.candidate_sim
+    );
+    let outcome = reprise::au::anti_unify(&ua.tree, &ub.tree, lang.profile());
+    println!(
+        "AU: divergence={:.3} (max {}), holes={} (max {}), factorable={}",
+        outcome.divergence,
+        cfg.thresholds.max_divergence,
+        outcome.holes.len(),
+        cfg.thresholds.max_holes,
+        outcome.factorable
+    );
+    for (i, h) in outcome.holes.iter().enumerate() {
+        println!(
+            "  hole {}: a={} b={} factorable={}",
+            i + 1,
+            h.tokens_a,
+            h.tokens_b,
+            h.factorable
+        );
+    }
+    println!(
+        "template:\n{}",
+        reprise::au::render_template(&outcome.template)
+    );
+}
