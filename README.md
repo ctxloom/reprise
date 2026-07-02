@@ -14,7 +14,19 @@ identifiers, a `while` where the original had a `for`, an extra guard clause.
 Token-window tools miss most of that band.
 
 reprise targets clone Types 1–3 plus the "reimplemented helper" slice of Type-4,
-**within a single codebase**, at repo-scan and PR-check granularity. It is
+**within a single codebase**, at repo-scan and PR-check granularity.
+
+That type vocabulary is standard in the clone-detection literature and is used
+throughout this README, so in plain terms:
+
+- **Type-1** — identical code modulo whitespace and comments.
+- **Type-2** — identical modulo identifier names and literal values: a renamed copy.
+- **Type-3** — a near-miss: statements added, removed, or reordered; a `while`
+  where the original had a `for`; small structural edits on a shared skeleton.
+- **Type-4** — same behavior, structurally unrelated code. Full Type-4 is out of
+  scope by design; reprise goes after its most common practical slice — an
+  existing helper **reimplemented** instead of called — via inlining and
+  API-profile matching. It is
 **report-only** — it never transforms your code — and it is built to run in CI: its
 flagship finding, `inconsistent-update`, fires at exactly the moment a change
 edits one copy of a known duplicate group but not the others.
@@ -315,6 +327,39 @@ Four stages, per language partition (details in [`docs/PLAN.md`](docs/PLAN.md)):
    template plus the holes where members diverge. The holes *are* the divergences,
    and factorable ones double as the refactoring recipe (expression holes →
    parameters, statement holes → closures).
+
+## The musical part
+
+A *reprise* is a theme that returns later in the piece changed — new key, new
+instrumentation, same bones. That is exactly what a near-duplicate is. The name
+is not the only thing here borrowed from music.
+
+One of reprise's retrieval layers is lifted from **Shazam** (Wang, *An
+Industrial-Strength Audio Search Algorithm*, ISMIR 2003). Shazam fingerprints a
+track as a *constellation*: pick distinctive spectrogram peaks (landmarks), hash
+them **in pairs with their time offset** — individually common peaks become
+combinatorially rare pairs — then verify a match by checking that the surviving
+hashes agree on a single time alignment (the diagonal). The design target was
+hostile channels: phone microphones, bar noise, lossy codecs, primitive
+streaming. The insight that makes it work is that damage is *local* — destroy
+98% of the hashes and the surviving 2% still line up.
+
+reprise runs the same play against a different adversary. Distinctive normalized
+subtrees are the landmarks; pairs are hashed with their structural offset; a
+candidate pair must produce a dominant bin in an offset histogram before the
+expensive anti-unification verification runs. **Shazam was controlling for loss
+— a signal damaged in transit. reprise is controlling for divergence — a copy
+damaged by editing.** A rename here, a swapped loop there, an extra guard
+clause: each edit destroys only the landmark pairs it touches, and the surviving
+constellation still lines up on the diagonal. The adversary changed; the math
+didn't.
+
+This layer holds its place on evidence, not elegance: it went head-to-head
+against a rival retrieval design in a measured rivalry, won on recall, and the
+loser was deleted from the codebase ([`DECISIONS.md`](DECISIONS.md) D16). There
+is a second, smaller borrowing from the same world: near-miss verification
+aligns statements by *graded* similarity rather than demanding exact matches —
+the cover-song lesson. After normalization, align with tolerance.
 
 ## Development
 
