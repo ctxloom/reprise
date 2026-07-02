@@ -265,3 +265,13 @@ fn top_zero_renders_all_groups() {
     // And the truncated default still truncates (sanity of the fixture).
     assert!(report.render_terminal(1, false).contains("more groups"));
 }
+
+#[test]
+fn nonexistent_scan_root_is_an_error_not_an_empty_scan() {
+    // Exit-code contract: a typo'd path must exit 2 in CI, never a clean 0.
+    let err = reprise::scan(
+        std::path::Path::new("/definitely/not/a/real/path"),
+        &reprise::Config::default(),
+    );
+    assert!(err.is_err(), "missing scan root must be a hard error");
+}
