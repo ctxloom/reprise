@@ -798,4 +798,7 @@ anywhere in a large function "touched" every idiom-run it contains. Fix: IU trac
 unit-granularity tiers (exact/near/inline-assisted) with unit mapping; exact-region
 entries fire only when the diff intersects the run's own span (span-precise);
 internal-repeat never qualifies. Regression test: tail edit beside a shared run is
-silent, in-run edit fires.
+silent, in-run edit fires. Region IU reports but does NOT gate (informational):
+the Juergens evidence is function-level clones, and a legitimate one-sided change
+to a shared run has no acceptance path in artifact-free mode — unit-tier IU
+remains the hard gate.

@@ -414,7 +414,11 @@ pub fn run(
             members.extend(untouched.iter().cloned());
             findings.push(CheckFinding {
                 kind: "inconsistent-update".into(),
-                fails: fails(Tier::InconsistentUpdate),
+                // Unit-copy drift is the Juergens fault mechanism and gates
+                // hard; shared-run (region) drift is real information but a
+                // legitimate one-sided change has no acceptance path in
+                // artifact-free mode, so it reports without failing (D39).
+                fails: fails(Tier::InconsistentUpdate) && !region,
                 group: Group {
                     id: String::new(),
                     tier: Tier::InconsistentUpdate,
