@@ -802,3 +802,18 @@ silent, in-run edit fires. Region IU reports but does NOT gate (informational):
 the Juergens evidence is function-level clones, and a legitimate one-sided change
 to a shared run has no acceptance path in artifact-free mode — unit-tier IU
 remains the hard gate.
+
+## D40 — The baseline is a git ref; the baseline file is gone (2026-07-02)
+
+User decision: "baseline will never exist as a persistent, tracked file. they can
+specify a git hash for a persistent baseline and rescan." The `reprise baseline`
+subcommand and `[baseline] file` are removed. A persistent acceptance point is a
+pinned ref — `[baseline] ref = "<sha|tag>"` (the default for `check` when `--base`
+is omitted) — and base state is always (re)scanned from the ref via the D38
+worktree path, with the transient `.reprise/base-state/` SHA-keyed cache. The
+`Baseline` type survives solely as that cache's serialization; a scheme mismatch
+is treated as a cache miss (rescan), no longer a user-facing re-baseline error.
+What the file bought (D38) maps onto refs: fixed drift reference = pinned ref;
+"moving the acceptance point" = an ordinary reviewable one-line pin bump. The one
+capability with no ref equivalent — surgically un-accepting a single group while
+keeping the rest — falls to `reprise:ignore` pragmas or an actual cleanup.

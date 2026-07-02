@@ -6,7 +6,7 @@ use std::path::PathBuf;
 #[command(
     name = "reprise",
     version,
-    about = "Code duplicate detection: scan, baseline, and PR-time drift gating"
+    about = "Code duplicate detection: repo scans and PR-time drift gating"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -32,16 +32,18 @@ enum Command {
         verbose: bool,
     },
     /// PR mode: findings involving units changed since a git ref fail CI
-    /// unless baselined and unworsened; partial edits of known duplicate
-    /// groups surface as inconsistent-update findings (spec §6).
+    /// unless present-and-unworsened in the base ref's own scan; partial
+    /// edits of known duplicate groups surface as inconsistent-update
+    /// findings (spec §6). The base ref IS the baseline (D40): pin one in
+    /// [baseline] ref for a persistent acceptance point.
     #[command(after_help = CHECK_EXIT_CODES)]
     Check {
         /// Repository root or directory to scan.
         path: PathBuf,
-        /// Git ref to diff against (e.g. origin/main, HEAD~1). Only units
-        /// whose line span intersects the diff are gated.
+        /// Git ref to diff against and to scan for base state (e.g.
+        /// origin/main, HEAD~1, a pinned tag/sha). Defaults to [baseline] ref.
         #[arg(long)]
-        base: String,
+        base: Option<String>,
         /// Minimum tier that fails CI (inconsistent-update, exact-normalized,
         /// internal-repeat, exact-region, near-normalized, inline-assisted,
         /// or none). Overrides [report] fail_on (default exact-normalized).
@@ -50,13 +52,6 @@ enum Command {
         /// Output format: terminal | json | sarif | cpd | jscpd.
         #[arg(long, default_value = "terminal")]
         format: String,
-    },
-    /// Write all current findings, keyed by stable structural fingerprints,
-    /// to a checked-in baseline (the legacy-repo adoption path, spec §2).
-    /// Path/name: [baseline] file, default reprise-baseline.json.
-    Baseline {
-        /// Repository root or directory to baseline.
-        path: PathBuf,
     },
 }
 
@@ -126,6 +121,11 @@ fn run() -> anyhow::Result<i32> {
             format,
         } => {
             let config = reprise::Config::load(&path)?;
+            let base = base
+                .or_else(|| config.baseline.pinned.clone())
+                .ok_or_else(|| anyhow::anyhow!(
+                    "no base ref: pass --base <ref> or pin one in reprise.toml ([baseline] ref = \"...\")"
+                ))?;
             let report = reprise::check::run(&path, &config, &base, fail_on.as_deref())?;
             match format.as_str() {
                 "terminal" => emit(&report.render_terminal())?,
@@ -145,23 +145,6 @@ fn run() -> anyhow::Result<i32> {
             }
             // Exit 1 only for real findings; errors above already mapped to 2.
             Ok(if report.failed() { 1 } else { 0 })
-        }
-        Command::Baseline { path } => {
-            let config = reprise::Config::load(&path)?;
-            let report = reprise::scan(&path, &config)?;
-            let baseline = reprise::baseline::create(&report, &path);
-            let file = reprise::baseline::baseline_path(&path, &config);
-            baseline.save(&file)?;
-            emit(&format!(
-                "baseline written: {} findings ({} main, {} test, {} api, {} weak) to {}\n",
-                baseline.findings.len(),
-                report.groups.len(),
-                report.test_groups.len(),
-                report.api_groups.len(),
-                report.weak_groups.len(),
-                file.display(),
-            ))?;
-            Ok(0)
         }
     }
 }

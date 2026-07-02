@@ -168,11 +168,9 @@ pub struct CheckReport {
     /// Inconsistent-update findings first, then by §6 tier order.
     pub findings: Vec<CheckFinding>,
     pub failing: usize,
-    /// No baseline FILE was used (base state came from a base-ref scan).
-    pub baseline_missing: bool,
-    /// Where the comparison's base state came from: "baseline-file" (curated
-    /// acceptance set, fixed drift reference) or "base-scan"/"base-scan
-    /// (cached)" (two-scan mode: synthesized from the base ref, no artifact).
+    /// Base-state source: "base-scan" (fresh worktree scan of the base ref)
+    /// or "base-scan (cached)" (transient .reprise/base-state cache hit).
+    /// The persistent baseline is a pinned git ref (D40) — never a file.
     pub base_state: String,
     /// Baseline entries in the gating (`main`) section; 0 = no baseline file.
     pub baseline_total: usize,
@@ -247,9 +245,6 @@ impl Drop for BaseWorktree {
 ///   the same entry set. Cached transiently under .reprise/base-state/ keyed
 ///   by resolved base SHA + config, so repeat checks skip the base scan.
 fn base_state(root: &Path, cfg: &Config, base: &str) -> anyhow::Result<(Baseline, String)> {
-    if let Some(b) = Baseline::load_if_present(root, cfg)? {
-        return Ok((b, "baseline-file".to_string()));
-    }
     let sha_out = Command::new("git")
         .arg("-C")
         .arg(root)
@@ -542,7 +537,6 @@ pub fn run(
         fail_on,
         findings,
         failing,
-        baseline_missing: base_state != "baseline-file",
         base_state: base_state.clone(),
         baseline_total: main_entries.len(),
         baseline_matched,
@@ -559,7 +553,7 @@ impl CheckReport {
     pub fn render_terminal(&self) -> String {
         let s = &self.stats;
         let mut out = format!(
-            "reprise check vs {}: {} touched units of {} indexed; baseline: {} findings \
+            "reprise check vs {}: {} touched units of {} indexed; base state: {} findings \
              ({} matched, {} exempt); {} suppressed; cache [{} hits, {} misses]; {}ms\n",
             self.base,
             self.touched_units,
@@ -572,14 +566,6 @@ impl CheckReport {
             s.cache_misses,
             s.duration_ms,
         );
-        if self.baseline_missing {
-            out.push_str(&format!(
-                "base state: {} of {} — pre-existing findings are exempt; only new or \
-                 worsened duplication gates. (`reprise baseline` pins a fixed acceptance \
-                 set instead; the file lives transiently under .reprise/ by default.)\n",
-                self.base_state, self.base,
-            ));
-        }
         if self.findings.is_empty() {
             out.push_str(&format!(
                 "\nclean: no reportable findings (fail_on {})\n",

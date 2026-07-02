@@ -1,14 +1,15 @@
-//! `reprise baseline` (spec §2): the legacy-repo adoption path. All current
+//! Base-state snapshots (D40: the persistent baseline is a git REF, never a
+//! tracked file — this module is the internal serialization for check's
+//! transient base-state cache). All current
 //! findings, keyed by their stable structural/template fingerprints (§6.1),
 //! written to a checked-in `reprise-baseline.json`. Subsequent `check` runs
 //! fail only on findings not in the baseline or worsened since it — but
 //! baselined groups are STILL tracked for inconsistent updates (§6).
 
-use crate::config::Config;
 use crate::report::{Group, ScanReport};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Baseline {
@@ -94,10 +95,6 @@ pub fn create(report: &ScanReport, root: &Path) -> Baseline {
     }
 }
 
-pub fn baseline_path(root: &Path, cfg: &Config) -> PathBuf {
-    root.join(&cfg.baseline.file)
-}
-
 impl Baseline {
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         let json = serde_json::to_string_pretty(self)?;
@@ -106,8 +103,9 @@ impl Baseline {
         Ok(())
     }
 
-    /// Load and validate. A scheme mismatch is an explicit error (spec §12:
-    /// stale baselines must never be silently compared).
+    /// Load and validate a transient base-state snapshot. A scheme mismatch is
+    /// an error, which callers treat as a cache miss (rescan the base ref) —
+    /// stale state is never silently compared (spec §12).
     pub fn load(path: &Path) -> anyhow::Result<Baseline> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading baseline {}", path.display()))?;
@@ -115,24 +113,13 @@ impl Baseline {
             .with_context(|| format!("parsing baseline {}", path.display()))?;
         if baseline.fingerprint_scheme != crate::fingerprint::FINGERPRINT_SCHEME {
             anyhow::bail!(
-                "baseline {} was written with fingerprint scheme {} but this binary \
-                 uses scheme {}: re-baseline required (run `reprise baseline`)",
+                "base-state snapshot {} was written with fingerprint scheme {} but this \
+                 binary uses scheme {}: rescan required",
                 path.display(),
                 baseline.fingerprint_scheme,
                 crate::fingerprint::FINGERPRINT_SCHEME,
             );
         }
         Ok(baseline)
-    }
-
-    /// Load the configured baseline if present; `Ok(None)` when the file does
-    /// not exist (a missing baseline means "nothing is exempt", not an error).
-    pub fn load_if_present(root: &Path, cfg: &Config) -> anyhow::Result<Option<Baseline>> {
-        let path = baseline_path(root, cfg);
-        if path.is_file() {
-            Ok(Some(Baseline::load(&path)?))
-        } else {
-            Ok(None)
-        }
     }
 }

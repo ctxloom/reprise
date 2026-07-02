@@ -60,7 +60,7 @@ just install-static          # fully static Linux binary (crt-static), then inst
 crates.io publish is **coming soon** — the crate name was verified free as of
 2026-07-02 but nothing is published yet. Licensed under **BSD-3-Clause**.
 
-## The three commands
+## The commands
 
 reprise runs with **zero configuration**. An optional `reprise.toml` at the scan
 root tunes it — see [`docs/CONFIG.md`](docs/CONFIG.md).
@@ -120,22 +120,26 @@ diverge (the differing attribute). The `for` loops all normalized to the same
 `--format json|sarif|cpd|jscpd` switches output; `--top N` caps the terminal list
 (0 = all); `--verbose` adds the weak-similarity and full test/api sections.
 
-### `reprise baseline <path>` — optional curated acceptance set
+### The baseline is a git ref — never a file
 
-**You don't need this to adopt reprise.** `check` is zero-setup: with no baseline
-it scans the base ref too (two-scan mode) and gates only *new or worsened*
-duplication — pre-existing findings are exempt automatically, and the synthesized
-base state is cached transiently under `.reprise/` keyed by base commit.
+Adoption is zero-setup: `check` scans the base ref itself for comparison state
+(cached transiently under `.reprise/`, keyed by commit), so pre-existing
+duplication is exempt automatically and only *new or worsened* duplication
+gates. There is no baseline file, no derived artifact in VCS — the codebase's
+own history is the acceptance record.
 
-`baseline` exists for teams that want a **fixed** reference instead of a moving
-one. It records current findings keyed by stable structural fingerprints, buying
-two things two-scan cannot: a cumulative-drift reference ("divergence 0.016 at
-*acceptance* → 0.077 now" — slow drift across many PRs never resets), and a
-curated acceptance set (delete an entry to *un-accept* duplication and force
-cleanup without fixing it in the same PR). The file is a derived artifact; it
-defaults to the transient `.reprise/baseline.json` (never tracked). Point
-`[baseline] file` somewhere tracked only if your team explicitly wants the
-acceptance set reviewed in VCS.
+For a **fixed** reference instead of a moving one — a persistent acceptance
+point whose drift trend doesn't reset every PR — pin a git hash or tag:
+
+```toml
+# reprise.toml
+[baseline]
+ref = "v1.4.0"   # or a commit sha — check uses this when --base is omitted
+```
+
+`reprise check .` then measures against that ref until you deliberately move
+the pin (an ordinary, reviewable one-line diff). Rolling gates just pass
+`--base origin/main` explicitly, as CI does.
 
 An inline `// reprise:ignore` comment on a unit's first line (or directly above
 it) suppresses that unit from all tiers; suppression counts appear in scan stats

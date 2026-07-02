@@ -22,9 +22,13 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct BaselineCfg {
-    /// Baseline file at the scan root, checked in (spec §2, §9 `[baseline]`).
-    pub file: String,
-    /// inconsistent-update findings + divergence trend on baselined groups
+    /// Pinned git ref (hash/tag/branch) used as `check`'s default base when
+    /// `--base` is omitted — the persistent baseline IS a git ref; base state
+    /// is (re)scanned from it and cached transiently (D40; supersedes the
+    /// spec §2/§9 baseline file, which no longer exists).
+    #[serde(rename = "ref", alias = "pinned")]
+    pub pinned: Option<String>,
+    /// inconsistent-update findings + divergence trend on base-state groups
     /// (spec §6).
     pub track_drift: bool,
 }
@@ -32,7 +36,7 @@ pub struct BaselineCfg {
 impl Default for BaselineCfg {
     fn default() -> Self {
         BaselineCfg {
-            file: ".reprise/baseline.json".into(),
+            pinned: None,
             track_drift: true,
         }
     }

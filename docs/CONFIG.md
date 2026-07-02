@@ -115,7 +115,7 @@ construction; the evidence is the shared rare-callee list).
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `file` | string | `".reprise/baseline.json"` | Baseline filename, resolved relative to the scan root. Written by `reprise baseline`, read by `reprise check`. |
+| `ref` | string (optional) | *(none)* | Pinned git hash/tag used as `check`'s default base when `--base` is omitted — the persistent baseline IS a git ref; base state is rescanned from it and cached transiently (D40). |
 | `track_drift` | bool | `true` | Emit `inconsistent-update` findings and divergence-trend (`drifting`) notes on baselined groups (spec §6). |
 
 ## `[cache]`

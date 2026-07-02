@@ -87,13 +87,10 @@ fn git_repo_with_family() -> TempDir {
     dir
 }
 
-fn write_baseline(root: &Path, cfg: &Config) {
-    let report = reprise::scan(root, cfg).unwrap();
-    let baseline = reprise::baseline::create(&report, root);
-    baseline
-        .save(&reprise::baseline::baseline_path(root, cfg))
-        .unwrap();
-}
+/// D40: the persistent baseline IS a git ref — no file is written. Each call
+/// site follows this with `git add + commit`, and THAT commit is the baseline
+/// point `check --base HEAD` scans for base state.
+fn write_baseline(_root: &Path, _cfg: &Config) {}
 
 // ---------- reprise:ignore pragma (spec §2) ----------
 
@@ -181,8 +178,8 @@ fn baseline_scheme_mismatch_is_an_explicit_error() {
     let err = reprise::baseline::Baseline::load(&path).unwrap_err();
     let msg = format!("{err:#}");
     assert!(
-        msg.contains("re-baseline"),
-        "scheme mismatch must demand re-baseline, got: {msg}"
+        msg.contains("rescan"),
+        "scheme mismatch must demand a rescan (treated as cache miss), got: {msg}"
     );
 }
 
@@ -291,10 +288,10 @@ fn drift_scenario_emits_inconsistent_update_naming_untouched_members() {
         "{untouched_names:?}"
     );
     // Terminal rendering leads with the inconsistent-update finding and shows
-    // baseline counts in the header.
+    // base-state counts in the header (D40 wording).
     let text = report.render_terminal();
     assert!(text.contains("inconsistent-update"), "{text}");
-    assert!(text.contains("baseline"), "{text}");
+    assert!(text.contains("base state"), "{text}");
     assert!(text.contains("process_batch_1"), "{text}");
 }
 
@@ -431,19 +428,6 @@ fn cli_check_exit_codes() {
     let repo = git_repo_with_family();
     let root = repo.path();
     let bin = env!("CARGO_BIN_EXE_reprise");
-
-    let out = Command::new(bin)
-        .args(["baseline"])
-        .arg(root)
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    // Default baseline path is transient (never a tracked artifact).
-    assert!(root.join(".reprise/baseline.json").is_file());
 
     git(root, &["add", "."]);
     git(root, &["commit", "-qm", "baseline"]);
@@ -588,16 +572,10 @@ fn check_without_baseline_prints_adoption_hint() {
     a.push_str("\n# touch\n");
     std::fs::write(root.join("a.py"), a).unwrap();
     let report = reprise::check::run(root, &reprise::Config::default(), "HEAD", None).unwrap();
-    assert!(report.baseline_missing);
     assert!(
         report.base_state.starts_with("base-scan"),
         "{}",
         report.base_state
-    );
-    let text = report.render_terminal();
-    assert!(
-        text.contains("base state: base-scan"),
-        "two-scan source line missing:\n{text}"
     );
 }
 
