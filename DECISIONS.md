@@ -789,3 +789,13 @@ drift across PRs, vs two-scan's per-PR moving reference) and a reviewable/editab
 acceptance set — and its default path moved to the untracked `.reprise/baseline.json`
 (spec §9 said repo root; deviation recorded here). The repo's own committed
 reprise-baseline.json was removed; reprise dogfoods two-scan mode in CI.
+
+**D38 addendum / D39 — IU drift tracking is unit-granularity (+ span-precise regions).**
+First CI run of two-scan mode failed on our own commit: 8 inconsistent-update
+findings, all pairing the 450-line `scan()` with small functions — exact-region
+entries whose members were mapped to their ENCLOSING UNIT spans, so any edit
+anywhere in a large function "touched" every idiom-run it contains. Fix: IU tracks
+unit-granularity tiers (exact/near/inline-assisted) with unit mapping; exact-region
+entries fire only when the diff intersects the run's own span (span-precise);
+internal-repeat never qualifies. Regression test: tail edit beside a shared run is
+silent, in-run edit fires.

@@ -645,3 +645,62 @@ fn two_scan_mode_fires_inconsistent_update_without_any_baseline_file() {
     let again = reprise::check::run(root, &cfg, "HEAD", None).unwrap();
     assert_eq!(again.base_state, "base-scan (cached)");
 }
+
+/// D39: an edit inside a large function must NOT fire inconsistent-update for
+/// region groups whose runs the edit never touched (unit-granularity mapping
+/// made every edit in a big function "touch" all its regions); an edit inside
+/// the shared run itself still fires.
+#[test]
+fn region_drift_is_span_precise() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let shared = "    buf = prepare(items)\n    buf.sort()\n    emit_header(buf, \"v2\")\n    for entry in buf:\n        validate(entry, STRICT)\n        write_row(entry, buf)\n        bump_metric(\"rows\", entry)\n    flush_all(buf)\n";
+    // Big function: preamble, the shared run, then a long tail.
+    let tail: String = (0..8)
+        .map(|i| format!("    step_{i} = compute_{i}(items, buf)\n    audit(step_{i}, {i})\n"))
+        .collect();
+    fs::write(
+        root.join("big.py"),
+        format!("def export_daily(items, path):\n    log_start(\"daily\", path)\n{shared}{tail}    return len(items)\n"),
+    )
+    .unwrap();
+    fs::write(
+        root.join("other.py"),
+        format!("def export_weekly(items, dest, limit):\n    if limit < 1:\n        return None\n    rotate_old(dest, limit)\n{shared}    notify(dest)\n    return dest\n"),
+    )
+    .unwrap();
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "t@example.com"]);
+    git(root, &["config", "user.name", "t"]);
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "init"]);
+    let cfg = Config::default();
+
+    // Edit the TAIL of the big function — far from the shared run.
+    let mut src = fs::read_to_string(root.join("big.py")).unwrap();
+    src = src.replace("audit(step_7, 7)", "audit_v2(step_7, 7, path)");
+    fs::write(root.join("big.py"), src).unwrap();
+    let report = reprise::check::run(root, &cfg, "HEAD", None).unwrap();
+    assert!(
+        !report
+            .findings
+            .iter()
+            .any(|f| f.kind == "inconsistent-update"),
+        "tail edit must not fire region IU: {:#?}",
+        report.findings
+    );
+
+    // Now edit INSIDE the shared run in one copy only.
+    let mut src = fs::read_to_string(root.join("big.py")).unwrap();
+    src = src.replace("validate(entry, STRICT)", "validate(entry, LENIENT)");
+    fs::write(root.join("big.py"), src).unwrap();
+    let report = reprise::check::run(root, &cfg, "HEAD", None).unwrap();
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|f| f.kind == "inconsistent-update"),
+        "in-run edit must fire region IU: {:#?}",
+        report.findings
+    );
+}

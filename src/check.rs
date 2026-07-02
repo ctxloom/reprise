@@ -349,7 +349,24 @@ pub fn run(
     // ---- inconsistent-update: from BASELINE state (spec §6), so a group
     // whose members drifted apart beyond max_divergence still fires ----
     if cfg.baseline.track_drift {
-        for e in main_entries.iter().filter(|e| e.members.len() >= 2) {
+        // Drift tracking is for COPIES that must be co-updated: unit-granularity
+        // tiers only. Region entries are shared idiom runs inside otherwise-
+        // different functions — mapping their members at unit granularity made
+        // every edit anywhere in a large function "touch" every region it
+        // contains (8 false IU failures on our own CI, D39). Regions are
+        // tracked only via span-precise touch below; internal-repeat (single
+        // member) never qualifies.
+        let iu_tracked = |e: &BaselineEntry| {
+            matches!(
+                e.tier.as_str(),
+                "exact-normalized" | "near-normalized" | "inline-assisted"
+            ) || e.tier == "exact-region"
+        };
+        for e in main_entries
+            .iter()
+            .filter(|e| e.members.len() >= 2 && iu_tracked(e))
+        {
+            let region = e.tier == "exact-region";
             let mut touched: Vec<Member> = Vec::new();
             let mut untouched: Vec<Member> = Vec::new();
             for bm in &e.members {
@@ -360,11 +377,17 @@ pub fn run(
                         .find(|u| u.name == bm.name && bm.name != "<anon>" && !bm.name.is_empty())
                         .or_else(|| us.iter().find(|u| spans_overlap(u.line_span, bm.line_span)))
                 });
-                let (is_touched, line_span) = match unit {
-                    Some(u) => (diff.touches(&bm.file, u.line_span), u.line_span),
-                    // Unmapped member: touched iff its file was (deleted or
-                    // rewritten past recognition — both are edits).
-                    None => (diff.file_touched(&bm.file), bm.line_span),
+                let (is_touched, line_span) = if region {
+                    // Regions: span-precise — the diff must intersect the run
+                    // itself, not merely the enclosing unit (D39).
+                    (diff.touches(&bm.file, bm.line_span), bm.line_span)
+                } else {
+                    match unit {
+                        Some(u) => (diff.touches(&bm.file, u.line_span), u.line_span),
+                        // Unmapped member: touched iff its file was (deleted or
+                        // rewritten past recognition — both are edits).
+                        None => (diff.file_touched(&bm.file), bm.line_span),
+                    }
                 };
                 let member = Member {
                     file: PathBuf::from(&bm.file),
