@@ -168,9 +168,12 @@ pub struct CheckReport {
     /// Inconsistent-update findings first, then by §6 tier order.
     pub findings: Vec<CheckFinding>,
     pub failing: usize,
-    /// No reprise-baseline.json at the scan root: every finding reports as
-    /// new, so `check` gates pre-existing duplication too (adoption hint).
+    /// No baseline FILE was used (base state came from a base-ref scan).
     pub baseline_missing: bool,
+    /// Where the comparison's base state came from: "baseline-file" (curated
+    /// acceptance set, fixed drift reference) or "base-scan"/"base-scan
+    /// (cached)" (two-scan mode: synthesized from the base ref, no artifact).
+    pub base_state: String,
     /// Baseline entries in the gating (`main`) section; 0 = no baseline file.
     pub baseline_total: usize,
     /// Current findings matched to a baseline entry.
@@ -193,6 +196,94 @@ fn member_matches(bm: &BaselineMember, file_rel: &str, name: &str, span: (u32, u
             || spans_overlap(span, bm.line_span))
 }
 
+/// Temp worktree of the base ref; removed on drop.
+struct BaseWorktree {
+    repo: PathBuf,
+    dir: tempfile::TempDir,
+}
+
+impl BaseWorktree {
+    fn add(repo: &Path, base: &str) -> anyhow::Result<BaseWorktree> {
+        let dir = tempfile::TempDir::new()?;
+        let path = dir.path().join("base");
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["worktree", "add", "--detach", "-q"])
+            .arg(&path)
+            .arg(base)
+            .output()?;
+        anyhow::ensure!(
+            out.status.success(),
+            "git worktree add for base `{base}` failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(BaseWorktree {
+            repo: repo.to_path_buf(),
+            dir,
+        })
+    }
+    fn path(&self) -> PathBuf {
+        self.dir.path().join("base")
+    }
+}
+
+impl Drop for BaseWorktree {
+    fn drop(&mut self) {
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&self.repo)
+            .args(["worktree", "remove", "--force"])
+            .arg(self.path())
+            .output();
+    }
+}
+
+/// Base state for the comparison (spec §6 semantics, two sources):
+/// - a baseline FILE (optional curation layer: fixed "since acceptance"
+///   reference; the file itself is a derived artifact and defaults to living
+///   transiently under .reprise/) — used when present;
+/// - otherwise TWO-SCAN: scan the base ref in a temp worktree and synthesize
+///   the same entry set. Cached transiently under .reprise/base-state/ keyed
+///   by resolved base SHA + config, so repeat checks skip the base scan.
+fn base_state(root: &Path, cfg: &Config, base: &str) -> anyhow::Result<(Baseline, String)> {
+    if let Some(b) = Baseline::load_if_present(root, cfg)? {
+        return Ok((b, "baseline-file".to_string()));
+    }
+    let sha_out = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--verify"])
+        .arg(format!("{base}^{{commit}}"))
+        .output()?;
+    anyhow::ensure!(
+        sha_out.status.success(),
+        "cannot resolve base `{base}`: {}",
+        String::from_utf8_lossy(&sha_out.stderr)
+    );
+    let sha = String::from_utf8_lossy(&sha_out.stdout).trim().to_string();
+    let cfg_sig = xxhash_rust::xxh3::xxh3_64(format!("{cfg:?}").as_bytes());
+    let cache_path = root
+        .join(".reprise")
+        .join("base-state")
+        .join(format!("{sha}-{cfg_sig:016x}.json"));
+    if cfg.cache.enabled
+        && let Ok(b) = Baseline::load(&cache_path)
+    {
+        return Ok((b, "base-scan (cached)".to_string()));
+    }
+    let wt = BaseWorktree::add(root, base)?;
+    let mut base_cfg = cfg.clone();
+    base_cfg.cache.shared_root = Some(root.to_path_buf());
+    let base_report = crate::scan(&wt.path(), &base_cfg)?;
+    let b = crate::baseline::create(&base_report, &wt.path());
+    if cfg.cache.enabled {
+        let _ = std::fs::create_dir_all(cache_path.parent().unwrap());
+        let _ = b.save(&cache_path);
+    }
+    Ok((b, "base-scan".to_string()))
+}
+
 pub fn run(
     root: &Path,
     cfg: &Config,
@@ -202,7 +293,8 @@ pub fn run(
     let diff = git_diff(root, base)?;
     let fail_on = fail_on_override.unwrap_or(&cfg.report.fail_on).to_string();
     let threshold = Tier::parse_fail_on(&fail_on)?;
-    let baseline = Baseline::load_if_present(root, cfg)?;
+    let (baseline, base_state) = base_state(root, cfg, base)?;
+    let baseline = Some(baseline);
     let report = crate::scan(root, cfg)?;
 
     let rel = |p: &Path| relative_file(p, root);
@@ -423,7 +515,8 @@ pub fn run(
         fail_on,
         findings,
         failing,
-        baseline_missing: baseline.is_none(),
+        baseline_missing: base_state != "baseline-file",
+        base_state: base_state.clone(),
         baseline_total: main_entries.len(),
         baseline_matched,
         baseline_exempt,
@@ -453,11 +546,12 @@ impl CheckReport {
             s.duration_ms,
         );
         if self.baseline_missing {
-            out.push_str(
-                "note: no reprise-baseline.json — every finding above reports as NEW, \
-                 including pre-existing duplication. Run `reprise baseline .` (and commit \
-                 the file) to adopt; check then gates only new or worsened findings.\n",
-            );
+            out.push_str(&format!(
+                "base state: {} of {} — pre-existing findings are exempt; only new or \
+                 worsened duplication gates. (`reprise baseline` pins a fixed acceptance \
+                 set instead; the file lives transiently under .reprise/ by default.)\n",
+                self.base_state, self.base,
+            ));
         }
         if self.findings.is_empty() {
             out.push_str(&format!(

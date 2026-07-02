@@ -54,10 +54,11 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
                     // D8/D19 version-keyed per-file cache: a hit is
                     // byte-identical to a cold extraction by contract.
                     let key = cache::key(&baseline::relative_file(path, root), &src, config);
+                    let cache_root = config.cache.shared_root.as_deref().unwrap_or(root);
                     let cached = config
                         .cache
                         .enabled
-                        .then(|| cache::load(root, key, path))
+                        .then(|| cache::load(cache_root, key, path))
                         .flatten();
                     match cached {
                         Some(extracted) => FileOutcome::Units(extracted, src, true),
@@ -65,7 +66,7 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
                             let extracted =
                                 unit::extract_file_units_keep_raw(path, &src, *lang, config);
                             if config.cache.enabled {
-                                cache::store(root, key, &extracted);
+                                cache::store(cache_root, key, &extracted);
                             }
                             FileOutcome::Units(extracted, src, false)
                         }

@@ -99,26 +99,32 @@ diverge (the differing attribute). The `for` loops all normalized to the same
 `--format json|sarif|cpd|jscpd` switches output; `--top N` caps the terminal list
 (0 = all); `--verbose` adds the weak-similarity and full test/api sections.
 
-### `reprise baseline <path>` — adopt on a legacy repo
+### `reprise baseline <path>` — optional curated acceptance set
 
-The first scan of any existing codebase will report its pre-existing duplication.
-`baseline` records all current findings, keyed by **stable structural
-fingerprints**, so subsequent `check` runs fail only on *new or worsened*
-duplication — the adoption path that keeps CI green on day one:
+**You don't need this to adopt reprise.** `check` is zero-setup: with no baseline
+it scans the base ref too (two-scan mode) and gates only *new or worsened*
+duplication — pre-existing findings are exempt automatically, and the synthesized
+base state is cached transiently under `.reprise/` keyed by base commit.
 
-```
-$ reprise baseline .
-baseline written: 1 findings (1 main, 0 test, 0 api, 0 weak) to ./reprise-baseline.json
-```
+`baseline` exists for teams that want a **fixed** reference instead of a moving
+one. It records current findings keyed by stable structural fingerprints, buying
+two things two-scan cannot: a cumulative-drift reference ("divergence 0.016 at
+*acceptance* → 0.077 now" — slow drift across many PRs never resets), and a
+curated acceptance set (delete an entry to *un-accept* duplication and force
+cleanup without fixing it in the same PR). The file is a derived artifact; it
+defaults to the transient `.reprise/baseline.json` (never tracked). Point
+`[baseline] file` somewhere tracked only if your team explicitly wants the
+acceptance set reviewed in VCS.
 
-Commit `reprise-baseline.json`. An inline `// reprise:ignore` comment on a unit's
-first line (or directly above it) suppresses that unit from all tiers; suppression
-counts appear in scan stats so they can't silently accumulate.
+An inline `// reprise:ignore` comment on a unit's first line (or directly above
+it) suppresses that unit from all tiers; suppression counts appear in scan stats
+so they can't silently accumulate.
 
 ### `reprise check <path> --base <ref>` — the drift workflow (flagship)
 
-This is what runs in CI on a PR. It diffs against a git ref, and only units the
-diff touched are gated. Its most valuable output is `inconsistent-update`: **you
+This is what runs in CI on a PR — zero setup: it diffs against a git ref, scans
+the base ref for comparison state (or uses a baseline file if one exists), and
+only units the diff touched are gated. Its most valuable output is `inconsistent-update`: **you
 edited one member of a known duplicate group and left the others behind.**
 
 Walkthrough — baseline the demo, then add a guard clause to *one* of the three

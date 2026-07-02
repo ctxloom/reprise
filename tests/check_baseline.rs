@@ -393,7 +393,7 @@ fn fail_on_none_disables_the_gate() {
 }
 
 #[test]
-fn check_without_baseline_treats_touched_findings_as_new() {
+fn check_without_baseline_file_synthesizes_base_state_from_two_scan() {
     let repo = git_repo_with_family();
     let root = repo.path();
     git(root, &["add", "."]);
@@ -402,8 +402,26 @@ fn check_without_baseline_treats_touched_findings_as_new() {
     fs::write(root.join("m0.rs"), edited).unwrap();
 
     let report = reprise::check::run(root, &Config::default(), "HEAD", None).unwrap();
-    assert_eq!(report.baseline_total, 0);
-    assert!(report.failed(), "un-baselined touched duplicate must fail");
+    // Two-scan mode: base state comes from scanning the base ref, so the
+    // pre-existing group IS the base state (not "everything is new") and the
+    // one-member edit fails as an inconsistent update, not a new finding.
+    assert!(report.base_state.starts_with("base-scan"));
+    assert!(
+        report.baseline_total > 0,
+        "base scan must supply base state"
+    );
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|f| f.kind == "inconsistent-update"),
+        "{:#?}",
+        report.findings
+    );
+    assert!(
+        report.failed(),
+        "touched member of a base-state group must gate"
+    );
 }
 
 // ---------- CLI exit codes (spec §2) ----------
@@ -424,7 +442,8 @@ fn cli_check_exit_codes() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(root.join("reprise-baseline.json").is_file());
+    // Default baseline path is transient (never a tracked artifact).
+    assert!(root.join(".reprise/baseline.json").is_file());
 
     git(root, &["add", "."]);
     git(root, &["commit", "-qm", "baseline"]);
@@ -570,9 +589,59 @@ fn check_without_baseline_prints_adoption_hint() {
     std::fs::write(root.join("a.py"), a).unwrap();
     let report = reprise::check::run(root, &reprise::Config::default(), "HEAD", None).unwrap();
     assert!(report.baseline_missing);
+    assert!(
+        report.base_state.starts_with("base-scan"),
+        "{}",
+        report.base_state
+    );
     let text = report.render_terminal();
     assert!(
-        text.contains("reprise baseline"),
-        "adoption hint missing:\n{text}"
+        text.contains("base state: base-scan"),
+        "two-scan source line missing:\n{text}"
     );
+}
+
+/// Two-scan mode end to end (no baseline file anywhere): a 3-member family is
+/// committed, one member is edited — inconsistent-update must fire from the
+/// synthesized base state, and pre-existing duplication must be exempt.
+#[test]
+fn two_scan_mode_fires_inconsistent_update_without_any_baseline_file() {
+    let dir = git_repo_with_family();
+    let root = dir.path();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "init"]);
+    let cfg = Config::default();
+    // Pre-existing duplication, untouched: exempt, exit clean.
+    let clean = reprise::check::run(root, &cfg, "HEAD", None).unwrap();
+    assert!(
+        !clean.failed(),
+        "untouched pre-existing duplication must be exempt in two-scan mode: {:#?}",
+        clean.findings
+    );
+    assert!(clean.base_state.starts_with("base-scan"));
+    // Edit exactly one member (m0 uses lit2 = 90*5 = 450).
+    let f0 = root.join("m0.rs");
+    let mut src = fs::read_to_string(&f0).unwrap();
+    src = src.replace("> 450", "> 999");
+    assert!(src.contains("> 999"), "edit did not apply");
+    fs::write(&f0, src).unwrap();
+    let report = reprise::check::run(root, &cfg, "HEAD", None).unwrap();
+    let iu = report
+        .findings
+        .iter()
+        .find(|f| f.kind == "inconsistent-update")
+        .unwrap_or_else(|| {
+            panic!(
+                "no inconsistent-update in two-scan mode: {:#?}",
+                report.findings
+            )
+        });
+    assert_eq!(iu.touched.len(), 1);
+    assert_eq!(iu.untouched.len(), 2);
+    assert!(report.failed());
+    // Transient base-state cache exists under .reprise (never in VCS).
+    assert!(root.join(".reprise/base-state").is_dir());
+    // Second run reuses it.
+    let again = reprise::check::run(root, &cfg, "HEAD", None).unwrap();
+    assert_eq!(again.base_state, "base-scan (cached)");
 }

@@ -32,7 +32,7 @@ pub struct BaselineCfg {
 impl Default for BaselineCfg {
     fn default() -> Self {
         BaselineCfg {
-            file: "reprise-baseline.json".into(),
+            file: ".reprise/baseline.json".into(),
             track_drift: true,
         }
     }
@@ -43,11 +43,19 @@ impl Default for BaselineCfg {
 pub struct CacheCfg {
     /// Version-keyed per-file cache under `.reprise/cache/` (spec §4, D8/D19).
     pub enabled: bool,
+    /// Internal: read/write the cache under this root instead of the scan
+    /// root — lets a base-ref worktree scan reuse the main repo's warm cache
+    /// (keys are relative-path + content, identical for unchanged files).
+    #[serde(skip)]
+    pub shared_root: Option<std::path::PathBuf>,
 }
 
 impl Default for CacheCfg {
     fn default() -> Self {
-        CacheCfg { enabled: true }
+        CacheCfg {
+            enabled: true,
+            shared_root: None,
+        }
     }
 }
 

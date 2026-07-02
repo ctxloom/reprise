@@ -774,3 +774,18 @@ are single-statement wrappers around the already-extracted `str` helper — the 
 shape as the field-reported fix-pattern noise. The fixture stays in the corpus as a
 NEGATIVE (must-stay-silent) case, pinning the suppression. This is one hand-labeled
 TP consciously traded for the remedy-pattern suppression; net field precision wins.
+
+## D38 — Two-scan is check's default; baseline demoted to optional, transient-by-default curation (2026-07-02)
+
+User decision ("I'm not a fan of storing derivative artifacts in VCS"; "yes, two
+scan"; "though that file may live as a transient"). `check` without a baseline file
+now synthesizes base state by scanning the base ref in a temp git worktree (reusing
+the content-keyed cache via `cache.shared_root`, so unchanged files are warm hits)
+and caches the synthesized state transiently under `.reprise/base-state/<sha>-<cfg>`.
+Adoption therefore needs no artifact: pre-existing duplication is exempt, and
+inconsistent-update/worsened findings fire from base state. The baseline file remains
+as an opt-in curation layer — it uniquely provides a FIXED drift reference (cumulative
+drift across PRs, vs two-scan's per-PR moving reference) and a reviewable/editable
+acceptance set — and its default path moved to the untracked `.reprise/baseline.json`
+(spec §9 said repo root; deviation recorded here). The repo's own committed
+reprise-baseline.json was removed; reprise dogfoods two-scan mode in CI.

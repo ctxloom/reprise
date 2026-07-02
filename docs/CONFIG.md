@@ -115,7 +115,7 @@ construction; the evidence is the shared rare-callee list).
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `file` | string | `"reprise-baseline.json"` | Baseline filename, resolved relative to the scan root. Written by `reprise baseline`, read by `reprise check`. |
+| `file` | string | `".reprise/baseline.json"` | Baseline filename, resolved relative to the scan root. Written by `reprise baseline`, read by `reprise check`. |
 | `track_drift` | bool | `true` | Emit `inconsistent-update` findings and divergence-trend (`drifting`) notes on baselined groups (spec §6). |
 
 ## `[cache]`
