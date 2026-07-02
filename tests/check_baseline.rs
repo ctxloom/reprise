@@ -289,7 +289,7 @@ fn drift_scenario_emits_inconsistent_update_naming_untouched_members() {
     );
     // Terminal rendering leads with the inconsistent-update finding and shows
     // base-state counts in the header (D40 wording).
-    let text = report.render_terminal();
+    let text = report.render_terminal(false);
     assert!(text.contains("inconsistent-update"), "{text}");
     assert!(text.contains("base state"), "{text}");
     assert!(text.contains("process_batch_1"), "{text}");
@@ -679,6 +679,48 @@ fn region_drift_is_span_precise() {
             .iter()
             .any(|f| f.kind == "inconsistent-update"),
         "in-run edit must fire region IU: {:#?}",
+        report.findings
+    );
+}
+
+/// D41: `reprise:accept-drift` on the touched member demotes IU to info —
+/// the unit stays covered by every other tier, unlike `reprise:ignore`.
+#[test]
+fn accept_drift_pragma_demotes_iu_to_info() {
+    let repo = git_repo_with_family();
+    let root = repo.path();
+    // Mark m0 as accepted-drift BEFORE the baseline commit.
+    // family_member starts with a newline; the pragma must sit directly
+    // above the fn line (blank lines end the upward scan by design).
+    let marked = family_member(0).replacen('\n', "\n// reprise:accept-drift\n", 1);
+    fs::write(root.join("m0.rs"), &marked).unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "baseline"]);
+
+    // One-sided edit to the accepted unit.
+    fs::write(
+        root.join("m0.rs"),
+        marked.replace("total", "running_sum").replace("90", "77"),
+    )
+    .unwrap();
+    let report = reprise::check::run(root, &Config::default(), "HEAD", None).unwrap();
+    let iu: Vec<_> = report
+        .findings
+        .iter()
+        .filter(|f| f.kind == "inconsistent-update")
+        .collect();
+    assert_eq!(iu.len(), 1, "IU still REPORTS: {:#?}", report.findings);
+    assert!(!iu[0].fails, "accept-drift demotes IU to info");
+    assert!(!report.failed());
+
+    // Control: the same edit on an unmarked sibling still gates.
+    fs::write(root.join("m0.rs"), &marked).unwrap(); // revert
+    let m1 = family_member(1).replace("acc", "running_sum");
+    fs::write(root.join("m1.rs"), m1).unwrap();
+    let report = reprise::check::run(root, &Config::default(), "HEAD", None).unwrap();
+    assert!(
+        report.failed(),
+        "unmarked member must still gate: {:#?}",
         report.findings
     );
 }

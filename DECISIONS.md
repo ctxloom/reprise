@@ -817,3 +817,23 @@ What the file bought (D38) maps onto refs: fixed drift reference = pinned ref;
 "moving the acceptance point" = an ordinary reviewable one-line pin bump. The one
 capability with no ref equivalent — surgically un-accepting a single group while
 keeping the rest — falls to `reprise:ignore` pragmas or an actual cleanup.
+
+## D41 — Field-feedback round two (2026-07-02)
+
+(a) **`reprise:accept-drift` pragma** — the missing per-finding IU exemption
+("the big one" in the report). A file-based `reprise exempt` store would
+reintroduce the derived artifact D40 killed; a source pragma is reviewable,
+co-located, and survives refactors. Semantics: the unit stays covered by every
+tier; IU findings whose TOUCHED members all carry the pragma report as info.
+(b) **`git archive` fallback** for base-state extraction: `git worktree add`
+failed in the field on a multi-worktree clone (".git/index: Not a directory",
+unreproducible); archive reads only objects — no per-checkout admin state.
+Caveat recorded: archive honors export-ignore, so the fallback path can omit
+attribute-excluded files. (c) **Verbose source dumps**: `scan --verbose` and
+`check --verbose` print each member's actual source (line-numbered, capped)
+under its reference. (d) Report items 3 (check substantiality floor,
+prod-vs-test-fake pairing) were already fixed in D37/D39 — the field binary
+predated them; item 4a (`reprise baseline` arg errors) is moot post-D40.
+(e) Follow-up recorded, not built: rare-token (IDF) substantiality floor so
+ubiquitous-idiom runs (getFS/result/warnings-class) don't reach reports even
+at length — needs calibration against the M4a sample method.

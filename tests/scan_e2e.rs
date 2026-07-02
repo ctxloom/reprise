@@ -174,3 +174,19 @@ fn parse_degraded_units_are_still_indexed() {
     assert!(report.stats.units_indexed >= 1, "degraded unit was dropped");
     assert!(report.stats.parse_degraded_units >= 1);
 }
+
+#[test]
+fn verbose_render_dumps_member_source() {
+    let repo = build_repo();
+    let report = reprise::scan(repo.path(), &Config::default()).unwrap();
+    let terse = report.render_terminal(20, false);
+    let verbose = report.render_terminal(20, true);
+    // The actual source of a member appears only in verbose mode.
+    assert!(!terse.contains("running_total += score"));
+    assert!(
+        verbose.contains("running_total += score"),
+        "verbose must dump member source:\n{verbose}"
+    );
+    // Line-numbered gutter format.
+    assert!(verbose.contains("│"));
+}

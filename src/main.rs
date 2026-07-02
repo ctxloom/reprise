@@ -52,6 +52,9 @@ enum Command {
         /// Output format: terminal | json | sarif | cpd | jscpd.
         #[arg(long, default_value = "terminal")]
         format: String,
+        /// Dump each member's actual source under its file:line reference.
+        #[arg(long)]
+        verbose: bool,
     },
 }
 
@@ -119,6 +122,7 @@ fn run() -> anyhow::Result<i32> {
             base,
             fail_on,
             format,
+            verbose,
         } => {
             let config = reprise::Config::load(&path)?;
             let base = base
@@ -128,7 +132,7 @@ fn run() -> anyhow::Result<i32> {
                 ))?;
             let report = reprise::check::run(&path, &config, &base, fail_on.as_deref())?;
             match format.as_str() {
-                "terminal" => emit(&report.render_terminal())?,
+                "terminal" => emit(&report.render_terminal(verbose))?,
                 "json" => emit(&format!("{}\n", serde_json::to_string_pretty(&report)?))?,
                 "sarif" => emit(&format!(
                     "{}\n",

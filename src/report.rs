@@ -186,6 +186,8 @@ pub struct UnitSummary {
     pub file: PathBuf,
     pub name: String,
     pub line_span: (u32, u32),
+    /// `reprise:accept-drift` (D41): IU on this unit reports as info.
+    pub accept_drift: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -248,7 +250,7 @@ impl ScanReport {
             out.push_str("\nno duplicate groups found\n");
         }
         for (i, group) in self.groups.iter().take(top).enumerate() {
-            render_group(&mut out, i + 1, group);
+            render_group(&mut out, i + 1, group, verbose);
         }
         if self.groups.len() > top {
             out.push_str(&format!(
@@ -267,7 +269,7 @@ impl ScanReport {
                 .take(if verbose { top } else { 3 })
                 .enumerate()
             {
-                render_group(&mut out, i + 1, group);
+                render_group(&mut out, i + 1, group, verbose);
             }
         }
         if !self.api_groups.is_empty() {
@@ -281,7 +283,7 @@ impl ScanReport {
                 .take(if verbose { top } else { 3 })
                 .enumerate()
             {
-                render_group(&mut out, i + 1, group);
+                render_group(&mut out, i + 1, group, verbose);
             }
         }
         if verbose && !self.weak_groups.is_empty() {
@@ -290,14 +292,49 @@ impl ScanReport {
                 self.weak_groups.len()
             ));
             for (i, group) in self.weak_groups.iter().take(top).enumerate() {
-                render_group(&mut out, i + 1, group);
+                render_group(&mut out, i + 1, group, verbose);
             }
         }
         out
     }
 }
 
-fn render_group(out: &mut String, rank: usize, group: &Group) {
+/// Verbose mode: dump each member's actual source (capped) under its line —
+/// the reviewer sees the real code refs next to the template (D41 feedback).
+/// Note: check-mode members render root-relative; resolution falls back to
+/// the path as given, so run from the repo root for source dumps in check.
+pub(crate) fn render_member_source_block(out: &mut String, member: &Member) {
+    render_member_source(out, member)
+}
+
+fn render_member_source(out: &mut String, member: &Member) {
+    const CAP: usize = 24;
+    let Ok(text) = std::fs::read_to_string(&member.file) else {
+        return;
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    let start = member.line_span.0.max(1) as usize - 1;
+    let end = (member.line_span.1 as usize).min(lines.len());
+    if start >= end {
+        return;
+    }
+    for (i, line) in lines[start..end].iter().take(CAP).enumerate() {
+        out.push_str(&format!(
+            "      {:>4} │ {line}
+",
+            start + i + 1
+        ));
+    }
+    if end - start > CAP {
+        out.push_str(&format!(
+            "           │ … {} more lines
+",
+            end - start - CAP
+        ));
+    }
+}
+
+fn render_group(out: &mut String, rank: usize, group: &Group, verbose: bool) {
     let similarity = if group.divergence > 0.0 {
         format!(" · similarity {:.0}%", (1.0 - group.divergence) * 100.0)
     } else {
@@ -326,6 +363,9 @@ fn render_group(out: &mut String, rank: usize, group: &Group) {
             member.name,
             degraded,
         ));
+        if verbose {
+            render_member_source(out, member);
+        }
     }
     if let Some(chain) = &group.inline_chain {
         for link in chain {

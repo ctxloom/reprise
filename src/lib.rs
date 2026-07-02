@@ -471,6 +471,7 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
             file: u.file.clone(),
             name: u.name.clone(),
             line_span: u.line_span,
+            accept_drift: u.accept_drift,
         })
         .collect();
 

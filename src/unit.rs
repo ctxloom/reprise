@@ -36,6 +36,9 @@ pub struct Unit {
     pub token_count: u32,
     pub parse_degraded: bool,
     pub is_test: bool,
+    /// `reprise:accept-drift` pragma (D41): one-sided edits to this unit
+    /// report inconsistent-update as info instead of failing.
+    pub accept_drift: bool,
     pub fingerprint: u128,
     pub tree: NormNode,
     /// Some for inline-expanded variants; None for plain units.
@@ -70,21 +73,25 @@ pub struct FileUnits {
     pub suppressed: usize,
 }
 
-/// `reprise:ignore` pragma (spec §2): a comment containing the marker on the
-/// unit's first line or the line above it suppresses the unit from ALL
-/// tiers. Substring match — see DECISIONS.md D21. Single-line attributes /
-/// decorators / annotations between the pragma and the `fn`/`def` line are
-/// skipped when scanning upward (D21 refined in M4a; multi-line attribute
+/// Unit pragmas (spec §2 + D41): a comment containing a marker on the unit's
+/// first line or the line above it. Substring match — see DECISIONS.md D21.
+/// Single-line attributes / decorators / annotations between the pragma and
+/// the `fn`/`def` line are skipped when scanning upward (multi-line attribute
 /// arguments remain unhandled).
-fn is_suppressed(lines: &[&str], first_line: u32) -> bool {
-    let marked = |ln: u32| {
+///
+/// - `reprise:ignore` — suppress the unit from ALL tiers.
+/// - `reprise:accept-drift` — the unit stays fully covered, but a one-sided
+///   edit to it no longer FAILS inconsistent-update (reports as info): the
+///   reviewed, source-located, D40-compatible way to accept divergence.
+fn pragma_line(lines: &[&str], first_line: u32) -> Option<u32> {
+    let has_pragma = |ln: u32| {
         ln >= 1
             && lines
                 .get(ln as usize - 1)
-                .is_some_and(|l| l.contains("reprise:ignore"))
+                .is_some_and(|l| l.contains("reprise:ignore") || l.contains("reprise:accept-drift"))
     };
-    if marked(first_line) {
-        return true;
+    if has_pragma(first_line) {
+        return Some(first_line);
     }
     let mut ln = first_line.saturating_sub(1);
     while ln >= 1 {
@@ -97,9 +104,19 @@ fn is_suppressed(lines: &[&str], first_line: u32) -> bool {
             ln -= 1;
             continue;
         }
-        return marked(ln);
+        return has_pragma(ln).then_some(ln);
     }
-    false
+    None
+}
+
+fn is_suppressed(lines: &[&str], first_line: u32) -> bool {
+    pragma_line(lines, first_line)
+        .is_some_and(|ln| lines[ln as usize - 1].contains("reprise:ignore"))
+}
+
+fn accepts_drift(lines: &[&str], first_line: u32) -> bool {
+    pragma_line(lines, first_line)
+        .is_some_and(|ln| lines[ln as usize - 1].contains("reprise:accept-drift"))
 }
 
 pub fn extract_file_units_keep_raw(path: &Path, src: &str, lang: Lang, cfg: &Config) -> FileUnits {
@@ -115,10 +132,11 @@ pub fn extract_file_units_keep_raw(path: &Path, src: &str, lang: Lang, cfg: &Con
             out.suppressed += 1;
             continue;
         }
+        let accept_drift = accepts_drift(&lines, raw.line_span.0);
         let raw_tree =
             std::mem::replace(&mut raw.tree, NormNode::new("", None, (0, 0), Vec::new()));
         let (tree, found) = pass_and_fold(raw_tree.clone(), lang, cfg);
-        let unit = unit_from_tree(path, lang, &raw, tree);
+        let unit = unit_from_tree(path, lang, &raw, tree, accept_drift);
         for f in found {
             // Report a run only when the duplicated mass clears the sequence floor.
             if f.template_tokens * f.count >= cfg.thresholds.min_seq_tokens {
@@ -165,7 +183,13 @@ fn pass_and_fold(tree: NormNode, lang: Lang, cfg: &Config) -> (NormNode, Vec<Rep
     (tree, found)
 }
 
-fn unit_from_tree(path: &Path, lang: Lang, raw: &RawUnit, tree: NormNode) -> Unit {
+fn unit_from_tree(
+    path: &Path,
+    lang: Lang,
+    raw: &RawUnit,
+    tree: NormNode,
+    accept_drift: bool,
+) -> Unit {
     Unit {
         file: path.to_path_buf(),
         lang,
@@ -175,6 +199,7 @@ fn unit_from_tree(path: &Path, lang: Lang, raw: &RawUnit, tree: NormNode) -> Uni
         token_count: tree.token_count(),
         parse_degraded: raw.parse_degraded,
         is_test: raw.is_test,
+        accept_drift,
         fingerprint: fingerprint::merkle(&tree),
         tree,
         variant: None,
@@ -206,6 +231,7 @@ pub fn finish_variant(
         token_count: tree.token_count(),
         parse_degraded: base.parse_degraded,
         is_test: base.is_test,
+        accept_drift: base.accept_drift,
         fingerprint,
         tree,
         variant: Some(VariantTag {

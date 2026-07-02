@@ -118,7 +118,10 @@ diverge (the differing attribute). The `for` loops all normalized to the same
 `while`/`break`/`continue` core, which is why the divergence is 2% and not more.
 
 `--format json|sarif|cpd|jscpd` switches output; `--top N` caps the terminal list
-(0 = all); `--verbose` adds the weak-similarity and full test/api sections.
+(0 = all); `--verbose` adds the weak-similarity and full test/api sections **and
+dumps each member's actual source** (line-numbered) under its file:line reference
+— review findings without opening files. `check --verbose` does the same for
+touched/untouched members.
 
 ### The baseline is a git ref — never a file
 
@@ -141,9 +144,15 @@ ref = "v1.4.0"   # or a commit sha — check uses this when --base is omitted
 the pin (an ordinary, reviewable one-line diff). Rolling gates just pass
 `--base origin/main` explicitly, as CI does.
 
-An inline `// reprise:ignore` comment on a unit's first line (or directly above
-it) suppresses that unit from all tiers; suppression counts appear in scan stats
-so they can't silently accumulate.
+Two source pragmas (a comment on the unit's first line or directly above it)
+put acceptance decisions where they belong — in reviewed source, not derived
+files:
+
+- `reprise:ignore` — suppress the unit from **all** tiers.
+- `reprise:accept-drift` — the unit stays fully covered, but a one-sided edit
+  to it reports `inconsistent-update` as information instead of failing: the
+  reviewed way to say "this copy is allowed to diverge." Suppression counts
+  appear in scan stats so neither can silently accumulate.
 
 ### `reprise check <path> --base <ref>` — the drift workflow (flagship)
 

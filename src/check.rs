@@ -198,6 +198,9 @@ fn member_matches(bm: &BaselineMember, file_rel: &str, name: &str, span: (u32, u
 struct BaseWorktree {
     repo: PathBuf,
     dir: tempfile::TempDir,
+    /// True when populated via the git-archive fallback: nothing to
+    /// `git worktree remove` on drop.
+    archived: bool,
 }
 
 impl BaseWorktree {
@@ -211,14 +214,40 @@ impl BaseWorktree {
             .arg(&path)
             .arg(base)
             .output()?;
+        if out.status.success() {
+            return Ok(BaseWorktree {
+                repo: repo.to_path_buf(),
+                dir,
+                archived: false,
+            });
+        }
+        // Fallback (D41): `git worktree add` depends on per-checkout admin
+        // state and has failed in the field on multi-worktree clones
+        // (".git/index: Not a directory"). `git archive` only reads objects —
+        // no worktree machinery at all. Caveat: it honors export-ignore
+        // attributes, so an attribute-excluded file would be missing from the
+        // base scan; acceptable for a fallback path.
+        std::fs::create_dir_all(&path)?;
+        let arch = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "git -C '{}' archive '{}' | tar -x -C '{}'",
+                repo.display(),
+                base,
+                path.display()
+            ))
+            .output()?;
         anyhow::ensure!(
-            out.status.success(),
-            "git worktree add for base `{base}` failed: {}",
-            String::from_utf8_lossy(&out.stderr)
+            arch.status.success(),
+            "git worktree add for base `{base}` failed ({}) and the git-archive \
+             fallback also failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim(),
+            String::from_utf8_lossy(&arch.stderr).trim()
         );
         Ok(BaseWorktree {
             repo: repo.to_path_buf(),
             dir,
+            archived: true,
         })
     }
     fn path(&self) -> PathBuf {
@@ -228,6 +257,9 @@ impl BaseWorktree {
 
 impl Drop for BaseWorktree {
     fn drop(&mut self) {
+        if self.archived {
+            return; // TempDir cleanup suffices
+        }
         let _ = Command::new("git")
             .arg("-C")
             .arg(&self.repo)
@@ -364,6 +396,7 @@ pub fn run(
             let region = e.tier == "exact-region";
             let mut touched: Vec<Member> = Vec::new();
             let mut untouched: Vec<Member> = Vec::new();
+            let mut touched_accepts = true;
             for bm in &e.members {
                 // Map the snapshot onto the current tree: same file, matching
                 // name first, overlapping span second.
@@ -392,6 +425,7 @@ pub fn run(
                     parse_degraded: false,
                 };
                 if is_touched {
+                    touched_accepts &= unit.is_some_and(|u| u.accept_drift);
                     touched.push(member);
                 } else {
                     untouched.push(member);
@@ -413,7 +447,9 @@ pub fn run(
                 // hard; shared-run (region) drift is real information but a
                 // legitimate one-sided change has no acceptance path in
                 // artifact-free mode, so it reports without failing (D39).
-                fails: fails(Tier::InconsistentUpdate) && !region,
+                // `reprise:accept-drift` on every touched member is the
+                // reviewed, source-located acceptance record (D41).
+                fails: fails(Tier::InconsistentUpdate) && !region && !touched_accepts,
                 group: Group {
                     id: String::new(),
                     tier: Tier::InconsistentUpdate,
@@ -550,7 +586,7 @@ pub fn run(
 // baseline counts in the header) ----------
 
 impl CheckReport {
-    pub fn render_terminal(&self) -> String {
+    pub fn render_terminal(&self, verbose: bool) -> String {
         let s = &self.stats;
         let mut out = format!(
             "reprise check vs {}: {} touched units of {} indexed; base state: {} findings \
@@ -599,13 +635,22 @@ impl CheckReport {
                 ));
                 for m in &f.touched {
                     out.push_str(&format!("    touched:   {}\n", member_line(m)));
+                    if verbose {
+                        crate::report::render_member_source_block(&mut out, m);
+                    }
                 }
                 for m in &f.untouched {
                     out.push_str(&format!("    UNTOUCHED: {}\n", member_line(m)));
+                    if verbose {
+                        crate::report::render_member_source_block(&mut out, m);
+                    }
                 }
             } else {
                 for m in &f.group.members {
                     out.push_str(&format!("    {}\n", member_line(m)));
+                    if verbose {
+                        crate::report::render_member_source_block(&mut out, m);
+                    }
                 }
             }
             if let Some((was, now)) = f.trend {
