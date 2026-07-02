@@ -1,9 +1,10 @@
-//! Wild-pair recall net (DECISIONS.md D6): every fixture under `benches/wild/`
-//! is the verbatim source of a hand-labeled TRUE-POSITIVE finding from the
-//! Phase-4 stratified precision sample (provenance in benches/wild/README.md).
-//! Each must keep converging at its labeled tier — a non-synthetic regression
-//! guard that, unlike the mutation benchmark, cannot be gamed by rules that
-//! merely invert our own generators.
+//! Wild recall/precision net (DECISIONS.md D6): fixtures under `benches/wild/`
+//! are verbatim sources of hand-labeled findings from the Phase-4 stratified
+//! sample (provenance in benches/wild/README.md). Tier-labeled fixtures must
+//! keep converging; `"none"` fixtures are documented NON-findings (patterns
+//! reprise deliberately suppresses, e.g. thin delegation wrappers, D37) and
+//! must stay silent. Unlike the mutation benchmark this cannot be gamed by
+//! rules that merely invert our own generators.
 
 use reprise::config::Config;
 use std::path::PathBuf;
@@ -17,7 +18,10 @@ const WILD: &[(&str, &str, usize)] = &[
     ("w5_serde_tagorcontent", "near-normalized", 2),
     ("w6_flask_maxprops", "near-normalized", 2),
     ("w7_click_chunkpump", "exact-region", 2),
-    ("w8_ripgrep_convert", "inline-assisted", 2),
+    // Relabeled TP→by-design non-finding (D37): usize/u64 are single-statement
+    // wrappers around the already-extracted `str` helper — flagging residual
+    // thin delegation is the tool flagging its own recommended fix pattern.
+    ("w8_ripgrep_convert", "none", 0),
     ("w9_ripgrep_cpufeatures", "internal-repeat", 1),
 ];
 
@@ -34,6 +38,14 @@ fn every_wild_pair_converges_at_its_labeled_tier() {
         assert!(root.is_dir(), "missing wild fixture {dir}");
         let report = reprise::scan(&root, &cfg)
             .unwrap_or_else(|e| panic!("scan of wild fixture {dir} failed: {e}"));
+        if *tier == "none" {
+            assert!(
+                report.groups.is_empty(),
+                "wild non-finding {dir} started converging (groups: {:#?})",
+                report.groups
+            );
+            continue;
+        }
         let hit = report
             .groups
             .iter()

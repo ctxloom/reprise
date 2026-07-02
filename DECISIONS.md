@@ -767,3 +767,10 @@ folds a freshly-extracted helper back in, making reprise flag its own recommende
 fix pattern. Real reimplemented-helper callers have surrounding code by definition.
 (c) `check` without a baseline file prints an adoption hint (run + commit
 `reprise baseline .`) since every finding otherwise reports as new.
+
+**D37 addendum:** the thin-delegation rule relabeled wild fixture
+`w8_ripgrep_convert` (M4a sample TP → by-design non-finding): `convert::usize`/`u64`
+are single-statement wrappers around the already-extracted `str` helper — the same
+shape as the field-reported fix-pattern noise. The fixture stays in the corpus as a
+NEGATIVE (must-stay-silent) case, pinning the suppression. This is one hand-labeled
+TP consciously traded for the remedy-pattern suppression; net field precision wins.
