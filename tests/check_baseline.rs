@@ -468,3 +468,111 @@ fn cli_check_exit_codes() {
         String::from_utf8_lossy(&out.stdout)
     );
 }
+
+// ---- D37: user-feedback fixes (micro-regions in check, thin wrappers, hint) ----
+
+/// Two functions sharing a ~35-token idiom run (micro: below
+/// report.micro_region_tokens) plus one pair sharing a substantial run.
+#[test]
+fn check_emits_only_substantial_regions() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    // Micro shared run (small env-copy idiom) inside otherwise-unrelated fns.
+    let micro =
+        "    out = {}\n    for key, value in sorted(env.items()):\n        out[key] = str(value)\n";
+    std::fs::write(
+        root.join("a.py"),
+        format!("def run_cli(env, args):\n{micro}    launch(args, out)\n    monitor(out)\n    return collect_logs(out, args)\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("b.py"),
+        format!("def clone_server(env, spec):\n{micro}    validated = check_spec(spec, out)\n    persist(validated)\n    return handle(validated, spec)\n"),
+    )
+    .unwrap();
+    git(root, &["init", "-q"]);
+    git(root, &["add", "-A"]);
+    git(
+        root,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "init",
+        ],
+    );
+    std::fs::write(root.join("c.py"), "def unrelated():\n    return 1\n").unwrap();
+    let mut a = std::fs::read_to_string(root.join("a.py")).unwrap();
+    a.push_str("\n# touch\n");
+    std::fs::write(root.join("a.py"), a).unwrap();
+    let report = reprise::check::run(root, &reprise::Config::default(), "HEAD", None).unwrap();
+    assert!(
+        !report
+            .findings
+            .iter()
+            .any(|f| f.group.tier == reprise::report::Tier::ExactRegion
+                && f.group.token_count < reprise::Config::default().report.micro_region_tokens),
+        "micro-regions must not surface in check: {:#?}",
+        report
+            .findings
+            .iter()
+            .map(|f| (f.group.tier, f.group.token_count))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Thin delegation wrappers (single-statement bodies calling a shared helper)
+/// must not re-match through inlining — that is the recommended fix pattern.
+#[test]
+fn thin_delegation_wrappers_do_not_match_via_inlining() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("m.py"),
+        "def render_shared(items, kind, limit):\n    rows = []\n    for item in items:\n        if item.weight > limit:\n            rows.append(format_row(item, kind))\n        else:\n            rows.append(placeholder(kind))\n        audit(item, kind)\n    return assemble(rows, kind)\n\n\ndef placeholder_fragments(items, limit):\n    return render_shared(items, \"fragments\", limit)\n\n\ndef placeholder_prompts(items, limit):\n    return render_shared(items, \"prompts\", limit)\n\n\ndef placeholder_mcp(items, limit):\n    return render_shared(items, \"mcp\", limit)\n",
+    )
+    .unwrap();
+    let report = reprise::scan(root, &reprise::Config::default()).unwrap();
+    assert!(
+        !report
+            .groups
+            .iter()
+            .any(|g| g.tier == reprise::report::Tier::InlineAssisted),
+        "delegation wrappers re-matched via inlining: {:#?}",
+        report.groups
+    );
+}
+
+#[test]
+fn check_without_baseline_prints_adoption_hint() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("a.py"), "def f(x):\n    return x\n").unwrap();
+    git(root, &["init", "-q"]);
+    git(root, &["add", "-A"]);
+    git(
+        root,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "init",
+        ],
+    );
+    let mut a = std::fs::read_to_string(root.join("a.py")).unwrap();
+    a.push_str("\n# touch\n");
+    std::fs::write(root.join("a.py"), a).unwrap();
+    let report = reprise::check::run(root, &reprise::Config::default(), "HEAD", None).unwrap();
+    assert!(report.baseline_missing);
+    let text = report.render_terminal();
+    assert!(
+        text.contains("reprise baseline"),
+        "adoption hint missing:\n{text}"
+    );
+}

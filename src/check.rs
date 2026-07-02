@@ -168,6 +168,9 @@ pub struct CheckReport {
     /// Inconsistent-update findings first, then by §6 tier order.
     pub findings: Vec<CheckFinding>,
     pub failing: usize,
+    /// No reprise-baseline.json at the scan root: every finding reports as
+    /// new, so `check` gates pre-existing duplication too (adoption hint).
+    pub baseline_missing: bool,
     /// Baseline entries in the gating (`main`) section; 0 = no baseline file.
     pub baseline_total: usize,
     /// Current findings matched to a baseline entry.
@@ -320,6 +323,13 @@ pub fn run(
     let mut baseline_matched = 0usize;
     let mut baseline_exempt = 0usize;
     for g in &report.groups {
+        // Micro-regions stay in `scan` output (ranked low, counted honestly)
+        // but are noise at commit time — a 4-line idiom shared with an
+        // unrelated function isn't review-worthy. Substantial regions only
+        // (user feedback; same floor as the scan summary split, D36/D37).
+        if g.tier == Tier::ExactRegion && g.token_count < cfg.report.micro_region_tokens {
+            continue;
+        }
         let touched: Vec<Member> = g
             .members
             .iter()
@@ -413,6 +423,7 @@ pub fn run(
         fail_on,
         findings,
         failing,
+        baseline_missing: baseline.is_none(),
         baseline_total: main_entries.len(),
         baseline_matched,
         baseline_exempt,
@@ -441,6 +452,13 @@ impl CheckReport {
             s.cache_misses,
             s.duration_ms,
         );
+        if self.baseline_missing {
+            out.push_str(
+                "note: no reprise-baseline.json — every finding above reports as NEW, \
+                 including pre-existing duplication. Run `reprise baseline .` (and commit \
+                 the file) to adopt; check then gates only new or worsened findings.\n",
+            );
+        }
         if self.findings.is_empty() {
             out.push_str(&format!(
                 "\nclean: no reportable findings (fail_on {})\n",

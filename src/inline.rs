@@ -277,6 +277,20 @@ pub struct Expansion {
     pub ambiguity_skips: u32,
 }
 
+impl Expansion {
+    /// No-op expansion (unit skipped: thin delegation, D37).
+    fn skipped(raw: &NormNode) -> Expansion {
+        Expansion {
+            tree: raw.clone(),
+            chain: Vec::new(),
+            expanded_units: Vec::new(),
+            scc: false,
+            calls_inlined: 0,
+            ambiguity_skips: 0,
+        }
+    }
+}
+
 struct Ctx<'a> {
     table: &'a DefTable<'a>,
     cfg: &'a Config,
@@ -312,6 +326,14 @@ pub fn expand_unit(
 ) -> Expansion {
     let lang = units[unit_idx].lang;
     let profile = lang.profile();
+    // Pure delegation bodies (a single top-level statement, i.e. a thin
+    // wrapper around one call) get no inline variant: expanding one folds the
+    // helper back in, so freshly-extracted helpers' wrappers would re-match
+    // each other — reprise flagging its own recommended fix (user feedback,
+    // D37). Real reimplemented-helper cases have surrounding code.
+    if crate::lang::child_field(raw, "body").is_some_and(|b| b.children.len() <= 1) {
+        return Expansion::skipped(raw);
+    }
     let scc_partners: HashSet<usize> = match table.def_of_unit.get(&unit_idx) {
         Some(&d) if table.scc_sizes[table.scc_of[d]] >= 2 => (0..table.defs.len())
             .filter(|&e| e != d && table.scc_of[e] == table.scc_of[d])

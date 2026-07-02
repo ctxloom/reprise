@@ -753,3 +753,17 @@ subset carried a stronger tier (`group::dedupe_subset_groups`, unit-tested with 
 reported shape); (b) the summary line reports `exact-region: N substantial of M`
 using `report.micro_region_tokens` (default 60) so the headline reflects what the
 ranking values instead of the micro-region long tail.
+
+## D37 — Check-mode noise fixes from field feedback (2026-07-02)
+
+Real-usage feedback (lefthook pre-commit wiring): (a) `check` now applies the
+`report.micro_region_tokens` floor to exact-region emission — micro-regions (4-line
+map-copy idioms shared across unrelated functions) stay in `scan` output but are
+noise in exactly the mode an agent reads at commit time; this also covers the
+reported prod-unit↔4-line-test-fake pairing, which entered as a micro region (a
+4-line fake cannot clear the 40-token unit floor). (b) Units whose body is a single
+top-level statement (pure delegation wrappers) get no inline variant: expanding one
+folds a freshly-extracted helper back in, making reprise flag its own recommended
+fix pattern. Real reimplemented-helper callers have surrounding code by definition.
+(c) `check` without a baseline file prints an adoption hint (run + commit
+`reprise baseline .`) since every finding otherwise reports as new.
