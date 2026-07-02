@@ -204,6 +204,10 @@ Rust, Python, TypeScript (including TSX), Go, and Kotlin. Matching is
 **same-language only** — a Python unit is never compared against a Rust one — so
 multi-language repos scan cleanly with each language partitioned independently.
 
+**Planned:** Java, C#, C++, and C. A language is one `LanguageProfile` trait
+implementation plus a set of probed grammar rules, so additions are incremental
+— the five existing profiles are the templates.
+
 ## Output formats
 
 | `--format` | Use |
