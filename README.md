@@ -222,6 +222,71 @@ Precision is **measured, not asserted** — but honestly, on small samples:
 - **Performance.** Warm `check --base` on a synthetic **500k-LOC** corpus: **8.1 s**
   (against a ≤10 s gate); real repos scan in well under a second warm.
 
+## What reprise found in its own code
+
+Every finding below is a real duplication that reprise's own author (an LLM
+coding agent — the tool's exact target demographic) introduced *while building
+reprise*, caught by the tool during development. Each is hand-verified; together
+they are the tool's most honest demo. DECISIONS.md records the full history.
+
+**`synth_call` — the first-ever finding (Phase 1, `exact-normalized`).** The very
+first self-scan reported exactly one group: the helper that synthesizes call
+nodes had been written twice, minutes apart, in `src/lang/rust.rs` and
+`src/lang/python.rs`. The two copies differed only in grammar kind-name strings
+(`"call_expression"`/`"arguments"` vs `"call"`/`"argument_list"`) — string
+literals, which normalization buckets, so the exact tier saw identical trees. A
+textbook Type-2 clone, and exactly the "expression holes → parameters" recipe:
+consolidated into `lang::synth_call` with the kind names as parameters.
+
+**`synth_ident` — a triple (Phase 2, `exact-normalized`).** The identifier-leaf
+builder existed three times: `ident` in the Python profile, and — under two
+different names, `ident` and `ident_node`, in the *same file* — in the Rust
+profile. Author didn't notice; exact tier did. Consolidated.
+
+**`dump` — copy-paste caught within the hour (`exact-normalized`, 194 tokens).**
+A CST-dumping dev tool was copy-pasted from `examples/probe.rs` into a second
+probe binary during a debugging session. The next self-scan flagged the pair;
+the second binary was merged back into the first. Elapsed time from paste to
+detection: about an hour of wall-clock development.
+
+**`render_template_block` (Phase 3, self-scan during delegated development).**
+The agent building check-mode reporting re-implemented report.rs's
+template-rendering block rather than calling it — precisely the "reimplemented
+an existing helper" pattern from the problem statement — and its own self-scan
+caught it mid-milestone. Consolidated into a shared `report::render_template_block`.
+
+**The standing findings — accepted parallel implementations.** The self-scan
+persistently reports the five language profiles (`src/lang/{rust,python,typescript,go,kotlin}.rs`)
+as duplication: `lower_recursion` across profiles at 96% similarity
+(`near-normalized`, 224 shared tokens), `reassign_stmts` as a 289-token
+`exact-region`, upgraded by the inliner to `inline-assisted` once their shared
+helpers (`child_field`, `is_raw_ident`, `synth_ident`) are expanded. These are
+*correct findings about deliberate duplication*: the profiles are parallel
+implementations of one trait, kept separate on purpose. They stay in the report,
+and `check`'s two-scan mode exempts them automatically as pre-existing — which is
+the intended adoption story for any legacy codebase.
+
+**The drift gate red-teamed its own rollout (D39).** The first CI run of
+two-scan mode failed on the commit that introduced it — eight
+`inconsistent-update` findings, all "touching" the 450-line `scan()` function.
+That was a genuine bug the gate had just exposed in itself: region members were
+touch-mapped at enclosing-unit granularity, so any edit anywhere in a large
+function "touched" every shared idiom-run inside it. After the fix, the *next*
+CI run failed with exactly one finding — the now span-precise gate correctly
+noticing that the fix itself had legitimately diverged one side of a code run
+shared between `check.rs` and `lib.rs`. That second, *true* finding drove the
+final policy: unit-copy drift gates hard; shared-run drift reports as
+information. Two commits, two findings, one bug fixed and one design decision
+made — by the tool, about the tool.
+
+**One finding traded away, on the record.** The thin-delegation suppression
+(wrappers whose whole body is a single call — the residue of the recommended
+fix pattern) silenced a fixture the calibration sample had labeled a true
+positive: ripgrep's `convert::usize`/`u64`, single-statement wrappers around an
+already-extracted helper. Field judgment ("stop flagging the fix pattern") won;
+the fixture stays in the wild corpus as a must-stay-silent negative, pinning
+the suppression. Precision trades are recorded, not hidden (D37).
+
 ## How it works
 
 Four stages, per language partition (details in [`docs/PLAN.md`](docs/PLAN.md)):
@@ -250,7 +315,7 @@ Four stages, per language partition (details in [`docs/PLAN.md`](docs/PLAN.md)):
 Everything runs through [`just`](https://github.com/casey/just):
 
 ```sh
-just test             # cargo test --all-targets (117 tests)
+just test             # cargo test --all-targets (127 tests)
 just lint             # clippy -D warnings + cargo fmt --check
 just bench-mutations  # the mutation-recall gate (spec §7.1)
 just scan-self        # dogfood: scan reprise's own repo
@@ -262,7 +327,8 @@ the wild-pair recall net) — including it would drown the self-scan in benchmar
 duplication rather than the tool's own code. The self-scan legitimately reports the
 **five parallel language profiles** (`src/lang/{rust,python,typescript,go,kotlin}.rs`)
 as duplication: they are deliberate parallel implementations of one trait, and
-`reprise baseline .` records them so a `check` run gates only on *new* drift.
+`check`'s two-scan mode exempts them automatically as pre-existing (see
+"What reprise found in its own code" above).
 
 **`check` needs a commit.** `reprise check . --base HEAD` diffs against a git ref,
 so the repo must have at least one commit. A freshly-initialized repo with no
