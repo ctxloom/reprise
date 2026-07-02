@@ -2,7 +2,7 @@
 name = "reprise"
 version = "0.1.0"
 edition = "2024"
-description = "Semantic-ish duplicate detection for LLM-generated code: normalizes with tree-sitter, fingerprints structurally, and reports near-miss clones as anti-unification templates."
+description = "Semantic-ish code duplicate detection: normalizes with tree-sitter, fingerprints structurally, reports near-miss clones as anti-unification templates, and gates duplicate drift at PR time."
 license = "BSD-3-Clause"
 repository = "https://github.com/ctxloom/reprise"
 homepage = "https://github.com/ctxloom/reprise"

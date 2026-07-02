@@ -6,7 +6,7 @@ use std::path::PathBuf;
 #[command(
     name = "reprise",
     version,
-    about = "Duplicate detection for LLM-generated code"
+    about = "Code duplicate detection: scan, baseline, and PR-time drift gating"
 )]
 struct Cli {
     #[command(subcommand)]

@@ -1,4 +1,5 @@
-//! reprise — semantic-ish duplicate detection for LLM-generated code.
+//! reprise — semantic-ish code duplicate detection (a common and central
+//! use case: duplication and divergence from LLM coding agents).
 //! Spec: docs/PLAN.md (Rev 9); deviations: DECISIONS.md.
 
 pub mod api;

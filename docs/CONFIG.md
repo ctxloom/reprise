@@ -89,7 +89,7 @@ silently dropping true positives.
 
 ## `[inline]`
 
-Best-effort inliner (spec §5.4): converges "caller uses helper" with "LLM
+Best-effort inliner (spec §5.4): converges "caller uses helper" with "author
 reimplemented the helper's body inline."
 
 | Key | Type | Default | Meaning |

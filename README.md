@@ -1,26 +1,32 @@
 # reprise
 
-**Duplicate detection for LLM-generated code.** A *reprise* is a theme that
-returns in altered form — a near-duplicate.
+**Code duplicate detection.** A *reprise* is a theme that returns in altered
+form — a near-duplicate.
 
 ## The problem
 
-LLM coding assistants systematically duplicate code within a codebase. GitClear's
-2025 analysis of 211M changed lines (2020–2024) found an **8× increase in
-duplicated code blocks**, with copy/pasted lines exceeding moved (refactored)
-lines for the first time. That study counted only *Type-1* (near-literal) clones.
-The harder, more damaging residue is **divergent duplication**: the assistant
-reimplements an existing helper instead of calling it — with different identifiers,
-a `while` where the original had a `for`, an extra guard clause — and the copies
-then **drift** as a feature is added to one but not the others. That drift is where
-bugs live: Juergens et al. (ICSE 2009) found 52% of clones change inconsistently,
-and roughly every second unintentional inconsistency is a fault.
+Duplicated code is where bugs breed: copies **drift** as a feature or fix lands
+in one and not the others. Juergens et al. (ICSE 2009) found 52% of clones
+change inconsistently, and roughly every second unintentional inconsistency is
+a fault. The damaging cases are rarely literal copy-paste — they are **divergent
+duplicates**: an existing helper reimplemented instead of called, with different
+identifiers, a `while` where the original had a `for`, an extra guard clause.
+Token-window tools miss most of that band.
 
 reprise targets clone Types 1–3 plus the "reimplemented helper" slice of Type-4,
 **within a single codebase**, at repo-scan and PR-check granularity. It is
 **report-only** — it never transforms your code — and it is built to run in CI: its
 flagship finding, `inconsistent-update`, fires at exactly the moment a change
 edits one copy of a known duplicate group but not the others.
+
+**A common and acute use case: LLM coding agents.** Agents reimplement existing
+helpers at scale — GitClear's 2025 analysis of 211M changed lines found an
+**8× increase in duplicated code blocks**, with copy/pasted lines exceeding
+refactored lines for the first time (and that study counted only near-literal
+clones). reprise was motivated by exactly this workload and dogfoods it (see
+"What reprise found in its own code"), but the detector is
+workload-agnostic — the calibration catches below are all long-lived,
+human-written codebases: ripgrep, flask, serde.
 
 Full design and rationale: [`docs/PLAN.md`](docs/PLAN.md) (the authoritative spec).
 Every deviation from it is logged in [`DECISIONS.md`](DECISIONS.md).
@@ -225,8 +231,8 @@ Precision is **measured, not asserted** — but honestly, on small samples:
 ## What reprise found in its own code
 
 Every finding below is a real duplication that reprise's own author (an LLM
-coding agent — the tool's exact target demographic) introduced *while building
-reprise*, caught by the tool during development. Each is hand-verified; together
+coding agent — fittingly, the use case that motivated the tool) introduced
+*while building reprise*, caught by the tool during development. Each is hand-verified; together
 they are the tool's most honest demo. DECISIONS.md records the full history.
 
 **`synth_call` — the first-ever finding (Phase 1, `exact-normalized`).** The very
