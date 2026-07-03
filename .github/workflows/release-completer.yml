@@ -1,0 +1,61 @@
+name: Release Completer
+
+# On a v* tag (pushed by auto-release.yml, or dispatched manually), build the
+# cross-platform binaries, cut the GitHub Release, and publish the Homebrew cask
+# to ctxloom/homebrew-tap. reprise is a Rust crate, so GoReleaser uses its `rust`
+# builder (cargo-zigbuild + zig) instead of the Go toolchain — the tree-sitter
+# grammars' C is compiled by zig cc for every target.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g., v0.2.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # On a tag push, github.ref is the tag. On manual dispatch, check out
+          # the tag the user named.
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Install Rust toolchain + release targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: >-
+            x86_64-unknown-linux-musl,
+            aarch64-unknown-linux-musl,
+            x86_64-apple-darwin,
+            aarch64-apple-darwin
+
+      - name: Install zig (cargo-zigbuild's cross C compiler)
+        uses: mlugg/setup-zig@v1
+
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: '~> v2'
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # PAT with push access to ctxloom/homebrew-tap (cask publish).
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}

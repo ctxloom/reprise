@@ -1,0 +1,58 @@
+name: Auto Release
+
+# On a successful CI run for a push to main (i.e. a merged PR), tag the version
+# in the VERSION file and push that tag, which triggers release-completer.yml.
+#
+# This does NOT bump the version — the version is set deliberately in the PR via
+# `just set-version`, and ci.yml's version-guard ensures it is fresh. If the tag
+# already exists this job FAILS rather than silently skipping.
+#
+# The tag is pushed with RELEASE_TAG_TOKEN (a PAT with contents:write on this
+# repo), NOT the default GITHUB_TOKEN: tags pushed by GITHUB_TOKEN do not start
+# other workflows, so release-completer would never fire.
+
+on:
+  workflow_run:
+    workflows: ["ci"]
+    types:
+      - completed
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  tag-release:
+    name: Tag VERSION and trigger release
+    runs-on: ubuntu-latest
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push'
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_TAG_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Tag VERSION (fail if it already exists)
+        run: |
+          V="$(tr -d '[:space:]' < VERSION)"
+          if [ -z "$V" ]; then
+            echo "::error::VERSION file is empty"; exit 1
+          fi
+          TAG="v${V#v}"
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "::error::Tag $TAG already exists. VERSION must be bumped per release; refusing to re-point an immutable tag."
+            exit 1
+          fi
+          git tag "$TAG"
+          git push origin "$TAG"
+          echo "Tagged and pushed $TAG — release-completer will build and publish the release."

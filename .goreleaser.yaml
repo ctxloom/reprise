@@ -1,0 +1,123 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+#
+# reprise release config. Mirrors ctxloom's GoReleaser setup (GitHub Release +
+# Homebrew cask to ctxloom/homebrew-tap), adapted for a Rust crate: the `rust`
+# builder cross-compiles via cargo-zigbuild + zig instead of the Go toolchain.
+#
+# Validate locally without publishing:  just release-snapshot
+# (equivalently: goreleaser release --snapshot --clean --skip=publish)
+version: 2
+
+project_name: reprise
+
+builds:
+  # cargo-zigbuild cross-compiles all four targets from a single Linux runner;
+  # zig cc compiles the tree-sitter grammars' C. GoReleaser maps each Rust
+  # target triple to {{.Os}}/{{.Arch}} for the archive/cask names below (the libc
+  # is dropped from the label, so linux archives stay reprise_<ver>_linux_<arch>).
+  #
+  # Linux targets are *-musl (fully STATIC): no libc dependency, so the binaries
+  # run on any Linux regardless of glibc — a glibc build made on a newer-glibc
+  # host fails on older images (e.g. Debian bookworm). zig supplies musl's C
+  # toolchain for the tree-sitter grammars, so the old "musl needs musl-tools"
+  # blocker (DECISIONS.md D34) no longer applies. macOS is not glibc; left as-is.
+  - id: reprise
+    builder: rust
+    binary: reprise
+    tool: cargo-zigbuild
+    command: build
+    flags:
+      - --release
+    targets:
+      - x86_64-unknown-linux-musl
+      - aarch64-unknown-linux-musl
+      - x86_64-apple-darwin
+      - aarch64-apple-darwin
+
+archives:
+  - id: default
+    ids:
+      - reprise
+    formats: [tar.gz]
+    # reprise_<version>_<os>_<arch>.tar.gz — the URL scheme the generated cask
+    # points at (github.com/ctxloom/reprise/releases/download/...).
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Version }}_
+      {{- .Os }}_
+      {{- .Arch }}
+    files:
+      - LICENSE*
+      - README.md
+
+# Homebrew cask published to ctxloom/homebrew-tap:  brew install ctxloom/tap/reprise
+# The cask ships macOS + Linux (amd64/arm64), matching the built targets.
+#
+# Requires the HOMEBREW_TAP_GITHUB_TOKEN secret (a PAT with push access to the
+# tap repo) — the per-repo GITHUB_TOKEN cannot push to another repository.
+# The post-install hook strips the macOS quarantine attribute so the unsigned
+# binary launches without a Gatekeeper prompt (no-op on Linux).
+homebrew_casks:
+  - name: reprise
+    ids:
+      - default
+    repository:
+      owner: ctxloom
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    directory: Casks
+    homepage: "https://github.com/ctxloom/reprise"
+    description: "Code duplicate detection: tree-sitter normalization, anti-unification templates, and PR-time drift gating"
+    license: "BSD-3-Clause"
+    # Don't push a cask for prereleases (e.g. v0.2.0-rc.1) or snapshots.
+    skip_upload: auto
+    hooks:
+      post:
+        install: |
+          if system_command("/usr/bin/xattr", args: ["-h"]).exit_status == 0
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/reprise"]
+          end
+
+checksum:
+  name_template: 'checksums.txt'
+  algorithm: sha256
+
+changelog:
+  sort: asc
+  use: github
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^ci:'
+      - '^chore:'
+      - Merge pull request
+      - Merge branch
+
+release:
+  github:
+    owner: ctxloom
+    name: reprise
+  draft: false
+  prerelease: auto
+  name_template: "v{{.Version}}"
+  header: |
+    ## reprise v{{.Version}}
+
+    Code duplicate detection — tree-sitter normalization, anti-unification
+    templates for near-miss clones, and PR-time duplicate-drift gating.
+
+    ### Install (macOS / Linux, Homebrew)
+
+    ```bash
+    brew install ctxloom/tap/reprise
+    ```
+
+    ### Manual
+
+    Download the archive for your platform below, extract, and put `reprise` on
+    your PATH. Archives carry SHA256 sums in `checksums.txt`:
+
+    ```bash
+    sha256sum -c checksums.txt --ignore-missing
+    ```

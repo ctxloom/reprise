@@ -5,6 +5,36 @@ on:
   pull_request:
 
 jobs:
+  # Release gate (mirrors ctxloom): every change to main must carry a fresh,
+  # untagged VERSION, and Cargo.toml must agree with it so `reprise --version`
+  # matches the tag. Fails the PR/push if v$VERSION is already tagged, forcing a
+  # deliberate `just set-version <next>` bump. On merge, auto-release.yml tags
+  # this VERSION and triggers the release.
+  version-guard:
+    name: Version Guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # need tags to check whether v$VERSION already exists
+      - name: VERSION is fresh and matches Cargo.toml
+        run: |
+          V="$(tr -d '[:space:]' < VERSION)"
+          if [ -z "$V" ]; then
+            echo "::error file=VERSION::VERSION file is empty"; exit 1
+          fi
+          CARGO_V="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/^version = "(.*)"/\1/')"
+          if [ "$V" != "$CARGO_V" ]; then
+            echo "::error file=VERSION::VERSION ($V) != Cargo.toml version ($CARGO_V). Run 'just set-version $V' to sync them."
+            exit 1
+          fi
+          TAG="v${V#v}"
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "::error file=VERSION::VERSION $V is already tagged ($TAG). Bump it ('just set-version <next>') before merging."
+            exit 1
+          fi
+          echo "VERSION $V ($TAG) is fresh and matches Cargo.toml — OK to merge and release."
+
   test:
     name: lint + test + mutation gate
     runs-on: ubuntu-latest

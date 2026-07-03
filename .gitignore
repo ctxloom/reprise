@@ -9,6 +9,9 @@
 
 /target
 
+# GoReleaser build output (release archives, checksums, generated cask)
+/dist
+
 # reprise's own on-disk scan cache (dogfood scans; spec §4, DECISIONS.md D8)
 .reprise/
 

@@ -1,0 +1,27 @@
+# Versionator configuration for reprise.
+# See https://github.com/benjaminabbitt/versionator for documentation.
+#
+# VERSION is the release source of truth. It is bumped deliberately per release
+# via `just set-version <next>` (which also updates Cargo.toml so
+# `reprise --version` matches the tag). Releases are merge-triggered: bump here,
+# open a PR, merge — CI's version-guard rejects a stale VERSION, and on merge
+# auto-release.yml tags v$VERSION immutably. No auto-increment.
+
+# Tags are v-prefixed (v1.2.3), matching the release-completer trigger (v*).
+prefix: "v"
+
+# No pre-release / build metadata rendering: the plain SemVer core in VERSION is
+# what gets tagged. `reprise --version` reports Cargo.toml's version, kept in
+# sync with VERSION by `just set-version`.
+prerelease:
+  enabled: false
+metadata:
+  enabled: false
+
+# The release tag/branch are produced by CI (auto-release.yml), not by
+# `versionator release`, so branch creation is off.
+release:
+  createBranch: false
+
+logging:
+  output: quiet

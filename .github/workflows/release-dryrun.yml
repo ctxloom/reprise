@@ -1,0 +1,50 @@
+name: Release Dry-Run
+
+# Validate the release build without publishing whenever a PR touches the
+# release config or build inputs. This exercises the same cargo-zigbuild + zig
+# cross-compile that release-completer.yml runs on a tag, so a broken target
+# (e.g. a tree-sitter grammar that won't cross-compile to darwin) fails the PR
+# instead of the release.
+
+on:
+  pull_request:
+    paths:
+      - '.goreleaser.yaml'
+      - '.github/workflows/release-completer.yml'
+      - '.github/workflows/release-dryrun.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'src/**'
+      - 'build.rs'
+
+jobs:
+  snapshot:
+    name: goreleaser snapshot build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain + release targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: >-
+            x86_64-unknown-linux-musl,
+            aarch64-unknown-linux-musl,
+            x86_64-apple-darwin,
+            aarch64-apple-darwin
+
+      - name: Install zig
+        uses: mlugg/setup-zig@v1
+
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - name: Build all targets (no publish)
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: '~> v2'
+          args: release --snapshot --clean --skip=publish
