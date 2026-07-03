@@ -2,6 +2,16 @@ use anyhow::bail;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+// On musl (the fully-static Linux release/`install-static` build) the default
+// allocator is pathologically slow under reprise's rayon-parallel,
+// allocation-heavy scan — ~16x vs glibc on the 500k perf corpus (77s vs 4.7s),
+// which blows the ≤10s perf gate. mimalloc restores glibc-class performance.
+// glibc and macOS builds keep the system allocator (already fast). Gated by
+// target_env so it only affects musl, mirroring ripgrep. See DECISIONS.md D42.
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser)]
 #[command(
     name = "reprise",

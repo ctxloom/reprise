@@ -736,6 +736,8 @@ target because the tree-sitter grammar crates compile C and this host has no mus
 toolchain; the musl route (`rustup target add x86_64-unknown-linux-musl` + musl-tools)
 is documented in the justfile comment as the alternative where available. Note the
 standard glibc/crt-static caveat (NSS/dlopen unavailable) — irrelevant to this CLI.
+(**Superseded by D42**: the static-link path is now musl-static via cargo-zigbuild;
+the glibc build didn't run on older images. The license decision here still stands.)
 
 ## D35 — Repository host: github.com/ctxloom/reprise (2026-07-02)
 
@@ -837,3 +839,33 @@ predated them; item 4a (`reprise baseline` arg errors) is moot post-D40.
 (e) Follow-up recorded, not built: rare-token (IDF) substantiality floor so
 ubiquitous-idiom runs (getFS/result/warnings-class) don't reach reports even
 at length — needs calibration against the M4a sample method.
+
+## D42 — Linux ships musl-static (supersedes D34's glibc static-pie); mimalloc on musl (2026-07-02)
+
+Supersedes the static-link half of D34. The shippable Linux binary is now
+**musl-static via cargo-zigbuild**, not glibc `+crt-static`. Trigger: a glibc
+binary built on a newer-glibc host (this dev host, trixie) links the host's
+glibc symbol versions and **fails to run on an older image** (Debian bookworm) —
+caught in the real agent-image build, whose gate now drops an incompatible
+companion with a loud warning rather than failing the whole image. A fully
+static musl binary has no libc dependency at all (verified: `ldd` → "not a
+dynamic executable", no GLIBC symbols, plain SYSV ELF), so it runs on any Linux
+regardless of glibc — kernel floor only.
+
+D34's reason for avoiding musl ("this host has no musl C toolchain" for the
+tree-sitter grammar C) no longer holds: **zig (via cargo-zigbuild) supplies the
+musl C toolchain**, so `cargo zigbuild --target x86_64-unknown-linux-musl`
+compiles the grammars and links static with no musl-tools install. `build-static`
+/`install-static` and the release targets (`.goreleaser.yaml`,
+release-completer, release-dryrun) switched from `*-linux-gnu` to `*-linux-musl`;
+os/arch labels are unchanged (libc isn't in the name), so archive/cask names and
+the tap URLs stay `reprise_<ver>_linux_<arch>`. macOS is not glibc — left as-is.
+
+**Allocator, the catch:** musl's default allocator is pathological under
+reprise's rayon-parallel, allocation-heavy scan — **~16x slower than glibc**
+(77–80 s vs 4.7 s warm on the 500k perf corpus), which blows the ≤10 s gate
+(D27/D32) by 8x. Fix: **mimalloc as `#[global_allocator]`, gated to
+`cfg(target_env = "musl")`** (mirrors ripgrep's musl-jemalloc precedent). glibc
+and macOS keep the system allocator (no dep, no change — mimalloc is absent from
+their dep graph). Result: musl+mimalloc **3.4 s** warm — under the gate and
+faster than the glibc build itself (a 23x swing from the one allocator line).
