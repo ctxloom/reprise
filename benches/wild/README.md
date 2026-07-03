@@ -7,6 +7,11 @@ asserts the pair still converges at its labeled tier — unlike the mutation
 benchmark, these duplicates were written by the upstream projects, not generated
 by inverting our own normalizer rules.
 
+Licensing: each excerpt stays under its upstream license (MIT / BSD-3-Clause),
+not reprise's. Full attribution and verbatim license texts are in
+[`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md) and [`licenses/`](licenses/).
+When adding a pair from a new project, update both.
+
 Fixture policy: member source is copied VERBATIM from the provenance commit.
 Where a member is a method, the minimal enclosing `impl`/`class` wrapper is
 reproduced (headers only); w7's `b.py` is the nested `def test` dedented one

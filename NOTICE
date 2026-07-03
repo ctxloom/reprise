@@ -1,0 +1,20 @@
+reprise
+Copyright (c) 2026, Ben Abbitt
+Licensed under the BSD-3-Clause license (see LICENSE).
+
+------------------------------------------------------------------------------
+Third-party material
+------------------------------------------------------------------------------
+
+The test corpus under `benches/wild/` contains small source excerpts copied
+verbatim from third-party open-source projects (gin, ripgrep, serde, flask,
+click) for use as a recall-regression benchmark. These excerpts remain under
+their original upstream licenses (MIT / BSD-3-Clause), not reprise's license.
+
+Full attribution, provenance, and the verbatim upstream license texts are in:
+
+    benches/wild/THIRD-PARTY-NOTICES.md
+    benches/wild/licenses/
+
+This material is a test corpus only. It is not part of the reprise binary and is
+excluded from the published crate (Cargo.toml `exclude = ["benches/**"]`).
