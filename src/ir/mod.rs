@@ -15,11 +15,13 @@
 
 pub mod kind;
 pub mod lower;
+pub mod pass;
 pub mod provenance;
 pub mod render;
 pub mod transform;
 
-pub use lower::lower_rust;
+pub use lower::{lower_rust, lower_rust_source};
+pub use pass::abstract_idents;
 pub use provenance::Provenance;
 pub use render::to_sexpr;
 pub use transform::{TransformEvent, TransformKind, TransformLog, Witness};

@@ -7,7 +7,7 @@
 
 use crate::ir::kind;
 use crate::ir::transform::{TransformKind, TransformLog, Witness};
-use crate::tree::{Label, NormNode};
+use crate::tree::{Bucket, Label, NormNode};
 use tree_sitter::Node;
 
 /// Lower a Rust `function_item` CST node to a canonical IR tree + its transform log.
@@ -16,6 +16,27 @@ pub fn lower_rust(node: Node, src: &str) -> (NormNode, TransformLog) {
     let root = lower_node(node, None, src, &mut log)
         .unwrap_or_else(|| NormNode::new(kind::UNIT, None, span_of(node), Vec::new()));
     (root, log)
+}
+
+/// Convenience: parse Rust `src` and lower its first `function_item`. `None` if the
+/// source contains no function.
+pub fn lower_rust_source(src: &str) -> Option<(NormNode, TransformLog)> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&crate::lang::Lang::Rust.ts_language())
+        .ok()?;
+    let tree = parser.parse(src, None)?;
+    let func = find_function_item(tree.root_node())?;
+    Some(lower_rust(func, src))
+}
+
+fn find_function_item<'a>(node: Node<'a>) -> Option<Node<'a>> {
+    if node.kind() == "function_item" {
+        return Some(node);
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find_map(find_function_item)
 }
 
 fn span_of(node: Node) -> (u32, u32) {
@@ -202,10 +223,21 @@ fn lower_node(
             Some(NormNode::new(kind::ASSIGN, field, span, children))
         }
         "integer_literal" | "float_literal" | "string_literal" | "raw_string_literal"
-        | "char_literal" | "boolean_literal" => Some(
-            NormNode::new(kind::LIT, field, span, Vec::new())
-                .with_label(Label::RawLit(text(node, src).into())),
-        ),
+        | "char_literal" | "boolean_literal" => {
+            // Literal → typed bucket. The per-language kind→bucket map is a frontend
+            // concern; the keep-list refinement (§5.2.5) is a later increment.
+            let bucket = match node.kind() {
+                "integer_literal" => Bucket::Int,
+                "float_literal" => Bucket::Float,
+                "char_literal" => Bucket::Char,
+                "boolean_literal" => Bucket::Bool,
+                _ => Bucket::Str,
+            };
+            Some(
+                NormNode::new(kind::LIT, field, span, Vec::new())
+                    .with_label(Label::LitBucket(bucket)),
+            )
+        }
         "identifier" | "field_identifier" | "type_identifier" | "shorthand_field_identifier" => {
             Some(
                 NormNode::new(kind::VAR, field, span, Vec::new())
@@ -276,23 +308,9 @@ fn break_guard(cond: NormNode, span: (u32, u32)) -> NormNode {
 mod tests {
     use super::*;
     use crate::ir::render::to_sexpr;
-    use crate::lang::Lang;
-
-    fn find_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
-        if node.kind() == kind {
-            return Some(node);
-        }
-        let mut cursor = node.walk();
-        node.named_children(&mut cursor)
-            .find_map(|c| find_kind(c, kind))
-    }
 
     fn lower_first_fn(src: &str) -> (NormNode, TransformLog) {
-        let mut parser = tree_sitter::Parser::new();
-        parser.set_language(&Lang::Rust.ts_language()).unwrap();
-        let tree = parser.parse(src, None).unwrap();
-        let func = find_kind(tree.root_node(), "function_item").expect("a function_item");
-        lower_rust(func, src)
+        lower_rust_source(src).expect("a function_item")
     }
 
     #[test]
