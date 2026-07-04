@@ -66,6 +66,11 @@ fn wild_corpus_has_no_untested_fixtures() {
         let entry = entry.unwrap();
         if entry.file_type().unwrap().is_dir() {
             let name = entry.file_name().to_string_lossy().to_string();
+            // `licenses/` holds vendored upstream license texts for the copied
+            // fixture sources (THIRD-PARTY-NOTICES.md), not a fixture pair.
+            if name == "licenses" {
+                continue;
+            }
             assert!(
                 tested.contains(&name.as_str()),
                 "benches/wild/{name} exists but has no row in tests/wild.rs"
