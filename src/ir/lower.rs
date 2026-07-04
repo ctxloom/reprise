@@ -233,6 +233,14 @@ fn lower_node(
                 "boolean_literal" => Bucket::Bool,
                 _ => Bucket::Str,
             };
+            // Lossy: relocate the value into a witness (§15) so the match (bucket)
+            // and the divergence (which value) are both preserved — two clones
+            // differing only in a constant converge, yet the log diff shows it.
+            log.record(
+                TransformKind::LitBucket,
+                span,
+                Witness::Literal(text(node, src).into()),
+            );
             Some(
                 NormNode::new(kind::LIT, field, span, Vec::new())
                     .with_label(Label::LitBucket(bucket)),
@@ -341,5 +349,22 @@ mod tests {
                 .any(|e| e.kind == TransformKind::LoopLower)
         );
         assert!(loop_log.is_empty());
+    }
+
+    #[test]
+    fn literals_bucket_for_matching_but_the_value_is_detected_via_witness() {
+        let (ir1, log1) = lower_first_fn("fn f() { x(1); }");
+        let (ir2, log2) = lower_first_fn("fn g() { x(2); }");
+        // Converge for matching: both lower to the same INT-bucketed IR …
+        assert_eq!(to_sexpr(&ir1), to_sexpr(&ir2));
+        // … but the difference is DETECTED, not lost — each bucketing kept its value.
+        let value = |log: &TransformLog| {
+            log.events().iter().find_map(|e| match &e.witness {
+                Witness::Literal(t) => Some(t.to_string()),
+                _ => None,
+            })
+        };
+        assert_eq!(value(&log1).as_deref(), Some("1"));
+        assert_eq!(value(&log2).as_deref(), Some("2"));
     }
 }

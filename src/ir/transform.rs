@@ -35,6 +35,8 @@ pub enum TransformKind {
     BranchHoist,
     /// Dead syntax removed (`pass`, empty `else`, redundant trailing `continue`).
     DeadStrip,
+    /// A literal abstracted to its typed bucket — lossy; the value rides in the witness.
+    LitBucket,
 }
 
 impl TransformKind {
@@ -50,6 +52,7 @@ impl TransformKind {
             TransformKind::AnfName => "anf-name",
             TransformKind::BranchHoist => "branch-hoist",
             TransformKind::DeadStrip => "dead-strip",
+            TransformKind::LitBucket => "lit-bucket",
         }
     }
 }
@@ -66,6 +69,9 @@ pub enum Witness {
     Order(Vec<u32>),
     /// A free-form note — placeholder until a transform earns a typed witness.
     Note(Box<str>),
+    /// The original literal text a `LitBucket` abstracted away — so two clones that
+    /// differ only in a constant converge, yet the difference stays recoverable.
+    Literal(Box<str>),
 }
 
 /// One recorded normalization step.
@@ -126,6 +132,9 @@ impl TransformLog {
                 }
                 Witness::Note(n) => {
                     let _ = write!(out, " note={n}");
+                }
+                Witness::Literal(t) => {
+                    let _ = write!(out, " lit={t}");
                 }
             }
             out.push('\n');
