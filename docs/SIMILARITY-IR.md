@@ -518,7 +518,7 @@ lines" survives arbitrarily aggressive normalization. **Provenance is hash-exclu
 
 The per-unit **transform log** is an ordered, **canonical** (deterministic: same source
 → same log) list of `(kind, locus, witness)` over a **closed, versioned transform enum**
-(LoopLower, RecursionLower, AnfName, BranchHoist, CommSort, ParenDrop, …), schema'd like
+(LoopLower, RecursionLower, AnfName, BranchHoist, CommSort, ParenDrop, LitBucket, …), schema'd like
 the node-set (§12.1). Reverse = replay inverses in reverse order.
 
 **The log is also explanatory (bonus).** Two members of a clone group can carry
@@ -596,8 +596,12 @@ Refinements:
 **The event stream is valuable beyond reversal.** Kept as a first-class part of the
 artifact, at analysis time it buys:
 - **Match explanation.** The *diff of two members' logs* is a source-level account of why
-  they converged ("one a `for`, one a `while`; one a ternary, one an if/else") — a narrated
-  derivation, not a bare similarity %.
+  they converged ("one a `for`, one a `while`; one used `1`, one `2`") — a narrated
+  derivation, not a bare similarity %. **TODO (factoring):** divergent `LitBucket`
+  witnesses are *factorable* — lift the differing constant to a parameter and rewrite
+  the members as calls passing it (currying / partial application). That is the README's
+  expression-hole→parameter refactoring recipe, with the witness supplying the values;
+  it belongs in the report (back half), not P1.
 - **Normalizer debugging + per-transform calibration attribution (high-value).** A recall
   miss = diff the two logs to find where normalization diverged; a precision miss = find
   which transform collapsed an unrelated pair. Attributes each FP/FN to a *specific*
