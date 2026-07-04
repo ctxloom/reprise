@@ -33,7 +33,10 @@ pub const GRAMMAR_VERSIONS: &[&str] = &[
 /// hard way in M4a: the D30 dispatch-arm suppression changed cached repeats
 /// while every key component stayed put, so warm scans served pre-D30
 /// findings (D30 note).
-pub const EXTRACTION_VERSION: u32 = 2;
+///
+/// v3: TS `const f = () => …` / `= function () {…}` are now extracted as units
+/// (`binding_unit`, D43), so TS files' FileUnits changed with no other key move.
+pub const EXTRACTION_VERSION: u32 = 3;
 
 /// Cache key for one source file (D8: the version-keying IS the filename).
 pub fn key(rel_path: &str, content: &str, cfg: &Config) -> u128 {

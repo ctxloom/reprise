@@ -77,6 +77,22 @@ pub trait LanguageProfile: Sync {
     /// Node kinds extracted as comparison units (spec §5.1).
     fn is_function_like(&self, kind: &str) -> bool;
 
+    /// A named function binding extracted as a unit *in addition* to
+    /// `is_function_like` nodes: languages where a callable is an expression
+    /// bound to a name in a declaration rather than a declaration itself —
+    /// TS `const f = (x) => …` / `const f = function () {…}`. Returns the
+    /// bound name and the callable node (which is then converted as the unit
+    /// root). Decl-only by construction: only recognize binding forms, so
+    /// inline callbacks (`xs.map(x => …)`) are never extracted. Default: none
+    /// (most languages declare functions directly, caught by is_function_like).
+    fn binding_unit<'tree>(
+        &self,
+        _node: tree_sitter::Node<'tree>,
+        _src: &str,
+    ) -> Option<(String, tree_sitter::Node<'tree>)> {
+        None
+    }
+
     fn is_comment(&self, kind: &str) -> bool;
 
     /// Node kinds stripped wholesale during conversion (attributes, decorators,

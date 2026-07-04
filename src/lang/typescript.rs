@@ -17,6 +17,32 @@ impl LanguageProfile for TypeScriptProfile {
         matches!(kind, "function_declaration" | "method_definition")
     }
 
+    fn binding_unit<'tree>(
+        &self,
+        node: tree_sitter::Node<'tree>,
+        src: &str,
+    ) -> Option<(String, tree_sitter::Node<'tree>)> {
+        // `const f = (x) => …` / `let f = function () {…}` — a named callable
+        // bound in a declaration. tree-sitter shape: variable_declarator with a
+        // `name` identifier and a `value` that is an arrow_function or
+        // function_expression. Anything else (object values, calls, inline
+        // callbacks in argument position) is not a variable_declarator here, so
+        // it is never extracted — decl-only, matching Rust/Python (D25 gap).
+        if node.kind() != "variable_declarator" {
+            return None;
+        }
+        let value = node.child_by_field_name("value")?;
+        if !matches!(value.kind(), "arrow_function" | "function_expression") {
+            return None;
+        }
+        let name = node
+            .child_by_field_name("name")?
+            .utf8_text(src.as_bytes())
+            .ok()?
+            .to_string();
+        Some((name, value))
+    }
+
     fn is_comment(&self, kind: &str) -> bool {
         kind == "comment"
     }

@@ -421,6 +421,7 @@ Deferred (no driving benchmark/calibration case yet — the §12 principle):
   `function_declaration`/`method_definition` are units, mirroring
   Rust/Python's decl-only extraction). `export const f = (x)=>…` is invisible.
   The scope explicitly permits deferring this; recorded as a gap.
+  **(Closed by D43: const-bound arrows/function-expressions are now extracted.)**
 - **Kotlin `when` is left as its native `when_expression`** (spec instruction).
 - **Kotlin multi-param tail recursion emits sequential single assignments**
   (Kotlin has no simultaneous multi-assign). Unsound for coupled updates but
@@ -869,3 +870,33 @@ reprise's rayon-parallel, allocation-heavy scan — **~16x slower than glibc**
 and macOS keep the system allocator (no dep, no change — mimalloc is absent from
 their dep graph). Result: musl+mimalloc **3.4 s** warm — under the gate and
 faster than the glibc build itself (a 23x swing from the one allocator line).
+
+## D43 — TS `const f = () => …` extracted as a unit; Go/TS/Kotlin recall calibration (2026-07-03)
+
+Closes the D25 gap "TS arrow/function assigned to a const is not extracted — is
+invisible." A new `LanguageProfile::binding_unit` hook (default None) lets a
+language extract a named callable bound in a declaration; TS implements it for a
+`variable_declarator` whose value is an `arrow_function`/`function_expression`,
+returning (name, callable). `collect_units` extracts it via the shared
+`push_unit`. Decl-only by construction: inline callbacks (`xs.map(x => …)`) are
+not variable_declarators, so they are never extracted (matches Rust/Python
+decl-only extraction; verified by test). Extraction output changed for every TS
+file, so **`cache::EXTRACTION_VERSION` bumped 2→3** (the D30 stale-cache lesson).
+
+Scope caveat (v1): the unit root for a const-arrow is `arrow_function`, so it
+converges with other const-arrows/function-expressions but NOT yet with a
+top-level `function f(){…}` declaration (different root kind). Arrow↔declaration
+cross-matching is a follow-up. Verified end-to-end: two duplicated const-arrow
+functions now form an exact-normalized group (were invisible before).
+
+**Calibration (audit follow-up).** The audit found Go/TS/Kotlin had NO recall
+gate — Phase-2/3 mutation variants existed only for rust+python. Added seed1
+`t3-loop-swap` and `t3-subtree-sub` variants for all three; both classes now
+gate at 5/5 across five languages. Surfaced a real capability gap while doing it:
+the `while (i < n) { x = a[i]; i++ }` manual-index loop form canonicalizes for
+Rust but NOT for TS/Go/Kotlin (their `rewrite_iteration` handles the three-clause
+`for`/`for i in indices` index forms, not while-with-manual-index). The
+loop-swap variants use each language's handled index form; the while-index gap is
+recorded here as a follow-up, not yet built. Wild-corpus pairs for TS/Kotlin
+remain unbuilt — real-repo provenance labeling (the M4a method) is a separate
+exercise and was deliberately not fabricated.

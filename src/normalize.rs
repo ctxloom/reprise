@@ -60,23 +60,43 @@ fn collect_units(
             .and_then(|n| n.utf8_text(src.as_bytes()).ok())
             .unwrap_or("<anon>")
             .to_string();
-        if let Some(tree) = convert(node, None, "", src, profile) {
-            out.push(RawUnit {
-                is_test: profile.unit_is_test(node, src, &name, path),
-                name,
-                byte_span: (node.start_byte() as u32, node.end_byte() as u32),
-                line_span: (
-                    node.start_position().row as u32 + 1,
-                    node.end_position().row as u32 + 1,
-                ),
-                parse_degraded: node.has_error(),
-                tree,
-            });
-        }
+        push_unit(node, name, src, profile, path, out);
+    } else if let Some((name, callable)) = profile.binding_unit(node, src) {
+        // A named callable bound in a declaration (`const f = () => …`). The
+        // callable node is the unit root; the binding name rides along for
+        // reporting/inliner naming. The recursion still descends into the
+        // callable body, so a nested binding is extracted too.
+        push_unit(callable, name, src, profile, path, out);
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         collect_units(child, src, profile, path, out);
+    }
+}
+
+/// Convert `node` and, if it yields a tree, push it as a `RawUnit` named
+/// `name`. Shared by the `is_function_like` and `binding_unit` extraction
+/// paths (spec §5.1).
+fn push_unit(
+    node: tree_sitter::Node,
+    name: String,
+    src: &str,
+    profile: &dyn LanguageProfile,
+    path: &std::path::Path,
+    out: &mut Vec<RawUnit>,
+) {
+    if let Some(tree) = convert(node, None, "", src, profile) {
+        out.push(RawUnit {
+            is_test: profile.unit_is_test(node, src, &name, path),
+            name,
+            byte_span: (node.start_byte() as u32, node.end_byte() as u32),
+            line_span: (
+                node.start_position().row as u32 + 1,
+                node.end_position().row as u32 + 1,
+            ),
+            parse_degraded: node.has_error(),
+            tree,
+        });
     }
 }
 
