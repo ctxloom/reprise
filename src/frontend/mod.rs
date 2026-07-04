@@ -40,6 +40,14 @@ pub(crate) trait Frontend {
         log: &mut TransformLog,
         out: &mut Vec<NormNode>,
     );
+
+    /// A wrapper kind whose children are spliced directly into the parent statement
+    /// list (Go's `statement_list` inside `block`), so blocks hold statements directly
+    /// — the canonical shape every shared helper assumes. Mirrors the historical
+    /// `LanguageProfile::splice_kind` (D23). Default: never splice.
+    fn splice_kind(&self, _kind: &str) -> bool {
+        false
+    }
 }
 
 pub(crate) fn lower_unit(fe: &dyn Frontend, node: Node, src: &str) -> (NormNode, TransformLog) {
@@ -139,10 +147,17 @@ pub(crate) fn block(
 }
 
 fn lower_stmts(fe: &dyn Frontend, node: Node, src: &str, log: &mut TransformLog) -> Vec<NormNode> {
+    let mut out = Vec::new();
     let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .filter_map(|c| fe.lower_node(c, None, src, log))
-        .collect()
+    for c in node.named_children(&mut cursor) {
+        if fe.splice_kind(c.kind()) {
+            // Hoist the wrapper's children into this list (Go `statement_list`).
+            out.extend(lower_stmts(fe, c, src, log));
+        } else if let Some(n) = fe.lower_node(c, None, src, log) {
+            out.push(n);
+        }
+    }
+    out
 }
 
 fn lower_body(
@@ -342,6 +357,57 @@ pub(crate) fn lower_while(
         Witness::LoopForm("while".into()),
     );
     NormNode::new(kind::LOOP, field, span, vec![body])
+}
+
+pub(crate) fn lower_for(
+    fe: &dyn Frontend,
+    node: Node,
+    field: Option<&str>,
+    span: (u32, u32),
+    fields: (&str, &str),
+    src: &str,
+    log: &mut TransformLog,
+) -> NormNode {
+    // `for pat in iter { body }` → the canonical iterated loop (§5.2.2):
+    //   Loop { if !__has_next(iter) { break }; pat = __next(iter); body }
+    // The synthesized has_next/next protocol is identical across languages, so a Rust
+    // `for` and a Python `for` converge to the same canonical form.
+    let (pat_f, iter_f) = fields;
+    let mut body = lower_body(fe, node, span, src, log);
+    let iter = node
+        .child_by_field_name(iter_f)
+        .and_then(|n| fe.lower_node(n, None, src, log));
+    let pat = node
+        .child_by_field_name(pat_f)
+        .and_then(|n| fe.lower_node(n, Some("target"), src, log));
+    if let (Some(iter), Some(pat)) = (iter, pat) {
+        let bind = make_assign(pat, call_ext("__next", iter.clone(), span), span);
+        let guard = break_guard(call_ext("__has_next", iter, span), span);
+        body.children.insert(0, bind);
+        body.children.insert(0, guard);
+    }
+    log.record(
+        TransformKind::LoopLower,
+        span,
+        Witness::LoopForm("for".into()),
+    );
+    NormNode::new(kind::LOOP, field, span, vec![body])
+}
+
+/// Synthesize `name(arg)` with an `External` callee (the `__has_next`/`__next` protocol).
+fn call_ext(name: &str, arg: NormNode, span: (u32, u32)) -> NormNode {
+    let callee = NormNode::new(kind::VAR, Some("callee"), span, Vec::new())
+        .with_label(Label::External(name.into()));
+    let mut a = arg;
+    a.field = Some("arg".into());
+    NormNode::new(kind::CALL, None, span, vec![callee, a])
+}
+
+/// `target = value` where `target` already carries its `@target` field.
+fn make_assign(target: NormNode, value: NormNode, span: (u32, u32)) -> NormNode {
+    let mut v = value;
+    v.field = Some("value".into());
+    NormNode::new(kind::ASSIGN, None, span, vec![target, v])
 }
 
 pub(crate) fn lower_if(

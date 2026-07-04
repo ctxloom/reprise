@@ -3,7 +3,7 @@
 //! `src/lang/rust.rs` (the full per-grammar normalizer): this is a small fraction of it.
 
 use super::{
-    Frontend, block, drop_parens, leaf, lit, lower_assign, lower_binary, lower_call,
+    Frontend, block, drop_parens, leaf, lit, lower_assign, lower_binary, lower_call, lower_for,
     lower_function, lower_if, lower_loop, lower_return, lower_source, lower_unary_positional,
     lower_unit, lower_while, native, unwrap_stmt, var,
 };
@@ -39,6 +39,15 @@ impl Frontend for Rust {
             "block" => Some(block(self, node, field, span, src, log)),
             "loop_expression" => Some(lower_loop(self, node, field, span, src, log)),
             "while_expression" => Some(lower_while(self, node, field, span, src, log)),
+            "for_expression" => Some(lower_for(
+                self,
+                node,
+                field,
+                span,
+                ("pattern", "value"),
+                src,
+                log,
+            )),
             "if_expression" => Some(lower_if(self, node, field, span, src, log)),
             "unary_expression" => Some(lower_unary_positional(self, node, field, span, src, log)),
             "break_expression" => Some(leaf(kind::BREAK, field, span)),

@@ -4,7 +4,7 @@
 //! normalizer): this is a small fraction of it, and it re-implements *nothing*.
 
 use super::{
-    Frontend, block, drop_parens, leaf, lit, lower_assign, lower_binary, lower_call,
+    Frontend, block, drop_parens, leaf, lit, lower_assign, lower_binary, lower_call, lower_for,
     lower_function, lower_if, lower_return, lower_source, lower_unary_field, lower_unit,
     lower_while, native, unwrap_stmt, var,
 };
@@ -39,6 +39,15 @@ impl Frontend for Python {
             "function_definition" => Some(lower_function(self, node, field, span, src, log)),
             "block" => Some(block(self, node, field, span, src, log)),
             "while_statement" => Some(lower_while(self, node, field, span, src, log)),
+            "for_statement" => Some(lower_for(
+                self,
+                node,
+                field,
+                span,
+                ("left", "right"),
+                src,
+                log,
+            )),
             "if_statement" => Some(lower_if(self, node, field, span, src, log)),
             "not_operator" => Some(lower_unary_field(
                 self, node, field, span, "argument", src, log,
@@ -122,6 +131,20 @@ mod tests {
         assert_eq!(
             to_sexpr(&ir),
             "(Unit (Var@param a) (Block@body (Return (Binop@value (Var@left a) (+@op) (Lit@right INT)))))"
+        );
+    }
+
+    #[test]
+    fn rust_and_python_for_loops_converge() {
+        // Both `for` forms lower through the shared has_next/next iterated Loop.
+        let (r, _) = lower_rust_source("fn f() { for x in xs { g(x); } }").unwrap();
+        let (p, _) = lower_python_source("def f():\n    for x in xs:\n        g(x)\n").unwrap();
+        let rs = to_sexpr(&crate::ir::abstract_idents(r));
+        let ps = to_sexpr(&crate::ir::abstract_idents(p));
+        assert_eq!(rs, ps);
+        assert!(
+            rs.contains("__has_next") && rs.contains("__next") && rs.contains("v0"),
+            "{rs}"
         );
     }
 
