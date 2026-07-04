@@ -14,13 +14,11 @@
 //! module is the P1 foundation: the vocabulary, the event log, and provenance.
 
 pub mod kind;
-pub mod lower;
 pub mod pass;
 pub mod provenance;
 pub mod render;
 pub mod transform;
 
-pub use lower::{lower_rust, lower_rust_source};
 pub use pass::abstract_idents;
 pub use provenance::Provenance;
 pub use render::to_sexpr;

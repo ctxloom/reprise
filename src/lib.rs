@@ -11,6 +11,7 @@ pub mod config;
 pub mod fingerprint;
 pub mod fold;
 pub mod formats;
+pub mod frontend;
 pub mod group;
 pub mod inline;
 pub mod ir;

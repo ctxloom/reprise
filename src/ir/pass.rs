@@ -57,12 +57,21 @@ fn relabel(node: &mut NormNode, declared: &HashSet<Box<str>>, order: &mut HashMa
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::lower::lower_rust_source;
+    use crate::frontend::{lower_python_source, lower_rust_source};
     use crate::ir::render::to_sexpr;
 
     fn abstracted(src: &str) -> String {
         let (ir, _log) = lower_rust_source(src).expect("a function");
         to_sexpr(&abstract_idents(ir))
+    }
+
+    #[test]
+    fn one_pass_serves_both_languages() {
+        // The SAME abstract_idents runs on Rust and Python IR: renamed params across
+        // languages converge to the same canonical form — "one algorithm, all languages".
+        let (r, _) = lower_rust_source("fn add(a: i32) { return a + 1; }").unwrap();
+        let (p, _) = lower_python_source("def add(x):\n    return x + 1\n").unwrap();
+        assert_eq!(to_sexpr(&abstract_idents(r)), to_sexpr(&abstract_idents(p)));
     }
 
     #[test]
