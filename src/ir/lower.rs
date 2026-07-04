@@ -53,6 +53,70 @@ fn lower_node(
             span,
             lower_stmts(node, src, log),
         )),
+        "loop_expression" => {
+            // Already the canonical core — no transform recorded.
+            let body = lower_body(node, src, log, span);
+            Some(NormNode::new(kind::LOOP, field, span, vec![body]))
+        }
+        "while_expression" => {
+            // `while cond { body }` → `Loop { break-guard; body }` (§5.2.2). Lossy:
+            // record LoopLower with the source form so it reverses for display, and
+            // so the log diff explains a while↔loop match (§15.2).
+            let cond = node
+                .child_by_field_name("condition")
+                .and_then(|c| lower_node(c, None, src, log));
+            let mut body = lower_body(node, src, log, span);
+            if let Some(cond) = cond {
+                body.children.insert(0, break_guard(cond, span));
+            }
+            log.record(
+                TransformKind::LoopLower,
+                span,
+                Witness::LoopForm("while".into()),
+            );
+            Some(NormNode::new(kind::LOOP, field, span, vec![body]))
+        }
+        "if_expression" => {
+            let guard = node
+                .child_by_field_name("condition")
+                .and_then(|c| lower_node(c, Some("guard"), src, log));
+            let body = node
+                .child_by_field_name("consequence")
+                .and_then(|c| lower_node(c, Some("body"), src, log));
+            let mut arms = vec![make_arm(guard, body, span)];
+            if let Some(alt) = node.child_by_field_name("alternative") {
+                // `else_clause` wraps a block or a nested `if`; the else arm has no guard.
+                let mut cursor = alt.walk();
+                let inner = alt
+                    .named_children(&mut cursor)
+                    .find_map(|c| lower_node(c, Some("body"), src, log));
+                if inner.is_some() {
+                    arms.push(make_arm(None, inner, span));
+                }
+            }
+            Some(NormNode::new(kind::BRANCH, field, span, arms))
+        }
+        "unary_expression" => {
+            let mut op = None;
+            let mut operand = None;
+            let mut cursor = node.walk();
+            for c in node.children(&mut cursor) {
+                if c.is_named() {
+                    operand = lower_node(c, Some("operand"), src, log);
+                } else if op.is_none() {
+                    op = Some(NormNode::new(
+                        text(c, src),
+                        Some("op"),
+                        span_of(c),
+                        Vec::new(),
+                    ));
+                }
+            }
+            let children = op.into_iter().chain(operand).collect();
+            Some(NormNode::new(kind::UNOP, field, span, children))
+        }
+        "break_expression" => Some(NormNode::new(kind::BREAK, field, span, Vec::new())),
+        "continue_expression" => Some(NormNode::new(kind::CONTINUE, field, span, Vec::new())),
         "expression_statement" => {
             // Unwrap: lower the single inner expression, keeping the stmt's field.
             let mut cursor = node.walk();
@@ -179,6 +243,35 @@ fn lower_stmts(node: Node, src: &str, log: &mut TransformLog) -> Vec<NormNode> {
         .collect()
 }
 
+/// Lower a node's `body` block, defaulting to an empty `Block`.
+fn lower_body(node: Node, src: &str, log: &mut TransformLog, span: (u32, u32)) -> NormNode {
+    node.child_by_field_name("body")
+        .and_then(|b| lower_node(b, Some("body"), src, log))
+        .unwrap_or_else(|| NormNode::new(kind::BLOCK, Some("body"), span, Vec::new()))
+}
+
+/// `Arm[ guard?, body? ]` — a member of a canonical `Branch` (§14). The else/default
+/// arm carries no guard.
+fn make_arm(guard: Option<NormNode>, body: Option<NormNode>, span: (u32, u32)) -> NormNode {
+    let children = guard.into_iter().chain(body).collect();
+    NormNode::new(kind::ARM, Some("arm"), span, children)
+}
+
+/// The canonical break-guard `Branch[ Arm[ !cond → { Break } ] ]` — built to be
+/// byte-identical to a hand-written `if !cond { break }` lowered through the
+/// `if_expression` arm, which is exactly what makes `while` converge with an explicit
+/// `loop` (only the transform log differs).
+fn break_guard(cond: NormNode, span: (u32, u32)) -> NormNode {
+    let mut operand = cond;
+    operand.field = Some("operand".into());
+    let bang = NormNode::new("!", Some("op"), span, Vec::new());
+    let guard = NormNode::new(kind::UNOP, Some("guard"), span, vec![bang, operand]);
+    let brk = NormNode::new(kind::BREAK, None, span, Vec::new());
+    let body = NormNode::new(kind::BLOCK, Some("body"), span, vec![brk]);
+    let arm = make_arm(Some(guard), Some(body), span);
+    NormNode::new(kind::BRANCH, None, span, vec![arm])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,5 +305,23 @@ mod tests {
         // The redundant parens around g(x) were dropped and recorded — one event.
         assert_eq!(log.len(), 1);
         assert_eq!(log.events()[0].kind, TransformKind::ParenDrop);
+    }
+
+    #[test]
+    fn while_and_loop_converge_with_differing_logs() {
+        let (while_ir, while_log) = lower_first_fn("fn w() { while c() { s(); } }");
+        let (loop_ir, loop_log) = lower_first_fn("fn l() { loop { if !c() { break; } s(); } }");
+        // The flagship convergence: a `while` and the equivalent hand-written
+        // `loop { if !cond { break } … }` lower to byte-identical canonical IR …
+        assert_eq!(to_sexpr(&while_ir), to_sexpr(&loop_ir));
+        // … while their transform logs differ — the match-explanation property
+        // (§15.2): the `while` recorded a LoopLower, the explicit `loop` did not.
+        assert!(
+            while_log
+                .events()
+                .iter()
+                .any(|e| e.kind == TransformKind::LoopLower)
+        );
+        assert!(loop_log.is_empty());
     }
 }
