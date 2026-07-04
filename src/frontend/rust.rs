@@ -3,9 +3,9 @@
 //! `src/lang/rust.rs` (the full per-grammar normalizer): this is a small fraction of it.
 
 use super::{
-    Frontend, block, drop_parens, leaf, lit, lower_assign, lower_binary, lower_call, lower_for,
-    lower_function, lower_if, lower_loop, lower_return, lower_source, lower_unary_positional,
-    lower_unit, lower_while, native, unwrap_stmt, var,
+    Frontend, block, drop_parens, leaf, lit, lower_assign, lower_binary, lower_call, lower_field,
+    lower_for, lower_function, lower_if, lower_loop, lower_return, lower_source,
+    lower_unary_positional, lower_unit, lower_while, native, unwrap_stmt, var,
 };
 use crate::ir::kind;
 use crate::ir::transform::TransformLog;
@@ -64,6 +64,15 @@ impl Frontend for Rust {
             )),
             "return_expression" => Some(lower_return(self, node, field, span, src, log)),
             "parenthesized_expression" => drop_parens(self, node, field, span, src, log),
+            "field_expression" => Some(lower_field(
+                self,
+                node,
+                field,
+                span,
+                ("value", "field"),
+                src,
+                log,
+            )),
             "binary_expression" => Some(lower_binary(
                 self,
                 node,

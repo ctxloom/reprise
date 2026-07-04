@@ -410,6 +410,35 @@ fn make_assign(target: NormNode, value: NormNode, span: (u32, u32)) -> NormNode 
     NormNode::new(kind::ASSIGN, None, span, vec![target, v])
 }
 
+/// Field access `base.name` → `Field{ base, name }`. The field name is **always
+/// External** by structure (it is never a local), so the historical `always_external`
+/// hook dissolves: abstraction leaves it alone.
+pub(crate) fn lower_field(
+    fe: &dyn Frontend,
+    node: Node,
+    field: Option<&str>,
+    span: (u32, u32),
+    fields: (&str, &str),
+    src: &str,
+    log: &mut TransformLog,
+) -> NormNode {
+    let (base_f, name_f) = fields;
+    let mut children = Vec::new();
+    if let Some(b) = node
+        .child_by_field_name(base_f)
+        .and_then(|n| fe.lower_node(n, Some("base"), src, log))
+    {
+        children.push(b);
+    }
+    if let Some(name) = node.child_by_field_name(name_f) {
+        children.push(
+            NormNode::new(kind::VAR, Some("name"), span_of(name), Vec::new())
+                .with_label(Label::External(text(name, src).into())),
+        );
+    }
+    NormNode::new(kind::FIELD, field, span, children)
+}
+
 pub(crate) fn lower_if(
     fe: &dyn Frontend,
     node: Node,

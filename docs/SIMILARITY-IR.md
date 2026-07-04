@@ -210,7 +210,10 @@ profiles) and an interface seam (a frontend contract replacing the
 4. Adjust node granularity where convergence/discrimination misses.
 5. **Recall-parity gate vs the current binary** (the D27/D32 method,
    `benches/compare/pair_ab.py`): zero lost reportable member-pairs on serde/ripgrep
-   before switchover.
+   before switchover. **Parity = at least as good** (no recall regression), NOT
+   byte-identical findings (user, 2026-07-03): the IR legitimately finds *more* where
+   it fixes historical grammar-shape fragility (principle 1), and such gains pass the
+   gate — only regressions fail it.
 6. Only then add the remaining three frontends, each re-passing the gates.
 
 ## 9. Phased rollout

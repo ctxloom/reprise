@@ -4,8 +4,8 @@
 //! normalizer): this is a small fraction of it, and it re-implements *nothing*.
 
 use super::{
-    Frontend, block, drop_parens, leaf, lit, lower_assign, lower_binary, lower_call, lower_for,
-    lower_function, lower_if, lower_return, lower_source, lower_unary_field, lower_unit,
+    Frontend, block, drop_parens, leaf, lit, lower_assign, lower_binary, lower_call, lower_field,
+    lower_for, lower_function, lower_if, lower_return, lower_source, lower_unary_field, lower_unit,
     lower_while, native, unwrap_stmt, var,
 };
 use crate::ir::kind;
@@ -67,6 +67,15 @@ impl Frontend for Python {
             )),
             "return_statement" => Some(lower_return(self, node, field, span, src, log)),
             "parenthesized_expression" => drop_parens(self, node, field, span, src, log),
+            "attribute" => Some(lower_field(
+                self,
+                node,
+                field,
+                span,
+                ("object", "attribute"),
+                src,
+                log,
+            )),
             "binary_operator" => Some(lower_binary(
                 self,
                 node,
@@ -133,6 +142,17 @@ mod tests {
             to_sexpr(&ir),
             "(Unit (Var@param a) (Block@body (Return (Binop@value (Var@left a) (+@op) (Lit@right INT)))))"
         );
+    }
+
+    #[test]
+    fn field_access_converges_and_names_stay_external() {
+        let abs = |ir| to_sexpr(&crate::ir::abstract_idents(ir));
+        let (r, _) = lower_rust_source("fn f(b: i32) { return a.b; }").unwrap();
+        let (p, _) = lower_python_source("def f(b):\n    return a.b\n").unwrap();
+        let (rs, ps) = (abs(r), abs(p));
+        assert_eq!(rs, ps);
+        // field name `b` stays External even though a local `b` (the param) exists.
+        assert!(rs.contains("(Var@name b)"), "{rs}");
     }
 
     #[test]
