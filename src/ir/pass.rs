@@ -54,6 +54,62 @@ fn relabel(node: &mut NormNode, declared: &HashSet<Box<str>>, order: &mut HashMa
     }
 }
 
+/// Commutative operators (canonical IR spelling — both `&&` and Python `and`, etc.).
+const COMMUTATIVE: &[&str] = &["+", "*", "&", "|", "^", "==", "!=", "&&", "||", "and", "or"];
+
+/// Spec §5.2.6 on the IR: sort the operands of a commutative operator chain into a
+/// canonical order (by field-stripped s-expression), so `a + b` and `b + a` converge.
+/// Language-agnostic — the operator token is canonical in the IR. Unsound for floats /
+/// operator overloading (accepted; the output is a report). Run *after* abstraction.
+pub fn canonicalize_order(mut node: NormNode) -> NormNode {
+    node.children = node.children.into_iter().map(canonicalize_order).collect();
+    if node.kind.as_ref() == kind::BINOP
+        && node.children.len() == 3
+        && COMMUTATIVE.contains(&node.children[1].kind.as_ref())
+    {
+        let op = node.children[1].clone();
+        let mut operands = Vec::new();
+        flatten_chain(&node, op.kind.as_ref(), &mut operands);
+        if operands.len() >= 2 {
+            operands.sort_by_cached_key(crate::ir::render::to_sexpr);
+            return rebuild_chain(operands, op, node.field);
+        }
+    }
+    node
+}
+
+/// Collect operands of a same-operator commutative chain (left-assoc), field-stripped.
+fn flatten_chain(node: &NormNode, op: &str, out: &mut Vec<NormNode>) {
+    if node.kind.as_ref() == kind::BINOP
+        && node.children.len() == 3
+        && node.children[1].kind.as_ref() == op
+    {
+        flatten_chain(&node.children[0], op, out);
+        let mut rhs = node.children[2].clone();
+        rhs.field = None;
+        out.push(rhs);
+    } else {
+        let mut n = node.clone();
+        n.field = None;
+        out.push(n);
+    }
+}
+
+fn rebuild_chain(mut operands: Vec<NormNode>, op: NormNode, field: Option<Box<str>>) -> NormNode {
+    let span = operands[0].span;
+    let mut acc = operands.remove(0);
+    acc.field = Some("left".into());
+    for mut next in operands {
+        next.field = Some("right".into());
+        let mut op_clone = op.clone();
+        op_clone.field = Some("op".into());
+        acc = NormNode::new(kind::BINOP, None, span, vec![acc, op_clone, next]);
+        acc.children[0].field = Some("left".into());
+    }
+    acc.field = field;
+    acc
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,6 +139,19 @@ mod tests {
         assert_eq!(
             a,
             "(Unit (Var@param v0) (Block@body (Return (Binop@value (Var@left v0) (+@op) (Lit@right INT)))))"
+        );
+    }
+
+    #[test]
+    fn commutative_operands_converge() {
+        let canon = |src: &str| {
+            let (ir, _) = lower_rust_source(src).unwrap();
+            to_sexpr(&canonicalize_order(abstract_idents(ir)))
+        };
+        // `a + b` and `b + a` sort to the same canonical order.
+        assert_eq!(
+            canon("fn f() { return a + b; }"),
+            canon("fn g() { return b + a; }")
         );
     }
 

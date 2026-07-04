@@ -19,7 +19,7 @@ pub mod provenance;
 pub mod render;
 pub mod transform;
 
-pub use pass::abstract_idents;
+pub use pass::{abstract_idents, canonicalize_order};
 pub use provenance::Provenance;
 pub use render::to_sexpr;
 pub use transform::{TransformEvent, TransformKind, TransformLog, Witness};
