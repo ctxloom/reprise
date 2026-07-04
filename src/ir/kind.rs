@@ -1,0 +1,110 @@
+//! The canonical IR node-set (`docs/SIMILARITY-IR.md` §5) — a **closed, versioned**
+//! vocabulary (the CodeQL `dbscheme` discipline, §12.1). Under D-IR-1(a) the IR
+//! reuses `NormNode`'s shape, so a "kind" is just one of these strings; frontends
+//! lower into them and the language-agnostic algorithms match on them.
+//!
+//! `SCHEME_VERSION` bumps on any change to this set — it feeds the cache key the
+//! same way `FINGERPRINT_SCHEME`/`EXTRACTION_VERSION` do (D19/D30), because the
+//! vocabulary *is* the canonical form.
+
+/// Bumps on any change to the canonical vocabulary (feeds the cache key, D19/D30).
+pub const SCHEME_VERSION: u32 = 1;
+
+// ---- structural ----
+pub const UNIT: &str = "Unit";
+pub const BLOCK: &str = "Block";
+pub const LOOP: &str = "Loop";
+/// The one unified conditional (§14): if-chains / match / when / switch / ternary.
+pub const BRANCH: &str = "Branch";
+/// A `(guard, body)` member of a [`BRANCH`].
+pub const ARM: &str = "Arm";
+pub const ASSIGN: &str = "Assign";
+pub const RETURN: &str = "Return";
+pub const BREAK: &str = "Break";
+pub const CONTINUE: &str = "Continue";
+
+// ---- expression ----
+pub const CALL: &str = "Call";
+pub const BINOP: &str = "Binop";
+pub const UNOP: &str = "Unop";
+pub const INDEX: &str = "Index";
+pub const FIELD: &str = "Field";
+pub const LAMBDA: &str = "Lambda";
+pub const VAR: &str = "Var";
+pub const LIT: &str = "Lit";
+
+// ---- escape hatch (§12.1: category-specific, opaque, resolution-free) ----
+pub const NATIVE_STMT: &str = "NativeStmt";
+pub const NATIVE_EXPR: &str = "NativeExpr";
+pub const NATIVE_PAT: &str = "NativePat";
+pub const NATIVE_TYPE: &str = "NativeType";
+
+// ---- ⚠ open (start as its simplest form / `Native`; §5, resolved by P1) ----
+/// The iteration protocol as an explicit node (today: synthetic `__has_next`/`__next`).
+pub const ITER: &str = "Iter";
+
+/// Every canonical kind. Frontends must emit only these (or a language token /
+/// `Native*` leaf); the closed set is what lets one schema serve five frontends.
+pub const ALL: &[&str] = &[
+    UNIT,
+    BLOCK,
+    LOOP,
+    BRANCH,
+    ARM,
+    ASSIGN,
+    RETURN,
+    BREAK,
+    CONTINUE,
+    CALL,
+    BINOP,
+    UNOP,
+    INDEX,
+    FIELD,
+    LAMBDA,
+    VAR,
+    LIT,
+    NATIVE_STMT,
+    NATIVE_EXPR,
+    NATIVE_PAT,
+    NATIVE_TYPE,
+    ITER,
+];
+
+/// Is `kind` a member of the canonical vocabulary? (A tree-sitter CST kind such
+/// as `"call_expression"` is not — that is the pre-lowering surface.)
+pub fn is_canonical(kind: &str) -> bool {
+    ALL.contains(&kind)
+}
+
+/// Is `kind` one of the opaque escape-hatch categories? A `Native*` node carries
+/// its language discriminator in its label and matches only same-tag (§12.1).
+pub fn is_native(kind: &str) -> bool {
+    matches!(kind, NATIVE_STMT | NATIVE_EXPR | NATIVE_PAT | NATIVE_TYPE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn all_kinds_unique_and_recognized() {
+        let mut seen = HashSet::new();
+        for &k in ALL {
+            assert!(seen.insert(k), "duplicate canonical kind: {k}");
+            assert!(is_canonical(k), "{k} missing from is_canonical");
+        }
+    }
+
+    #[test]
+    fn native_kinds_classify() {
+        for &k in &[NATIVE_STMT, NATIVE_EXPR, NATIVE_PAT, NATIVE_TYPE] {
+            assert!(is_native(k));
+            assert!(is_canonical(k));
+        }
+        assert!(!is_native(LOOP));
+        // A raw tree-sitter kind is never canonical — it is the surface the
+        // frontend lowers *from*.
+        assert!(!is_canonical("call_expression"));
+    }
+}

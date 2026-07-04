@@ -13,6 +13,7 @@ pub mod fold;
 pub mod formats;
 pub mod group;
 pub mod inline;
+pub mod ir;
 pub mod lang;
 pub mod matchtree;
 pub mod normalize;
