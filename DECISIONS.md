@@ -900,3 +900,105 @@ loop-swap variants use each language's handled index form; the while-index gap i
 recorded here as a follow-up, not yet built. Wild-corpus pairs for TS/Kotlin
 remain unbuilt — real-repo provenance labeling (the M4a method) is a separate
 exercise and was deliberately not fabricated.
+
+## D44 — Substrate stays source-via-tree-sitter + purpose-built IR; execution bytecode rejected (2026-07-03)
+
+Design discussion, not a code change: whether to shrink the five parallel
+`src/lang/*.rs` profiles by moving the normalization substrate off tree-sitter
+**source** onto an existing lowered/desugared form — JVM bytecode (Java/Kotlin),
+CPython bytecode (Python), CIL (C#) — read either directly or as textual
+disassembly (`javap -c`, `python -m dis`) parsed by a tree-sitter grammar.
+Recorded per the §8 no-silent-architecture rule and the D16 habit (weigh a rival
+substrate on the merits, put the verdict on the record).
+
+**Motivation acknowledged — the instinct is right about the smell.** The
+normalization phase (§5.2: loop lowering, tail-recursion→loop, iteration-protocol
+rewrite, positional identifier abstraction, literal bucketing) is a hand-grown IR,
+and its per-language rewrites are exactly where the standing self-scan duplication
+lives (the `lower_recursion`/`reassign_stmts` families, D43). Those rewrites
+reimplement, per language, desugarings a compiler already performs: `lower_loops`
+synthesizing `__has_next`/`__next` is literally CPython's `FOR_ITER`; positional
+locals are literally bytecode slot numbers. "Stop hand-rolling an assembler and
+borrow a real one" correctly names what reprise is accreting.
+
+**Verdict: substrate stays.** Four properties reprise is *defined by* are each
+broken by an execution-bytecode substrate:
+
+| Property | Broken how |
+|---|---|
+| **Buildless / works on broken code** | Bytecode needs a successful compile of the whole project with resolved deps. The flagship `check` runs at PR time on frequently-non-compiling LLM-agent code and on arbitrary file subsets; tree-sitter parses one broken file in isolation. Product-defining — disqualifying on its own. |
+| **Tree-structured evidence** | A method's bytecode is a flat instruction stream; control flow is jump labels, not nested subtrees. Subtree hashing, the offset-histogram diagonal (§5.6), and anti-unification templates all need structural nesting. Lowering collapses matching toward jscpd's linear-window regime — the thing reprise beats (§7.3) — and degrades the flagship source-shaped template into "a run of ops with holes." |
+| **Toolchain-deterministic baseline** | Same source, different compiler/version/opt-level → different bytecode. CPython bytecode churns every minor release (3.11's specializing adaptive interpreter reworked it wholesale). A drift baseline (D40) that shifts when CI bumps the toolchain is dead. |
+| **Uniform matrix coverage** | Only Python (CPython) and Kotlin (JVM) of the five current languages have a clean stable pseudo-assembly; Java is the only one of four planned. Rust→MIR(internal)/LLVM-IR(opt-soup), Go→SSA(internal), TS→V8(internal), C/C++→none structured. Forces a hybrid pipeline whose halves aren't comparable — more architecture, not less. |
+
+**The "disassemble, then tree-sit it" variant does not rescue it.** Parsing
+`javap`/`dis` text with a tree-sitter grammar recovers the *uniform frontend* —
+but uniformity was never the problem (`NormNode` and the whole back half are
+already language-agnostic; that is the existing win). The four properties above
+are untouched by *how* the bytecode is parsed, and the CST of a disassembly is a
+flat instruction listing — nesting is still jump labels, so the tree tier still
+collapses. Recovering structured control flow means heuristic decompilation,
+which rebuilds the source AST you started from, minus fidelity.
+
+**Honest counterweight (why the idea keeps looking attractive).** For VM-family
+languages the multiplier is real: Java/Kotlin/Scala/Groovy all disassemble to
+JVM, so one grammar + one profile would cover the ecosystem; C#/F#/VB → one CIL.
+That is genuine N→1 consolidation — but only purchasable at the cost of the four
+properties, and same-language-only matching (§3) means cross-family unification
+isn't even a goal reprise would spend them on.
+
+**Direction if the profiles are reduced (a separate decision, not taken here):**
+author the IR, don't borrow it. A purpose-built neutral normalization IR —
+desugared, inspectable, textual for golden tests, tree-shaped exactly as clone
+detection needs — *emitted from tree-sitter source* keeps every ergonomic (one
+lowering target, controlled desugaring, one home for the rewrites) with none of
+the four poisons, because it stays buildless, deterministic, and source-mapped.
+§5.2 already half-specifies that instruction set. The smaller near-term step —
+lifting the `lower_recursion`/`reassign_stmts` family out of the profiles into
+shared generic functions parameterized by a per-language shape — is a
+cross-profile consolidation and gets its own sign-off before it lands (it changes
+topology across five deliberately-independent units).
+
+**Escape hatch preserved.** Bytecode's one genuine fit in reprise is an *opt-in,
+requires-build, deep-Type-4 tier* for JVM/CLR languages — semantic-clone
+detection that sees through source-level obfuscation, added alongside the
+source-first core, never replacing it. Bytecode-based clone/plagiarism detection
+is an established technique for exactly that setting (compiled, whole-repo, fixed
+toolchain); it is a different tool's default, not reprise's.
+
+## D45 — Similarity IR: design promoted, P1 underway (2026-07-03)
+
+D44 rejected borrowing an execution IL and pointed at a purpose-built IR "designed,
+not merely chosen." That design is now written up as the authoritative
+**`docs/SIMILARITY-IR.md`** (the D-IR-1…10 register lives there), and P1 implementation
+is beginning on branch `similarity-ir`. What is decided vs. what P1 measures:
+
+- **Scope.** Greenfield the *front half* — an IR node-set + per-language frontends
+  lowering tree-sitter CST **directly to a canonical form**. The matching back half
+  (`fingerprint`/`seq`/`tree`/`au`/`inline`) is preserved unchanged — it is not where
+  the duplication lives. tree-sitter stays the sole frontend (buildless, D44).
+- **The win.** The front-half algorithms currently copied across the five
+  `src/lang/*.rs` profiles (loop lowering, recursion/tail, iteration rewrite, order
+  canonicalization) move onto the IR, written once; the standing self-scan findings
+  (`lower_recursion`/`reassign_stmts`) die by construction.
+- **Resolved.** Node-set is a per-language shared *skeleton*, **not** a universal
+  cross-language vocabulary — the trap that archived source{d} Babelfish and GitHub
+  `semantic`; §3 same-language-only makes reprise immune (the shared vocabulary exists
+  for algorithm reuse, never cross-language matching). `Branch` unified
+  (if-chains/match/switch/ternary + value-producing branched-assignment; a dispatch
+  table becomes a *recognized shape* of `Branch`, retiring the per-language
+  `is_dispatch_arm` hook — D30 goes language-agnostic). Decomposition normalization via
+  **ANF named intermediates** (not collapse-to-nested — the `(data,err)` multi-return
+  case flipped it). The artifact is **lossless** (normalization *relocates* discriminators
+  into per-transform witnesses, does not destroy them); transforms are reversible **for
+  display only** (no compile-from-IR). The transform log is an append-only event stream
+  held **in memory, never persisted** (excluded from the D19 cache) — the CQRS/ES *model*,
+  not its infrastructure.
+- **Measured in P1, not asserted (the D-IR register).** Container choice
+  (same-`NormNode`-container vs typed enum), ANF naming granularity, e-graph threshold,
+  fallthrough/arm-sort, and every ⚠ node-set boundary — all gated by `bench-mutations`
+  + the §7.2 precision sample + `pair_ab` parity vs the current binary. The transform
+  log doubles as the per-transform recall/precision **attribution harness**.
+- **Rollout.** P1 = IR + Rust/Python frontends behind a flag, parity-gated; P2 =
+  TS/Go/Kotlin; P3 = retire the `LanguageProfile` normalization hooks (bumps
+  `FINGERPRINT_SCHEME`/`EXTRACTION_VERSION`, D19/D30).
