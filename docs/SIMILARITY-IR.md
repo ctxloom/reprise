@@ -136,6 +136,8 @@ Branch{arms:[(guard, body)]}      DECIDED (§14): ONE ordered first-match condit
 (DispatchTable — dropped)         RESOLVED (§14): not a node, a recognized *shape* of
                                   Branch (all arms literal-eq guard + trivial body);
                                   keeps D30 language-agnostic
+⚠ Try/catch                       Branch-family (§14 / D-IR-11): catch-list = ordered
+                                  typed arms + bind; `Native`-first until structure settled
 ```
 
 The ⚠ nodes are exactly where convergence vs discrimination is decided. Resolve
@@ -195,7 +197,8 @@ profiles) and an interface seam (a frontend contract replacing the
   CST proves to be the bottleneck. → **Recommendation: tree-sitter only for now.**
 
 > **Full D-IR register:** D-IR-1…5 above; **D-IR-6/7** (ANF naming granularity;
-> e-graph threshold) in §13; **D-IR-8** (fallthrough & arm-sort) in §14; **D-IR-9**
+> e-graph threshold) in §13; **D-IR-8/11** (fallthrough & arm-sort; try/catch structure)
+> in §14; **D-IR-9**
 > (reversal strength — RESOLVED) and **D-IR-10** (log lifecycle — RESOLVED) in §15.
 > Open items are P1-gated (§8).
 
@@ -450,6 +453,21 @@ if / else-if chains, `match`/`when`/`switch`, and ternary. Resolves the §5 ⚠ 
   separate node — it's a *recognized shape* of Branch (every arm a literal-equality
   guard + trivial body). D30's fold-but-don't-report suppression checks that shape on
   canonical Branch, retiring the per-language `is_dispatch_arm` hook.
+- **Try/catch is a Branch-family construct (user, 2026-07-03; D-IR-11).** A catch-clause
+  list is an *ordered, first-match, type-guarded arm list* — exactly the Branch shape:
+  `catch (E e) { … }` lowers to an arm `(catches(E), [bind e; handler])`, reusing the
+  pattern-arm lowering (the exception type is the guard, the caught variable is the
+  pattern bind); a bare `catch` / `except:` is the trivial-guard else arm. Converges
+  Java/Python/Kotlin/TS/C++/C# try/catch. Honest wrinkles: (a) the guard is a
+  *region-throw*, not a point-test — the "subject" is the *effect* of running the
+  protected block, not an expression; (b) `finally` has no arm analog (a trailing
+  unconditional block — the loose end); (c) we model the **syntactic shape** (protected
+  region + ordered typed handlers + finally), NOT the exceptional control-flow graph —
+  §10 stops at the tree. Cross-connection: Go has no try/catch — its error handling is
+  the `if err != nil` idiom in the §13 rung-3 error-propagation family; whether the two
+  *cross-converge* is a separate, precision-risky Type-4 question, deferred.
+  **`Native`-first until D-IR-11 settles the structure** (escape-hatch discipline),
+  graduating with a driving case.
 
 **Arm ordering.** Order is semantically load-bearing (first-match-wins), so a general
 Branch is *ordered* — arms cannot be sorted (unlike commutative operands). Exception:
@@ -467,6 +485,10 @@ D30, which this makes cleaner, not looser.
   lower-by-body-duplication → leaning `Native`-first. (b) Sort literal-disjoint dispatch
   arms vs keep source order → leaning sort-when-disjoint (matches D11 + the D30 shape).
   P1 decides.
+- **D-IR-11 · Try/catch structure.** A dedicated `Try` node in the Branch family vs.
+  `Branch` gaining an optional protected-region + `finally` element (the latter also
+  subsumes `match`'s explicit subject). Catch-arms reuse the pattern-arm lowering either
+  way. `Native`-first until settled; P1 + a driving case decide.
 
 ## 15. Provenance & reversible transforms (design commitment, 2026-07-03)
 
