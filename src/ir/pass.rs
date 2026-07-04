@@ -110,6 +110,28 @@ fn rebuild_chain(mut operands: Vec<NormNode>, op: NormNode, field: Option<Box<st
     acc
 }
 
+/// Spec §5.2.7 on the IR: drop a redundant trailing `Continue` at a loop-body tail
+/// (source `continue` at the end of a loop is a no-op, and lowered recursion emits
+/// one), so `for x in xs { f(x); continue }` converges with `for x in xs { f(x) }`.
+pub fn strip_dead(mut node: NormNode) -> NormNode {
+    node.children = node.children.into_iter().map(strip_dead).collect();
+    if node.kind.as_ref() == kind::LOOP
+        && let Some(body) = node
+            .children
+            .iter_mut()
+            .find(|c| c.field.as_deref() == Some("body"))
+    {
+        while body
+            .children
+            .last()
+            .is_some_and(|c| c.kind.as_ref() == kind::CONTINUE)
+        {
+            body.children.pop();
+        }
+    }
+    node
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,6 +161,18 @@ mod tests {
         assert_eq!(
             a,
             "(Unit (Var@param v0) (Block@body (Return (Binop@value (Var@left v0) (+@op) (Lit@right INT)))))"
+        );
+    }
+
+    #[test]
+    fn trailing_continue_is_stripped() {
+        let strip = |src: &str| {
+            let (ir, _) = lower_rust_source(src).unwrap();
+            to_sexpr(&strip_dead(abstract_idents(ir)))
+        };
+        assert_eq!(
+            strip("fn a() { for x in xs { f(x); continue; } }"),
+            strip("fn b() { for x in xs { f(x); } }")
         );
     }
 

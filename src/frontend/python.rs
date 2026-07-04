@@ -54,6 +54,7 @@ impl Frontend for Python {
             )),
             "break_statement" => Some(leaf(kind::BREAK, field, span)),
             "continue_statement" => Some(leaf(kind::CONTINUE, field, span)),
+            "pass_statement" => None,
             "expression_statement" => unwrap_stmt(self, node, field, src, log),
             "call" => Some(lower_call(
                 self,
@@ -132,6 +133,12 @@ mod tests {
             to_sexpr(&ir),
             "(Unit (Var@param a) (Block@body (Return (Binop@value (Var@left a) (+@op) (Lit@right INT)))))"
         );
+    }
+
+    #[test]
+    fn python_pass_is_dropped() {
+        let (ir, _) = lower_python_source("def f():\n    pass\n").unwrap();
+        assert_eq!(to_sexpr(&ir), "(Unit (Block@body))");
     }
 
     #[test]
