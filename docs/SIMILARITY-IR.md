@@ -333,6 +333,17 @@ Full per-system synthesis is in the session transcript; the design-changing dist
   structural imperative**: derive the mapping declaratively (queries / a TSG-style
   construction DSL), version-pinned, so a grammar bump can't silently move a hash.
   (GitHub `semantic` ✗, stack-graphs ✓.)
+  **Realized (SP4, 2026-07-05) as _gated_, not eliminated** (`docs/sp4-grammar-lift-plan.md`).
+  Queries can't synthesize the structural lowerings (break-guard, subject-fold, tail-return —
+  D-SP4-1c), so the lift stays hand-authored; what changed is the *coupling is now data*. Each
+  frontend's `const MAP` + `RESIDUE_KINDS` dispatch table (`src/frontend/{rust,python,go}.rs`) is
+  the single source a **conformance gate** reads (`frontend::frontend_table` +
+  `every_referenced_construct_exists_in_the_linked_grammar`) to assert every referenced (kind,
+  field) still exists in the linked grammar. A grammar bump now either stays green or **fails
+  loudly, naming the dead construct** — it can no longer route a renamed kind to `native()` and
+  silently move a `u128`. The `grammar-*.snap` / `unmapped-*.snap` snapshots + the patch-pinned
+  cache key (`cache::GRAMMAR_VERSIONS`) make any bump a reviewable diff. So the imperative is met by
+  *gating* the hand-written lift, not by generating it — the honest, bounded closure.
 - **Spans are a decoupled side-channel, excluded from the identity hash; keep two
   views.** srcML wraps (not replaces) source for byte-exact provenance; M3 decouples
   location as URI values. → nodes carry spans but the structural hash is span-free

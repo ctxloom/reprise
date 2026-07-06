@@ -18,8 +18,25 @@ use xxhash_rust::xxh3::xxh3_128;
 /// hardcoded constant list adjacent to the Cargo.toml pins because Cargo does
 /// not expose dependency versions at build time (D19); update alongside any
 /// grammar bump — the pinned versions are load-bearing (DECISIONS.md D9).
+///
+/// **The bump ritual (SP4 — `docs/sp4-grammar-lift-plan.md` §6).** These pins are
+/// one leg of a triad that makes a grammar bump *loud, not silent*: (1) this list
+/// keys the cache so a bump invalidates every stale fingerprint; (2) the frontend
+/// conformance gate (`crate::frontend::frontend_table` + `every_referenced_construct_
+/// exists_in_the_linked_grammar`) asserts every dispatched (kind, field) still exists
+/// in the linked grammar — a rename fails loudly, naming the dead construct; (3) the
+/// `grammar-*.snap` / `unmapped-*.snap` snapshots turn any grammar-surface change into
+/// a reviewable diff. So when bumping a grammar crate: bump the Cargo.toml pin AND this
+/// string → run `just test` → the gate stays green (no drift) or fails naming the dead
+/// construct, and the schema snapshots diff. Regenerate a *reviewed* diff with
+/// `UPDATE_GRAMMAR_SNAPSHOTS=1 cargo test`, and only bump `ir::kind::SCHEME_VERSION` if
+/// the canonical form *legitimately* moved.
+///
+/// `tree-sitter` (the runtime, which executes every grammar) is pinned at the **resolved
+/// patch** `0.26.10`, not the minor `0.26` — a patch bump can change parsing behaviour, so
+/// it must move the cache key too (parity with the fully-patch-pinned grammar crates).
 pub const GRAMMAR_VERSIONS: &[&str] = &[
-    "tree-sitter/0.26",
+    "tree-sitter/0.26.10",
     "tree-sitter-rust/0.24.2",
     "tree-sitter-python/0.25.0",
     "tree-sitter-typescript/0.23.2",
