@@ -293,6 +293,93 @@ time reported combined (as `query-ms`), with `idx-entries` as the peak-footprint
 
 Bench file: `examples/bakeoff.rs` (run `cargo run --release --example bakeoff -- [root…]`, default `src`).
 
+## 0.5 Landmark-definition sweep — FLOOD reduction at ZERO recall loss **GO: structural verify (H-tree-verify); the constellation encoding is a wash** (2026-07-05, `stark-mixed-front`)
+
+§0.4 proved the incumbent landmark is **complete-recall** (100% vs the verify-union oracle) and
+**Pareto-optimal on flood** at the full-recall frontier. So the only remaining lever is **flood
+reduction at recall = 1.0** — cut coincidental candidates without dropping a single verified clone.
+This sweep trials seven alternate landmark **definitions** as new `candidates()` entrants in
+`examples/bakeoff.rs`, each on the **same** substrate (nodes3 / df6 / df3) and the **same**
+owner→count→`min_shared` clique; only the definition (peak selection + relation encoding) changes,
+so any delta is attributable to it. **Measurement only — `src/` production code is untouched.**
+The oracle is held **fixed** (verify-union ACCEPT via the original `offset_histogram → anti_unify`),
+so recall is retriever-independent. Self-check: the reconstructed `fan=3, ms=2` reproduces the
+incumbent flood **byte-for-byte** (8 013 on `src`), confirming the harness measures the real
+definition.
+
+Corpus: `src/` (834 plain units, IR normalizer, ACCEPT = 45, synthetic near = 21); **confirmed on
+`src crates` (881 units, ACCEPT = 48) — same ranking, same verdicts.** recall-A = verify-union
+ACCEPT, recall-B = synthetic near. Incumbent = `fan=3, ms=2`, flood **8 013**, recall 1.000/1.000.
+
+**The knobs that hold BOTH recalls at 1.000, ranked by flood (`src`):**
+
+| definition | flood | recall-A | recall-B | precision | query-ms | vs incumbent |
+|---|---|---|---|---|---|---|
+| **linear fan=4 ms=4 + tree-hist** | **3 444** | 1.000 | 1.000 | 0.0131 | ~21 | **−57%** |
+| **linear fan=2 ms=3 + tree-hist** | 3 501 | 1.000 | 1.000 | 0.0129 | ~15 | −56% |
+| **linear fan=3 ms=3 + tree-hist** | 3 749 | 1.000 | 1.000 | 0.0120 | ~21 | −53% |
+| **linear fan=3 ms=2 + tree-hist** (pure filter on the shipping op-point) | 4 195 | 1.000 | 1.000 | 0.0107 | ~17 | **−48%** |
+| fan=4 ms=4 (no filter) | 5 125 | 1.000 | 1.000 | 0.0088 | ~12 | −36% |
+| tree fan=2 ms=3 (structural relcode) | 5 579 | 1.000 | 1.000 | 0.0081 | ~7 | −30% |
+| fan=2 ms=3 | 5 691 | 1.000 | 1.000 | 0.0079 | ~6 | −29% |
+| fan=3 ms=3 (§0.4's free win) | 6 277 | 1.000 | 1.000 | 0.0072 | ~10 | −22% |
+| tree fan=3 ms=2 (structural relcode) | 7 744 | 1.000 | 1.000 | 0.0058 | ~8 | −3% |
+| **fan=3 ms=2 = incumbent** | 8 013 | 1.000 | 1.000 | 0.0056 | ~8 | 0 |
+
+**The definitions that FAIL the zero-recall-loss bar (cannot be adopted):**
+
+| definition | best flood | recall-A | recall-B | why it fails |
+|---|---|---|---|---|
+| **H-peak-cap** (top-K rarest peaks/unit) | 703 @ K=24 | 0.933 | 0.905 | a fixed K starves large units of landmarks; recall collapses (K≤8 → ≤0.29). Confirms the incumbent's **no peak cap**. |
+| **H-floor-align** (rare test on leak-free floor-3 df) | 2 248 | 0.889 | 0.810 | fixing the `unwrap_or(0)` sub-floor auto-rare **costs recall** — the 3–5-token subtrees it demotes are genuinely discriminative for small/renamed near-clones. **The "leak" is load-bearing, not a bug.** |
+| **H-salience** (peaks filtered by node-kind tier) | 2 445 @ tier≥2 | 0.867–0.911 | 0.714–0.810 | dropping low-salience peaks (field/index chains, bare operators) discards features near-clones share. Rarity, not node-type, is the right selector. |
+
+**Findings.**
+
+- **H-tree-verify is the win.** A structural **depth-delta histogram** — for each shared floor-3
+  subtree, vote on `depth_a − depth_b` instead of the token-offset delta — used as a **retriever-side
+  pre-filter** on the incumbent's own candidate stream cuts flood **8 013 → 4 195 (−48%)** at the
+  shipping operating point (`fan=3, ms=2`), holding recall 1.000/1.000 on **both** oracles and **both**
+  corpora. It removes only candidate pairs whose shared subtrees sit at *inconsistent relative depths*
+  — coincidental landmark collisions — and empirically drops **zero** ACCEPT pairs. Stacked with the
+  free threshold/fan-out knobs it reaches **3 444 (−57%)**.
+- **H-tree-constellation is a WASH.** Replacing the linear `Δoffset/8` in the landmark tuple with a
+  structural relcode (containment bit + depth-delta) moves flood by only ≈1–3% at identical recall
+  (`tree fan=3 ms=3` 6 265 vs `fan=3 ms=3` 6 277; `tree fan=3 ms=2` 7 744 vs 8 013). The hypothesis
+  "structural relations are less coincidental" holds for the **verify histogram**, **not** for the
+  constellation encoding — a quantized token gap is already as discriminative as a depth-delta there.
+- **H-threshold + H-fanout are free, mechanism-less wins** (already partly known from §0.4). `ms=3`
+  and/or `FAN_OUT=2` cut flood 22–30% at recall 1.000 with no new code. `FAN_OUT=4` lets `ms` rise to 4
+  without recall loss (more redundant landmarks), giving the best selection-only point, `fan=4 ms=4`
+  (5 125, −36%).
+
+**Recommendation.**
+
+1. **Adopt the safe knobs now (no new mechanism):** raise `shared_landmarks_min` 2 → 3 (the §0.4 free
+   win, re-confirmed) — −22% flood at recall 1.000. `FAN_OUT=2` is an additional free cut if desired.
+2. **Prototype H-tree-verify (the real prize).** Add the depth-delta agreement as a cheap structural
+   gate. It need not be a second pass: the depth is already available per subtree and can be voted in
+   the **same merge-join** the offset-histogram already walks (compute the `depth_a−depth_b` bin
+   alongside the `offset_a−offset_b` bin), making it near-free. Net expectation: ~48% fewer candidates
+   reaching `anti_unify` (the near tier's dominant cost) at zero recall loss. **Re-validate on
+   whole-repo + inline-on before shipping** — the ACCEPT oracle is small (45/48), and the filter is a
+   distinct structural axis.
+3. **H-tree-constellation is NOT worth a production change** — a wash on flood, added tuple complexity
+   for no gain. The structural signal pays off in *verify*, not in the constellation.
+4. **Do NOT touch peak selection.** Cap, floor-align, and salience each lose recall on both corpora.
+   The incumbent rare-peak selection — **including the `unwrap_or(0)` sub-floor auto-rare** — is
+   well-tuned; the "leak" is a recall-carrying feature.
+
+**Deferred (not measured):** inline-on flood (variants entering retrieval — plain units only here);
+cross-language behavioral matching (retrievers partition per-lang); a full-pipeline **cost** accounting
+of the tree-hist filter (it adds ~10–15 ms retrieval-side but should net-save downstream `anti_unify`
+calls — measure end-to-end before adopting); H-tree-constellation with a richer relation vocabulary
+(LCA arm-lengths, sibling-in-block) — the containment+depth-delta form tried here is already a wash, so
+a richer form is low-priority; larger ACCEPT oracles to tighten the recall=1.000 claim beyond 45/48
+pairs.
+
+Bench: `examples/bakeoff.rs`, section `LANDMARK-DEFINITION SWEEP` + `RECALL=1.0 FLOOD RANKING`.
+
 ## 1. Problem — the limiters are representation-dependent size proxies
 
 reprise's precision floors all gate on a **raw count** as a proxy for "is there enough here to trust a
