@@ -132,8 +132,17 @@ impl Default for TestsCfg {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct RetrievalCfg {
+    /// Which candidate-generation retriever runs alongside the shared bag layer.
+    /// A **string-keyed, plugin-extensible** selector (mirrors `normalize.normalizer`),
+    /// NOT a two-way flag: further retrievers may register later. The default `"landmark"`
+    /// is the §5.5.4 rare-peak constellation retriever (the §7.4b rivalry winner). The
+    /// bake-off alternatives (minhash-lsh, winnowing, sourcerer-rare) implement the same
+    /// `matchtree::Retriever` trait bench-side. Matching-time only — retrieval is
+    /// post-fingerprint, so this NEVER enters the extraction cache key (hash-neutral).
+    pub retriever: String,
     /// §5.5.4 landmark pairs — rivalry winner (§7.4b, see CALIBRATION.md;
-    /// hole-context hashes were dropped per the §5.5 rivalry clause).
+    /// hole-context hashes were dropped per the §5.5 rivalry clause). Master on/off for
+    /// the landmark layer; when off, the shared bag layer runs alone.
     pub landmark_pairs: bool,
     /// Minimum shared landmark-pair hashes for a candidate. The M3b value of 4
     /// cost real recall (D27 A/B: serde lost 15/43 pairs); 2 is recall-neutral.
@@ -156,6 +165,7 @@ pub struct RetrievalCfg {
 impl Default for RetrievalCfg {
     fn default() -> Self {
         RetrievalCfg {
+            retriever: "landmark".into(),
             landmark_pairs: true,
             shared_landmarks_min: 2,
             owner_pair_window: 0,

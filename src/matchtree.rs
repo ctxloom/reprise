@@ -47,14 +47,17 @@ pub struct RetrievalStats {
     pub landmark_index_size: usize,
 }
 
-struct RepData {
+/// Per-unit retrieval substrate, shared by every `Retriever` (candidate
+/// generation) and the verify chain. Retriever-specific indexes (e.g. the
+/// landmark constellation hashes) are built inside the retriever from this
+/// substrate, not stored here — the substrate stays neutral.
+pub struct RepData {
     unit_idx: usize,
     bag_set: Vec<u128>,
     /// Subtree hash → pre-order offsets, sorted by hash: the histogram
     /// intersects two of these by linear merge, no hashing (M3b/D22 — the
     /// per-candidate HashMap probes dominated 500k-LOC scans).
     offsets: Vec<(u128, Vec<u32>)>,
-    landmarks: Vec<u128>, // pair hashes
 }
 
 /// A histogram-and-AU-verified pair, keyed on unit indices.
@@ -114,7 +117,7 @@ fn near_groups_for_lang(
     if eligible.len() < 2 {
         return Vec::new();
     }
-    let mut reps: Vec<RepData> = eligible
+    let reps: Vec<RepData> = eligible
         .par_iter()
         .map(|&idx| {
             // Histogram offsets use a finer inventory (floor 3) than the bag
@@ -142,52 +145,18 @@ fn near_groups_for_lang(
                 unit_idx: idx,
                 bag_set,
                 offsets,
-                landmarks: Vec::new(),
             }
         })
         .collect();
 
     mark("reps");
-    // Landmark pairs (§5.5.4): rare subtrees (low document frequency) paired
-    // combinatorially with bucketed structural offsets.
-    if cfg.retrieval.landmark_pairs {
-        let mut df: HashMap<u128, u32> = HashMap::new();
-        for rep in &reps {
-            for h in &rep.bag_set {
-                *df.entry(*h).or_insert(0) += 1;
-            }
-        }
-        let rare_cap = 3.max(reps.len() as u32 / 20);
-        reps.par_iter_mut().for_each(|rep| {
-            let mut rare: Vec<(u32, u128)> = rep
-                .offsets
-                .iter()
-                .filter(|(h, _)| df.get(h).copied().unwrap_or(0) <= rare_cap)
-                .flat_map(|(h, offs)| offs.iter().map(move |o| (*o, *h)))
-                .collect();
-            rare.sort_unstable();
-            const FAN_OUT: usize = 3;
-            for i in 0..rare.len() {
-                for j in i + 1..(i + 1 + FAN_OUT).min(rare.len()) {
-                    let delta = (rare[j].0 - rare[i].0) / 8;
-                    let mut buf = Vec::with_capacity(36);
-                    buf.extend_from_slice(&rare[i].1.to_le_bytes());
-                    buf.extend_from_slice(&rare[j].1.to_le_bytes());
-                    buf.extend_from_slice(&delta.to_le_bytes());
-                    rep.landmarks.push(xxhash_rust::xxh3::xxh3_128(&buf));
-                }
-            }
-            // shared_count_pairs expects sorted, deduplicated hash lists.
-            rep.landmarks.sort_unstable();
-            rep.landmarks.dedup();
-        });
-    }
-
-    mark("landmarks");
-    // ---- candidate retrieval (union of layers; membership tracked for §7.4b) ----
+    // ---- candidate retrieval (union of two layers; membership tracked for §7.4b) ----
+    // Layer 1 (shared, always on): the bag-Jaccard layer.
+    // Layer 2 (swappable `Retriever`, default `Landmark`): candidate generation only —
+    // the verify chain below is identical for whichever retriever proposes the pairs.
     let df_cap = 50usize;
     let window = cfg.retrieval.owner_pair_window;
-    let bag_pairs = shared_count_pairs(&reps, |r| &r.bag_set, df_cap, window);
+    let bag_pairs = shared_count_pairs(reps.len(), |i| reps[i].bag_set.as_slice(), df_cap, window);
     let mut candidates: BTreeMap<(usize, usize), (bool, bool)> = BTreeMap::new();
     for ((i, j), shared) in bag_pairs {
         let union = reps[i].bag_set.len() + reps[j].bag_set.len() - shared;
@@ -197,38 +166,9 @@ fn near_groups_for_lang(
     }
     stats.candidates_bag += candidates.len();
     if cfg.retrieval.landmark_pairs {
-        // ≥4 shared pair hashes (was 2): the Phase-2 watch item fired at
-        // 500k LOC — shared-2 admitted ~30x more candidates than survive
-        // histogram verification (D22). True clones share constellations
-        // (dozens of pairs; audio ID works from 1–2% of thousands), so the
-        // recall cost is nil on the benchmark, measured per §7.4(b).
-        let shared_landmarks_min = cfg.retrieval.shared_landmarks_min;
-        let coverage_min = cfg.retrieval.landmark_coverage_min;
-        stats.landmark_index_size += reps.iter().map(|r| r.landmarks.len()).sum::<usize>();
-        for ((i, j), shared) in shared_count_pairs(&reps, |r| &r.landmarks, df_cap, window) {
-            if shared < shared_landmarks_min {
-                continue;
-            }
-            // Coverage-fraction candidate gate (docs/substantiality-metric.md
-            // §0.3): the shared constellation as a fraction of the smaller unit's
-            // landmark set. A whole-unit clone covers most of each unit; a
-            // coincidental boilerplate region covers little — exactly the flood
-            // mechanism. Uses the FULL (df-uncapped) landmark intersection so the
-            // gate is never MORE aggressive than the validated definition, and is
-            // strictly recall-safe: a pair also proposed by the bag layer keeps its
-            // `.0` flag and is still verified. Pre-AU, so it saves the O(n·m)
-            // anti-unification on the coincidences it drops.
-            if coverage_min > 0.0 {
-                let denom = reps[i].landmarks.len().min(reps[j].landmarks.len()).max(1) as f64;
-                let full_shared = intersect_count(&reps[i].landmarks, &reps[j].landmarks);
-                if (full_shared as f64) / denom < coverage_min {
-                    stats.candidates_landmark_coverage_gated += 1;
-                    continue;
-                }
-            }
-            let entry = candidates.entry((i, j)).or_default();
-            entry.1 = true;
-            stats.candidates_landmark += 1;
+        let retriever = select_retriever(&cfg.retrieval.retriever);
+        for (i, j) in retriever.candidates(&reps, cfg, stats) {
+            candidates.entry((i, j)).or_default().1 = true;
         }
     }
     stats.candidates_total += candidates.len();
@@ -378,6 +318,136 @@ fn near_groups_for_lang(
     out
 }
 
+/// Candidate-generation seam (spec §5.5, §7.4b). A retriever reads the shared
+/// [`RepData`] substrate and emits candidate rep-index pairs `(i, j)` with `i < j`
+/// for the shared verify chain (`offset_histogram_passes` → `anti_unify`). It is
+/// candidate generation ONLY — it never verifies. Retrieval is post-fingerprint,
+/// so which retriever runs is hash-neutral (it does not enter the extraction cache
+/// key). The default is [`Landmark`]; the bake-off registers alternatives
+/// (minhash-lsh, winnowing, sourcerer-rare) against this same trait so the bench
+/// races real production code.
+pub trait Retriever: Sync {
+    /// Stable identifier, equal to the `retrieval.retriever` selector value.
+    fn name(&self) -> &'static str;
+    /// Candidate rep-index pairs `(i, j)`, `i < j`, drawn from the shared substrate.
+    /// May update the retriever's own accounting in `stats` (candidate/index counts);
+    /// must not touch verify counts (those belong to the shared verify chain).
+    fn candidates(
+        &self,
+        reps: &[RepData],
+        cfg: &Config,
+        stats: &mut RetrievalStats,
+    ) -> Vec<(usize, usize)>;
+}
+
+/// Resolve the `retrieval.retriever` selector to a retriever. String-keyed and
+/// plugin-extensible (mirrors `normalize.normalizer`); production ships only the
+/// landmark retriever, so any value resolves to [`Landmark`] for now.
+fn select_retriever(name: &str) -> Box<dyn Retriever> {
+    match name {
+        "landmark" => Box::new(Landmark),
+        _ => Box::new(Landmark),
+    }
+}
+
+/// The §5.5.4 rare-peak constellation retriever — the §7.4(b) rivalry winner and
+/// the default. Rare subtrees (low document frequency) are paired combinatorially
+/// with bucketed structural offsets into landmark hashes; two units are candidates
+/// when they share ≥ `shared_landmarks_min` landmarks and clear the §0.3
+/// coverage-fraction gate.
+pub struct Landmark;
+
+impl Retriever for Landmark {
+    fn name(&self) -> &'static str {
+        "landmark"
+    }
+
+    fn candidates(
+        &self,
+        reps: &[RepData],
+        cfg: &Config,
+        stats: &mut RetrievalStats,
+    ) -> Vec<(usize, usize)> {
+        // Landmark pairs (§5.5.4): rare subtrees (low document frequency) paired
+        // combinatorially with bucketed structural offsets. Built here from the
+        // shared substrate and owned by the retriever (not stored on RepData).
+        let mut df: HashMap<u128, u32> = HashMap::new();
+        for rep in reps {
+            for h in &rep.bag_set {
+                *df.entry(*h).or_insert(0) += 1;
+            }
+        }
+        let rare_cap = 3.max(reps.len() as u32 / 20);
+        let landmarks: Vec<Vec<u128>> = reps
+            .par_iter()
+            .map(|rep| {
+                let mut rare: Vec<(u32, u128)> = rep
+                    .offsets
+                    .iter()
+                    .filter(|(h, _)| df.get(h).copied().unwrap_or(0) <= rare_cap)
+                    .flat_map(|(h, offs)| offs.iter().map(move |o| (*o, *h)))
+                    .collect();
+                rare.sort_unstable();
+                const FAN_OUT: usize = 3;
+                let mut lms = Vec::new();
+                for i in 0..rare.len() {
+                    for j in i + 1..(i + 1 + FAN_OUT).min(rare.len()) {
+                        let delta = (rare[j].0 - rare[i].0) / 8;
+                        let mut buf = Vec::with_capacity(36);
+                        buf.extend_from_slice(&rare[i].1.to_le_bytes());
+                        buf.extend_from_slice(&rare[j].1.to_le_bytes());
+                        buf.extend_from_slice(&delta.to_le_bytes());
+                        lms.push(xxhash_rust::xxh3::xxh3_128(&buf));
+                    }
+                }
+                // shared_count_pairs expects sorted, deduplicated hash lists.
+                lms.sort_unstable();
+                lms.dedup();
+                lms
+            })
+            .collect();
+
+        let df_cap = 50usize;
+        let window = cfg.retrieval.owner_pair_window;
+        // ≥4 shared pair hashes (was 2): the Phase-2 watch item fired at
+        // 500k LOC — shared-2 admitted ~30x more candidates than survive
+        // histogram verification (D22). True clones share constellations
+        // (dozens of pairs; audio ID works from 1–2% of thousands), so the
+        // recall cost is nil on the benchmark, measured per §7.4(b).
+        let shared_landmarks_min = cfg.retrieval.shared_landmarks_min;
+        let coverage_min = cfg.retrieval.landmark_coverage_min;
+        stats.landmark_index_size += landmarks.iter().map(Vec::len).sum::<usize>();
+        let mut out = Vec::new();
+        for ((i, j), shared) in
+            shared_count_pairs(landmarks.len(), |k| landmarks[k].as_slice(), df_cap, window)
+        {
+            if shared < shared_landmarks_min {
+                continue;
+            }
+            // Coverage-fraction candidate gate (docs/substantiality-metric.md
+            // §0.3): the shared constellation as a fraction of the smaller unit's
+            // landmark set. A whole-unit clone covers most of each unit; a
+            // coincidental boilerplate region covers little — exactly the flood
+            // mechanism. Uses the FULL (df-uncapped) landmark intersection so the
+            // gate is never MORE aggressive than the validated definition, and is
+            // strictly recall-safe: a pair also proposed by the bag layer keeps its
+            // `.0` flag and is still verified. Pre-AU, so it saves the O(n·m)
+            // anti-unification on the coincidences it drops.
+            if coverage_min > 0.0 {
+                let denom = landmarks[i].len().min(landmarks[j].len()).max(1) as f64;
+                let full_shared = intersect_count(&landmarks[i], &landmarks[j]);
+                if (full_shared as f64) / denom < coverage_min {
+                    stats.candidates_landmark_coverage_gated += 1;
+                    continue;
+                }
+            }
+            stats.candidates_landmark += 1;
+            out.push((i, j));
+        }
+        out
+    }
+}
+
 /// D3 tautology filter, minimum viable rule: an inlined variant never groups
 /// with the callee it inlined, nor with units exact-equal to that callee.
 /// Extension (D18): a pair whose BASES are exact-equal is also suppressed —
@@ -419,22 +489,23 @@ fn intersect_count(a: &[u128], b: &[u128]) -> usize {
 /// Shared-hash counts for all pairs (skip hashes with df > cap). Fully
 /// sort-based (M3b/D22): at 500k-LOC scale the landmark index holds ~10⁷
 /// hashes, and both a HashMap-of-owner-lists index and a map per pair event
-/// dominated the scan. Callers provide per-rep hash lists that are already
-/// sorted and deduplicated.
+/// dominated the scan. `hashes(i)` returns unit `i`'s already-sorted,
+/// deduplicated hash list — indexed rather than keyed on `RepData` so any layer
+/// (bag substrate, retriever-owned landmark index, …) can drive the same join.
 fn shared_count_pairs<'a, F>(
-    reps: &'a [RepData],
+    n: usize,
     hashes: F,
     df_cap: usize,
     owner_pair_window: usize,
 ) -> Vec<((usize, usize), usize)>
 where
-    F: Fn(&'a RepData) -> &'a Vec<u128>,
+    F: Fn(usize) -> &'a [u128],
 {
-    let total: usize = reps.iter().map(|r| hashes(r).len()).sum();
+    let total: usize = (0..n).map(|i| hashes(i).len()).sum();
     let mut entries: Vec<(u128, u32)> = Vec::with_capacity(total);
-    for (i, rep) in reps.iter().enumerate() {
-        debug_assert!(hashes(rep).is_sorted());
-        for &h in hashes(rep) {
+    for i in 0..n {
+        debug_assert!(hashes(i).is_sorted());
+        for &h in hashes(i) {
             entries.push((h, i as u32));
         }
     }
