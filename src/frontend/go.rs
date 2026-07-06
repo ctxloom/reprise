@@ -10,11 +10,10 @@
 //! [`Frontend::expand_stmt`]); assignments wrap both sides in `expression_list`, and
 //! `:=`/`var`/`const` *declare* (binding `@target`) where `=` *mutates* (`@place`).
 
+use super::Lowering as L;
 use super::{
-    Frontend, block, break_guard, call_ext, drop_parens, eq_guard, ext_name, leaf, lit,
-    lower_aug_assign, lower_binary, lower_body, lower_call, lower_field, lower_function,
-    lower_source, lower_unary_positional, lower_unit, make_arm, make_branch, make_index,
-    matches_guard, native, or_chain, push_else_arm, unwrap_stmt, var,
+    Frontend, block, break_guard, call_ext, eq_guard, lower_aug_assign, lower_body, lower_source,
+    lower_unit, make_arm, make_branch, make_index, matches_guard, native, or_chain, push_else_arm,
 };
 use crate::ir::kind;
 use crate::ir::transform::{TransformKind, TransformLog, Witness};
@@ -44,6 +43,88 @@ fn span_of(node: Node) -> (u32, u32) {
     (node.start_byte() as u32, node.end_byte() as u32)
 }
 
+/// The data-driven Go dispatch table (D-SP4-2; `docs/sp4-grammar-lift-plan.md` §4), following the
+/// Python increment-2 pattern (uniform arms as data; language-local lowerings as [`super::Lowering::Std`]
+/// fn-pointers). Every **uniform** arm — a CST kind handled by a *shared* [`super`] helper — is data;
+/// Go's **language-local** lowerings (`lower_for_stmt`, `lower_if_go`, `lower_switch`, `lower_return_go`,
+/// `lower_inc_dec`, `lower_assignment_stmt`, and the `:=` adapter [`lower_short_var_decl`]) ride in the
+/// table as `Std` fn-pointers rather than a hand-written residue list. The runtime dispatch reads this
+/// exact table via [`super::lookup`] + [`super::dispatch`]; only the genuinely irreducible quirks the
+/// table can't express — the inline `index_expression` construction and the single-element
+/// `expression_list` unwrap guard — stay residue (see [`RESIDUE_KINDS`]).
+const MAP: &[(&str, super::Lowering)] = &[
+    ("function_declaration", L::Function),
+    ("method_declaration", L::Function),
+    ("block", L::Block),
+    // Language-local lowerings — a shared node-set, a per-language shape — ride in the table as `Std`.
+    ("for_statement", L::Std(lower_for_stmt)),
+    ("if_statement", L::Std(lower_if_go)),
+    ("expression_switch_statement", L::Std(lower_switch)),
+    ("type_switch_statement", L::Std(lower_switch)),
+    ("return_statement", L::Std(lower_return_go)),
+    // `:=` declares (binding `@target`) — the shared `lower_assign_go` with `bind = true` pinned.
+    ("short_var_declaration", L::Std(lower_short_var_decl)),
+    ("assignment_statement", L::Std(lower_assignment_stmt)),
+    ("inc_statement", L::Std(lower_inc_dec)),
+    ("dec_statement", L::Std(lower_inc_dec)),
+    ("expression_statement", L::Unwrap),
+    ("break_statement", L::Leaf(kind::BREAK)),
+    ("continue_statement", L::Leaf(kind::CONTINUE)),
+    ("call_expression", L::Call("function", "arguments")),
+    ("binary_expression", L::Binary("left", "operator", "right")),
+    ("unary_expression", L::UnaryPositional),
+    ("selector_expression", L::Field("operand", "field")),
+    ("parenthesized_expression", L::DropParens),
+    ("int_literal", L::Lit(Bucket::Int)),
+    ("float_literal", L::Lit(Bucket::Float)),
+    ("imaginary_literal", L::Lit(Bucket::Float)),
+    ("interpreted_string_literal", L::Lit(Bucket::Str)),
+    ("raw_string_literal", L::Lit(Bucket::Str)),
+    ("rune_literal", L::Lit(Bucket::Char)),
+    ("true", L::Lit(Bucket::Bool)),
+    ("false", L::Lit(Bucket::Bool)),
+    ("identifier", L::Var),
+    // Field/type/package names can never be a declared local (§5.2.4 exception).
+    ("field_identifier", L::ExtName),
+    ("type_identifier", L::ExtName),
+    ("package_identifier", L::ExtName),
+    // No similarity signal — dropped (Type-1 convergence / spec §5.2.7), as Rust's comments do.
+    ("comment", L::Drop),
+];
+
+/// Tree-sitter kinds the Go frontend references but the shared [`MAP`] does not key on — registered as
+/// data so the increment-5 conformance gate can enumerate EVERY kind the frontend references
+/// (MAP keys ∪ `RESIDUE_KINDS`) and assert each still exists in the linked grammar. Per the generalized
+/// rule (Python increment 2): every grammar-kind the frontend references that is NOT a MAP key —
+/// residue-arm kinds ∪ the internal discriminants of the `Std` helpers, plus the grammar kinds the
+/// non-`lower_node` frontend paths (`splice_kind`, `expand_stmt`) still couple to (the analog of Rust's
+/// tail-return-only kinds `use_declaration`/`empty_statement`/`macro_definition`).
+///
+/// (The one referenced grammar kind deliberately left out is `parameter_declaration`, matched inside
+/// [`Frontend::lower_params`] — the same param-shape gate gap Rust (`parameter`) and Python
+/// (`typed_parameter`/`default_parameter`) leave open; tracked as cross-frontend deferred work.)
+// Registered-now/consumed-later: the increment-5 conformance gate is this list's first non-test reader;
+// today only the table-invariant test below exercises it, so this `allow` is scoped to the plain
+// library build (parity with Rust's/Python's `RESIDUE_KINDS`).
+#[allow(dead_code)]
+const RESIDUE_KINDS: &[&str] = &[
+    // Dispatched from `lower_node`'s residue arm (a table miss → an inline Go-local lowering).
+    "index_expression", // xs[i] → Index (inline make_index)
+    "expression_list",  // single-element unwrap guard; also lower_return_go's multi-value wrapper
+    // Internal discriminants of the `Std` language-local helpers (not MAP keys, still grammar-coupled).
+    "range_clause",    // lower_for_stmt: the `for … range` form
+    "for_clause",      // lower_for_stmt / expand_stmt: the C-style three-clause form
+    "expression_case", // lower_switch: a value/condition case arm
+    "type_case",       // lower_switch: a `case T:` type-switch arm
+    "default_case",    // lower_switch: the trivial-guard (else) arm
+    "statement_list",  // splice_kind (block wrapper) / case_body (switch arm body)
+    // Referenced only by `expand_stmt` (grouped `var (…)`/`const (…)` decls, spliced into the block).
+    "var_declaration",
+    "const_declaration",
+    "var_spec",
+    "const_spec",
+];
+
 impl Frontend for Go {
     fn lower_node(
         &self,
@@ -52,57 +133,18 @@ impl Frontend for Go {
         src: &str,
         log: &mut TransformLog,
     ) -> Option<NormNode> {
+        // The uniform arms AND Go's language-local lowerings are data (`MAP`): look the kind up,
+        // dispatch it (shared helper or `Std` fn-ptr). A hit returning `None` is a deliberate drop
+        // (`Lowering::Drop`, or an `Unwrap`/`DropParens` that found nothing) — NOT a miss, so it
+        // never reaches residue.
+        if let Some(entry) = super::lookup(MAP, node.kind()) {
+            return super::dispatch(entry, self, node, field, src, log);
+        }
+        // Table miss → the Go-local residue (kinds registered in `RESIDUE_KINDS`): the two
+        // irreducible inline quirks — `index_expression`'s field-based `Index` construction and the
+        // single-element `expression_list` unwrap — else an unmodeled `native` leaf.
         let span = span_of(node);
         match node.kind() {
-            "function_declaration" | "method_declaration" => {
-                Some(lower_function(self, node, field, span, src, log))
-            }
-            "block" => Some(block(self, node, field, span, src, log)),
-            "for_statement" => Some(lower_for_stmt(self, node, field, span, src, log)),
-            "if_statement" => Some(lower_if_go(self, node, field, span, src, log)),
-            "expression_switch_statement" | "type_switch_statement" => {
-                Some(lower_switch(self, node, field, span, src, log))
-            }
-            "expression_statement" => unwrap_stmt(self, node, field, src, log),
-            "return_statement" => Some(lower_return_go(self, node, field, span, src, log)),
-            "break_statement" => Some(leaf(kind::BREAK, field, span)),
-            "continue_statement" => Some(leaf(kind::CONTINUE, field, span)),
-            "comment" => None, // no similarity signal (Type-1 convergence)
-            "short_var_declaration" => {
-                Some(lower_assign_go(self, node, field, span, true, src, log))
-            }
-            "assignment_statement" => lower_assignment_stmt(self, node, field, span, src, log),
-            "inc_statement" | "dec_statement" => {
-                Some(lower_inc_dec(self, node, field, span, src, log))
-            }
-            "call_expression" => Some(lower_call(
-                self,
-                node,
-                field,
-                span,
-                ("function", "arguments"),
-                src,
-                log,
-            )),
-            "binary_expression" => Some(lower_binary(
-                self,
-                node,
-                field,
-                span,
-                ("left", "operator", "right"),
-                src,
-                log,
-            )),
-            "unary_expression" => Some(lower_unary_positional(self, node, field, span, src, log)),
-            "selector_expression" => Some(lower_field(
-                self,
-                node,
-                field,
-                span,
-                ("operand", "field"),
-                src,
-                log,
-            )),
             "index_expression" => {
                 let base = node
                     .child_by_field_name("operand")
@@ -120,21 +162,6 @@ impl Frontend for Go {
             "expression_list" if node.named_child_count() == 1 => node
                 .named_child(0)
                 .and_then(|inner| self.lower_node(inner, field, src, log)),
-            "parenthesized_expression" => drop_parens(self, node, field, span, src, log),
-            "int_literal" => Some(lit(node, field, span, Bucket::Int, src, log)),
-            "float_literal" | "imaginary_literal" => {
-                Some(lit(node, field, span, Bucket::Float, src, log))
-            }
-            "interpreted_string_literal" | "raw_string_literal" => {
-                Some(lit(node, field, span, Bucket::Str, src, log))
-            }
-            "rune_literal" => Some(lit(node, field, span, Bucket::Char, src, log)),
-            "true" | "false" => Some(lit(node, field, span, Bucket::Bool, src, log)),
-            "identifier" => Some(var(node, field, span, src)),
-            // Field/type/package names can never be a declared local (§5.2.4 exception).
-            "field_identifier" | "type_identifier" | "package_identifier" => {
-                Some(ext_name(node, field, span, src))
-            }
             _ => Some(native(self, node, field, span, src, log)),
         }
     }
@@ -213,7 +240,7 @@ fn find_named_clause(node: Node) -> Option<Node> {
 /// three-clause form's `init` is hoisted by [`Frontend::expand_stmt`]; here we build
 /// the loop body (break-guard from the condition, `update` appended) for every form.
 fn lower_for_stmt(
-    fe: &Go,
+    fe: &dyn Frontend,
     node: Node,
     field: Option<&str>,
     span: (u32, u32),
@@ -265,7 +292,7 @@ fn lower_for_stmt(
 /// `left = __next(xs)` — the same iterated protocol Rust/Python `for` lowers to, so a
 /// single-variable Go range converges with them.
 fn lower_range_into(
-    fe: &Go,
+    fe: &dyn Frontend,
     clause: Node,
     body: &mut NormNode,
     span: (u32, u32),
@@ -309,7 +336,7 @@ fn is_blank_target(node: &NormNode) -> bool {
 /// `default_case` the trivial-guard (else) arm. Each case body is the `statement_list`
 /// lowered to a `Block`. (The type-switch `alias` bind is not yet modelled.)
 fn lower_switch(
-    fe: &Go,
+    fe: &dyn Frontend,
     node: Node,
     field: Option<&str>,
     span: (u32, u32),
@@ -353,7 +380,7 @@ fn lower_switch(
 /// `subject == v`, OR-joined for a multi-value case; without one (`switch { case c: }`),
 /// each value is already a boolean condition and passes through.
 fn case_value_guard(
-    fe: &Go,
+    fe: &dyn Frontend,
     subject: Option<&NormNode>,
     list: Node,
     span: (u32, u32),
@@ -376,7 +403,7 @@ fn case_value_guard(
 
 /// A case body (its `statement_list`) → a `Block`.
 fn case_body(
-    fe: &Go,
+    fe: &dyn Frontend,
     case: Node,
     _span: (u32, u32),
     src: &str,
@@ -394,7 +421,7 @@ fn case_body(
 /// `else_clause` wrapper — so lowering it recursively nests an else-if as the else arm's
 /// body, matching the shared `lower_if`'s shape for Rust/Python.
 fn lower_if_go(
-    fe: &Go,
+    fe: &dyn Frontend,
     node: Node,
     field: Option<&str>,
     span: (u32, u32),
@@ -420,7 +447,7 @@ fn lower_if_go(
 /// `expression_list` wrapper is unwrapped so `return f(x)` is `Return{ Call }` — the
 /// single-child shape tail-recursion lowering keys on.
 fn lower_return_go(
-    fe: &Go,
+    fe: &dyn Frontend,
     node: Node,
     field: Option<&str>,
     span: (u32, u32),
@@ -450,7 +477,7 @@ fn lower_return_go(
 /// loop-counter idiom across `i++` / `i += 1` / `i = i + 1` and with the Rust/Python
 /// equivalents. The literal `1` is a kept structural constant (spec §5.2.5), never bucketed.
 fn lower_inc_dec(
-    fe: &Go,
+    fe: &dyn Frontend,
     node: Node,
     field: Option<&str>,
     span: (u32, u32),
@@ -491,21 +518,21 @@ fn lower_inc_dec(
 /// to get the binary op — the same path Rust's `compound_assignment_expr` takes, so `i += 1`
 /// converges with `i = i + 1` and Go's `i++`.
 fn lower_assignment_stmt(
-    fe: &Go,
+    fe: &dyn Frontend,
     node: Node,
     field: Option<&str>,
     span: (u32, u32),
     src: &str,
     log: &mut TransformLog,
-) -> Option<NormNode> {
+) -> NormNode {
     let is_plain = node
         .child_by_field_name("operator")
         .map(|o| span_text(o, src) == "=")
         .unwrap_or(false);
     if is_plain {
-        Some(lower_assign_go(fe, node, field, span, false, src, log))
+        lower_assign_go(fe, node, field, span, false, src, log)
     } else {
-        Some(lower_aug_assign(
+        lower_aug_assign(
             fe,
             node,
             ("left", "operator", "right", false),
@@ -513,15 +540,29 @@ fn lower_assignment_stmt(
             span,
             src,
             log,
-        ))
+        )
     }
+}
+
+/// `:=` short variable declaration → a *binding* [`lower_assign_go`] (`@target`), the shared helper
+/// with `bind = true` pinned. A thin per-language adapter letting it ride in the table as an `Std`
+/// entry (the analog of Python's `lower_not_py`), rather than a hand-written residue arm.
+fn lower_short_var_decl(
+    fe: &dyn Frontend,
+    node: Node,
+    field: Option<&str>,
+    span: (u32, u32),
+    src: &str,
+    log: &mut TransformLog,
+) -> NormNode {
+    lower_assign_go(fe, node, field, span, true, src, log)
 }
 
 /// Build `Assign` from a `left`/`right` pair of `expression_list`s. `bind` picks the
 /// target field: `@target` (a declaration — becomes a positional local) for `:=`/`var`/
 /// `const`, `@place` (a mutation — untouched by abstraction) for `=`.
 fn lower_assign_go(
-    fe: &Go,
+    fe: &dyn Frontend,
     node: Node,
     field: Option<&str>,
     span: (u32, u32),
@@ -540,7 +581,7 @@ fn lower_assign_go(
 }
 
 /// A `var_spec`/`const_spec` → `Assign{ name@target…, value@value… }`.
-fn lower_spec(fe: &Go, spec: Node, src: &str, log: &mut TransformLog) -> NormNode {
+fn lower_spec(fe: &dyn Frontend, spec: Node, src: &str, log: &mut TransformLog) -> NormNode {
     let span = span_of(spec);
     let mut children = Vec::new();
     let mut nc = spec.walk();
@@ -558,7 +599,7 @@ fn lower_spec(fe: &Go, spec: Node, src: &str, log: &mut TransformLog) -> NormNod
 /// Lower the elements of an `expression_list` of assignment targets. `bind` targets take
 /// `@target` (declared locals); mutation lvalues take `@place`.
 fn lower_targets(
-    fe: &Go,
+    fe: &dyn Frontend,
     list: Node,
     bind: bool,
     src: &str,
@@ -576,7 +617,7 @@ fn lower_targets(
 }
 
 /// Lower the elements of an `expression_list` of assigned values (each `@value`).
-fn lower_values(fe: &Go, list: Node, src: &str, log: &mut TransformLog) -> Vec<NormNode> {
+fn lower_values(fe: &dyn Frontend, list: Node, src: &str, log: &mut TransformLog) -> Vec<NormNode> {
     let mut out = Vec::new();
     let mut cursor = list.walk();
     for v in list.named_children(&mut cursor) {
@@ -600,6 +641,22 @@ mod tests {
 
     fn go(src: &str) -> (crate::tree::NormNode, TransformLog) {
         lower_go_source(src).expect("a go function")
+    }
+
+    #[test]
+    fn dispatch_table_is_a_consistent_single_source_of_truth() {
+        // The table is the SP4 gate's source of truth (D-SP4-2), so every referenced kind must be
+        // data in EXACTLY one place: a unique MAP key OR a residue kind, never both.
+        use std::collections::HashSet;
+        let mut keys = HashSet::new();
+        for (k, _) in super::MAP {
+            assert!(keys.insert(*k), "duplicate MAP key: {k}");
+        }
+        let mut residue = HashSet::new();
+        for k in super::RESIDUE_KINDS {
+            assert!(residue.insert(*k), "duplicate residue kind: {k}");
+            assert!(!keys.contains(k), "kind {k} is both a MAP key and residue");
+        }
     }
 
     #[test]
