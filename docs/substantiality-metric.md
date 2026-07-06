@@ -293,6 +293,97 @@ time reported combined (as `query-ms`), with `idx-entries` as the peak-footprint
 
 Bench file: `examples/bakeoff.rs` (run `cargo run --release --example bakeoff -- [root…]`, default `src`).
 
+## 0.6 Implementation — the two validated levers shipped (2026-07-05, `stark-mixed-front`)
+
+The §0.3 GOs were implemented and **measured**. Both are **hash-neutral** (no fingerprint /
+canonical-tree / cache-key move) and neither regresses recall. Branch:
+`worktree-agent-aecf804d48e538518`; baseline `4a84d02`.
+
+### Lever 1 — coverage-fraction candidate gate — SHIPPED (commit `2522411`)
+
+`src/matchtree.rs`: a landmark candidate is retained only when its shared constellation is at
+least `retrieval.landmark_coverage_min` (default **0.05**) of the smaller unit's landmark set —
+coverage = **full (df-uncapped) landmark intersection / min(|A|,|B|)**, the exact §0.3 definition.
+Pre-anti-unify, so it also saves the O(n·m) AU on the coincidences it drops. A pair also proposed
+by the bag layer keeps its bag flag and is still verified (the gate can only remove *landmark*
+candidacy) — the source of its recall-safety. New stat `candidates_landmark_coverage_gated` makes
+the cut a live number.
+
+**Recall proof — direct, on the shipping pipeline.** `verified_pairs` (near-tier accept+weak) is
+**byte-identical with the gate off vs on, same corpus** — so no verified pair (hence no verify-union
+ACCEPT, since ACCEPT ⊆ verified) is dropped:
+
+| corpus | verified off→on | landmark flood off→on | flood cut |
+|---|---|---|---|
+| reprise `src/` | **54 → 54** | 8 029 → 4 529 | **−43.6%** |
+| whole repo (Rust+Py+Go+TS+Kt) | **107 → 107** | 11 872 → 6 586 | **−44.5%** |
+| `benches/` (synthetic) | **24 → 24** | 76 → 63 | −17% |
+
+`mutation_recall` stays **100%** (t1/t2 13/13, controls correctly 0/2); full workspace suite green.
+The whole-repo −44.5% matches §0.3's predicted 0.44 exactly. **t=0.10 already costs recall**
+(whole-repo 107→103), so **0.05 is the recall-neutral edge** — confirmed live, not assumed.
+Fidelity to the reconstruction stays proven for the *ungated* path (bakeoff `recon==scan` on
+candidates/histogram/verified), and the gate is a strict subset of that path.
+
+### Lever 2 — Seam C boilerplate-idiom discount — SHIPPED (commit `0cf74ce`)
+
+`src/ir/substance.rs`: per-language **canonical-shape recognizers** (shape-keyed, not native-kind —
+one recognizer serves every IR frontend). Recognized:
+- **Nullish guard-clause family** — a single-arm `Branch` whose guard is a nullish comparison
+  (`== / != / is` with a `nil`/`None`/`null`/… operand) *or* a nullish predicate call
+  (`.is_none()`/`.is_err()`/…), and whose body early-exits (`Return`/`Break`/`Continue`, ≤3 stmts).
+  Fires identically on Go `if err != nil { return err }`, Python `if x is None: return None`, Rust
+  `if x.is_none() { return … }` — corpus-verified IR shapes.
+- **Trivial accessors** — a unit body that is a lone `return <field|var|index>` (present but *dormant*
+  for group ranking: getters sit below the token floor, so they never reach a group — flagged below).
+
+The recognized token mass is discounted from the ranking value through `group::substantive_tokens`
+(raw tokens − boilerplate mass, **floored at 20%** so a boilerplate-saturated group is deprioritized,
+never zeroed). Applied at all three consolidation-value sites (exact, inline-exact, near — near uses
+the AU **template** tree's mass, plumbed as `NearGroup::template_boilerplate`). **Recall-safe by
+construction: `rank()` only orders; the report never drops a group** — so this can reorder, never
+lose a finding. It feeds `value` only — the displayed `token_count` and the fingerprint are untouched.
+
+**Measured (ranking effect, boilerplate vs genuine):**
+- **Whole repo (Rust-heavy):** **1 / 339** groups discounted — the single real Go err-check function
+  (`MarshalXML`, 16.4% discount, value 110→92). **Zero false discounts** on the 338 genuine Rust
+  clones (Rust err-handling is `?`/`match`, not the nullish-guard shape — the recognizer is
+  conservative by design).
+- **Constructed Go corpus (genuine vs boilerplate, both 54 tokens):** the boilerplate pair (three
+  `if err != nil { return err }` blocks) is discounted **55.6%** (value 54→24) while the genuine
+  compute-clone is untouched (54) → the boilerplate group **drops from rank #1 to #2**. A rank
+  *separation*, never a drop.
+
+7 recognizer unit tests (Go/Python/Rust positives; ordinary relational guard `if x < cutoff {
+continue }` and if/else **not** discounted — protects the `formats.rs` FN_A/B/C clone family).
+`mutation_recall` 100%; **282 workspace tests pass**.
+
+### What still needs human precision-labeling (deferred)
+
+- **`shared_landmarks_min` free-flood-win** — the bake-off (§0.4) showed landmark `shared≥3` cuts
+  flood 23–31% at **still-full** verify-union recall (`src` 8 029→6 277; repo 11 872→9 988). That is a
+  *second*, independent recall-neutral flood cut on top of Lever 1, but proving it recall-neutral
+  needs the **M4a stratified method** (per-pair labels, not the aggregate `verified_pairs` count) —
+  not done here. Candidate follow-on lever.
+- **shared-landmark-df was NOT plumbed as a group-level discount — deliberately.** §0.3's AUC 0.905
+  is over *candidate* pairs, but the high-df boilerplate is **rejected by AU before it becomes a
+  group** (accepted near-clones already sit at df median ~6.6). So a group-level df discount is
+  low-yield; the operative group-level boilerplate signal is the **shape recognizer** (Lever 2), and
+  the candidate-level coverage/df win is already harvested by **Lever 1**. Needs human labeling on a
+  boilerplate-heavy corpus to confirm accepted groups never carry high df (would need the long-block
+  corpus below).
+- **Long widely-recurring boilerplate-block corpus gap** (the §0.3 qualified GO, still open). No
+  `frag_df≥6` ≥30-token block exists in this corpus, so: (a) the df-discount's hardest adversarial
+  case is still unmeasured, and (b) Lever 2's `MIN_SUBSTANCE_FRACTION` (0.2), guard-body statement cap
+  (3), and `NULLISH_METHODS` set are calibrated against *taste + the small in-repo evidence*, not a
+  labeled block corpus. Needs a real long-boilerplate corpus + human labels to lock the constants.
+- **Cross-language under-sampling** (§0.3). Lever 2 barely exercises on reprise's own corpus — **1
+  real Go function**. The Go/C `if err != nil` / `goto cleanup` idioms are where the discount bites,
+  and they are essentially absent here. Calibration wants a Go- or C-heavy corpus.
+- **Lint housekeeping:** `just lint` had a **pre-existing** `cargo fmt` drift in
+  `examples/lm_validate.rs` (baseline, unrelated to either lever); the `src/` changes are fmt+clippy
+  clean. Fixed in a separate `chore` commit so lint is green.
+
 ## 1. Problem — the limiters are representation-dependent size proxies
 
 reprise's precision floors all gate on a **raw count** as a proxy for "is there enough here to trust a

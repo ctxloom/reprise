@@ -350,7 +350,10 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
             // Spec §2/§6.1: the AU template hash is the group's stable key.
             fingerprint: fingerprint::hex(ng.template_hash),
             token_count: ng.template_tokens,
-            value: group::consolidation_value(&member_refs, ng.template_tokens),
+            value: group::consolidation_value(
+                &member_refs,
+                group::substantive_tokens(ng.template_tokens, ng.template_boilerplate),
+            ),
             note: None,
             divergence: ng.divergence,
             template: Some(ng.template),
