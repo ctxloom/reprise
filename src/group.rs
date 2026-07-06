@@ -51,7 +51,13 @@ pub fn build_exact_groups(units: &[Unit], cfg: &Config) -> (Vec<(Group, Vec<usiz
                     // The shared normalized structural hash (spec §2/§6.1).
                     fingerprint: crate::fingerprint::hex(members[0].fingerprint),
                     token_count,
-                    value: consolidation_value(&members, token_count),
+                    value: consolidation_value(
+                        &members,
+                        substantive_tokens(
+                            token_count,
+                            crate::ir::substance::boilerplate_mass(&members[0].tree),
+                        ),
+                    ),
                     note: None,
                     divergence: 0.0,
                     template: None,
@@ -117,7 +123,13 @@ pub fn build_inline_exact_groups(units: &[Unit], cfg: &Config) -> Vec<(Group, Ve
                 // The bucket's shared hash: the converged (inlined) form.
                 fingerprint: crate::fingerprint::hex(units[members[0]].fingerprint),
                 token_count,
-                value: consolidation_value(&member_refs, token_count),
+                value: consolidation_value(
+                    &member_refs,
+                    substantive_tokens(
+                        token_count,
+                        crate::ir::substance::boilerplate_mass(&units[members[0]].tree),
+                    ),
+                ),
                 note: None,
                 divergence: 0.0,
                 template: None,
@@ -149,6 +161,28 @@ pub fn consolidation_value(members: &[&Unit], token_count: u32) -> f64 {
         value *= 1.5;
     }
     value
+}
+
+/// Fraction of a group's ranking weight preserved even when its matched shape is
+/// *entirely* recognized boilerplate — a boilerplate-saturated group is
+/// deprioritized, never zeroed. `rank()` only orders (and the report displays the
+/// top-N); it never drops a group, so this can only reorder, never lose a finding.
+const MIN_SUBSTANCE_FRACTION: f64 = 0.2;
+
+/// Seam C boilerplate discount (docs/native-analysis-overrides-plan.md §5;
+/// docs/substantiality-metric.md §0.3): the substantiality input to the
+/// consolidation value, = raw tokens minus the mass of recognized boilerplate
+/// idioms (`ir::substance`), floored at `MIN_SUBSTANCE_FRACTION` of the raw count.
+/// A ranking-only, hash-neutral discount: it feeds `value`, never the fingerprint,
+/// the canonical tree, or the displayed `token_count`. Historical-normalizer trees
+/// carry no IR kinds, so `boilerplate_mass` returns 0 there (a no-op — the IR path
+/// is the calibrated one).
+pub fn substantive_tokens(token_count: u32, boilerplate_mass: u32) -> u32 {
+    let floor = (f64::from(token_count) * MIN_SUBSTANCE_FRACTION).ceil() as u32;
+    token_count
+        .saturating_sub(boilerplate_mass)
+        .max(floor)
+        .max(1)
 }
 
 /// Spec §5.6 subsumption: a group entirely nested inside the members of one

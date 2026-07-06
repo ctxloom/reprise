@@ -23,6 +23,9 @@ pub struct NearGroup {
     /// near/inline groups (spec §2/§6.1 `partialFingerprints`).
     pub template_hash: u128,
     pub template_tokens: u32,
+    /// Seam C: token mass of recognized boilerplate idioms in the AU template
+    /// (`ir::substance`). Discounts the ranking value only — hash-neutral.
+    pub template_boilerplate: u32,
     pub divergence: f64,
     /// Inline chains of the participating variants (InlineAssisted only).
     pub inline_chains: Vec<String>,
@@ -632,6 +635,7 @@ fn build_groups(pairs: Vec<VerifiedPair>, tier: Tier, units: &[Unit]) -> Vec<Nea
                 template: au::render_template(&best.template),
                 template_hash: fingerprint::merkle(&best.template),
                 template_tokens: best.template_tokens,
+                template_boilerplate: crate::ir::substance::boilerplate_mass(&best.template),
                 divergence: acc.max_div,
                 inline_chains: acc.chains,
             }

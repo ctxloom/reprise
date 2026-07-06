@@ -18,6 +18,7 @@ pub mod kind;
 pub mod pass;
 pub mod provenance;
 pub mod render;
+pub mod substance;
 pub mod transform;
 
 pub use edit::{Edit, apply};
