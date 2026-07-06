@@ -164,11 +164,12 @@ pub struct RetrievalCfg {
     /// (depth_a−depth_b) consistency criterion alongside the offset-delta (Shazam
     /// diagonal) one, over the SAME shared floor-3 subtrees, in the pre-AU verify
     /// cascade. A genuine clone places its shared subtrees at consistent RELATIVE
-    /// depths; a coincidental landmark collision scatters. The §0.5 sweep measured
-    /// this cutting the pre-AU candidate flood ~48% at recall 1.000 (zero verified
-    /// pairs lost) on plain units — but that oracle was small, so it ships OFF and is
-    /// promoted only once the whole-repo + inline-on byte-identical `verified_pairs`
-    /// gate holds. A pure candidate pre-filter: hash-neutral, never in the cache key.
+    /// depths; a coincidental landmark collision scatters. **Default ON** — promoted
+    /// after the whole-repo + inline-on byte-identical `verified_pairs` gate held
+    /// clean (verified_pairs 187=187, every clone-group set identical; the only stat
+    /// that moved was the diagnostic histogram_rejected, +98 = 98 fewer anti_unify
+    /// calls at zero recall loss). A pure candidate pre-filter: hash-neutral, never
+    /// in the cache key. Set false to disable the depth criterion (offset-delta only).
     pub tree_verify: bool,
 }
 
@@ -180,7 +181,7 @@ impl Default for RetrievalCfg {
             shared_landmarks_min: 2,
             owner_pair_window: 0,
             landmark_coverage_min: 0.05,
-            tree_verify: false,
+            tree_verify: true,
         }
     }
 }
