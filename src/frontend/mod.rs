@@ -412,6 +412,28 @@ pub(crate) fn grammar_schema(lang: Lang) -> String {
     out
 }
 
+/// A frontend's dispatch table paired with its residue-kind list — the two data structures the
+/// conformance gate enumerates: `(MAP, RESIDUE_KINDS)`.
+type FrontendTable = (&'static [(&'static str, Lowering)], &'static [&'static str]);
+
+/// The `(dispatch table, residue-kinds)` pair for a `lang` that has an IR frontend — the **same**
+/// [`MAP`](rust::MAP)/`RESIDUE_KINDS` the runtime dispatch reads, exposed so the increment-5
+/// conformance gate checks against the one source of truth (structural completeness — Piece A of
+/// `docs/sp4-grammar-lift-plan.md` §2). `None` for a language with no frontend yet (TS/Kotlin).
+// Registered-now/consumed-later: the only reader is the `#[cfg(test)]` conformance gate below, so
+// this is dead in the plain library build (same scoped `allow` as [`grammar_schema`]). Its being a
+// non-test fn is what lets each frontend's `RESIDUE_KINDS` drop its own `allow` — they are now
+// referenced here rather than only from a test.
+#[allow(dead_code)]
+pub(crate) fn frontend_table(lang: Lang) -> Option<FrontendTable> {
+    match lang {
+        Lang::Rust => Some((rust::MAP, rust::RESIDUE_KINDS)),
+        Lang::Python => Some((python::MAP, python::RESIDUE_KINDS)),
+        Lang::Go => Some((go::MAP, go::RESIDUE_KINDS)),
+        _ => None,
+    }
+}
+
 /// Walk `src`'s CST and IR-normalize every function-like unit — the IR-path analog of
 /// `normalize::extract_raw_units`. Rust/Python/Go.
 pub fn extract_ir_units(src: &str, lang: Lang, path: &std::path::Path) -> Vec<IrUnit> {
@@ -1518,6 +1540,190 @@ mod grammar_schema_tests {
                 actual, expected,
                 "grammar schema for {lang:?} drifted from {file}; if a grammar bump is intended, \
                  review the diff then regenerate with UPDATE_GRAMMAR_SNAPSHOTS=1"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod conformance_gate_tests {
+    //! The SP4 closure (increment 5): assert every construct each frontend's table references still
+    //! exists in the *actually linked* tree-sitter grammar, turning a silent grammar-drift hash move
+    //! (a renamed kind falls through to `native()` with a green build) into a **loud, localized**
+    //! test failure that names the dead construct. Derived from the dispatch tables (Piece B over
+    //! Piece A — `docs/sp4-grammar-lift-plan.md` §2), so the gate and runtime share one source of
+    //! truth. Plus the inverse advisory snapshot: the named grammar kinds no table models, so a bump
+    //! that adds/renames a kind is a reviewable diff.
+
+    use super::{Lowering, frontend_table};
+    use crate::lang::Lang;
+    use tree_sitter::Language;
+
+    /// The languages with an IR frontend + table (the gate's scope). TS/Kotlin have no frontend yet.
+    const GATED: &[Lang] = &[Lang::Rust, Lang::Python, Lang::Go];
+
+    /// The per-language CST **field** names a table entry threads into its shared helper — the field
+    /// half of the (kind, field) coupling. Only the field-parameterized `Lowering` variants carry
+    /// any; the rest use positional children or the shared helper's fixed field set. (`Leaf`/`Lit`
+    /// carry a *canonical* kind/bucket, NOT a grammar field — deliberately not collected.)
+    fn entry_fields(l: &Lowering, out: &mut Vec<&'static str>) {
+        match *l {
+            Lowering::For(pat, iter) => out.extend([pat, iter]),
+            Lowering::Call(callee, args) => out.extend([callee, args]),
+            Lowering::Field(base, name) => out.extend([base, name]),
+            Lowering::Binary(l, o, r) => out.extend([l, o, r]),
+            Lowering::AugAssign(l, o, r, _) => out.extend([l, o, r]),
+            _ => {}
+        }
+    }
+
+    /// Every grammar-coupled string a frontend references *as data*: the node kinds (MAP keys ∪
+    /// `RESIDUE_KINDS`) and the table-embedded field names.
+    fn referenced(lang: Lang) -> (Vec<&'static str>, Vec<&'static str>) {
+        let (map, residue) = frontend_table(lang).expect("a gated language has a table");
+        let mut kinds: Vec<&str> = map.iter().map(|(k, _)| *k).collect();
+        kinds.extend(residue.iter().copied());
+        let mut fields = Vec::new();
+        for (_, l) in map {
+            entry_fields(l, &mut fields);
+        }
+        (kinds, fields)
+    }
+
+    /// The dead references: node kinds that no longer resolve (`id_for_node_kind → 0`, the bare-`u16`
+    /// miss sentinel) and field names that no longer resolve (`field_id_for_name → None`). Empty ⇒
+    /// conformant. Shared by the real gate and the teeth test (which feeds it a bogus list). The
+    /// `named = true` resolution mirrors `grammar_schema`'s `node_kind_is_named` filter, so "exists"
+    /// means the same thing in both directions.
+    fn dead_references(language: &Language, kinds: &[&str], fields: &[&str]) -> Vec<String> {
+        let mut dead = Vec::new();
+        for &k in kinds {
+            if language.id_for_node_kind(k, true) == 0 {
+                dead.push(format!("node-kind {k:?}"));
+            }
+        }
+        for &f in fields {
+            if language.field_id_for_name(f).is_none() {
+                dead.push(format!("field {f:?}"));
+            }
+        }
+        dead
+    }
+
+    /// The named grammar kinds the linked `Language` exposes (the same set `grammar_schema` lists).
+    fn named_kinds(language: &Language) -> Vec<&'static str> {
+        let mut v: Vec<&str> = (0..language.node_kind_count())
+            .filter_map(|id| {
+                let id = id as u16;
+                language
+                    .node_kind_is_named(id)
+                    .then(|| language.node_kind_for_id(id))
+                    .flatten()
+            })
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// THE GATE. Every kind + field each frontend's table references must still exist in its linked
+    /// grammar; an absence is grammar drift — the construct's lowering is dead and now routes to
+    /// `native()`, a silent hash move — so the gate fails loudly, naming the dead construct.
+    #[test]
+    fn every_referenced_construct_exists_in_the_linked_grammar() {
+        for &lang in GATED {
+            let language = lang.ts_language();
+            let (kinds, fields) = referenced(lang);
+            let dead = dead_references(&language, &kinds, &fields);
+            assert!(
+                dead.is_empty(),
+                "{lang:?} frontend references {} construct(s) absent from the linked tree-sitter \
+                 grammar — grammar drift; each lowering is dead and now routes to native(): {dead:?}",
+                dead.len(),
+            );
+        }
+    }
+
+    /// The one residue reference that is a *suffix* match, not a literal kind: Rust's `return_tail`
+    /// treats any `*_item` node as a non-value (a nested item, not a tail expression). The gate can't
+    /// enumerate `_item` as a MAP/residue string, so it is checked structurally here — the Rust
+    /// grammar must still expose at least one named `*_item` kind, else the guard is dead.
+    #[test]
+    fn rust_item_suffix_guard_is_live() {
+        let language = Lang::Rust.ts_language();
+        assert!(
+            named_kinds(&language).iter().any(|k| k.ends_with("_item")),
+            "Rust grammar exposes no `*_item` named kind — `return_tail`'s suffix guard is dead",
+        );
+    }
+
+    /// TEETH. Prove the gate is not vacuous: a deliberately-bogus kind and field are reported as
+    /// dead, while the real tables report nothing (the same check the real gate runs).
+    #[test]
+    fn gate_has_teeth_on_a_bogus_reference() {
+        let language = Lang::Rust.ts_language();
+        let dead = dead_references(
+            &language,
+            &["while_expression", "definitely_not_a_kind_42"],
+            &["condition", "definitely_not_a_field_42"],
+        );
+        assert!(
+            dead.contains(&"node-kind \"definitely_not_a_kind_42\"".to_string()),
+            "gate failed to flag a bogus node-kind: {dead:?}",
+        );
+        assert!(
+            dead.contains(&"field \"definitely_not_a_field_42\"".to_string()),
+            "gate failed to flag a bogus field: {dead:?}",
+        );
+        assert_eq!(
+            dead.len(),
+            2,
+            "gate flagged a real construct as dead (false positive): {dead:?}",
+        );
+    }
+
+    /// INVERSE ADVISORY. The named grammar kinds no table models (grammar named kinds − MAP keys −
+    /// `RESIDUE_KINDS`) — the set that falls through to `native()`. Snapshotted so a grammar bump
+    /// that adds or renames a kind produces a reviewable diff here (a new construct to consider
+    /// modeling), complementing the forward gate (which catches removals/renames of *referenced*
+    /// kinds). Regenerate a reviewed bump with `UPDATE_GRAMMAR_SNAPSHOTS=1 cargo test`.
+    #[test]
+    fn unmapped_kinds_advisory_matches_snapshot() {
+        for &lang in GATED {
+            let language = lang.ts_language();
+            let (kinds, _) = referenced(lang);
+            let referenced: std::collections::HashSet<&str> = kinds.into_iter().collect();
+            let unmapped: Vec<&str> = named_kinds(&language)
+                .into_iter()
+                .filter(|k| !referenced.contains(k))
+                .collect();
+
+            let mut actual = String::new();
+            actual.push_str(&format!("grammar: {} (unmapped → native)\n", lang.name()));
+            actual.push_str(&format!("unmapped named kinds ({}):\n", unmapped.len()));
+            for k in &unmapped {
+                actual.push_str("  ");
+                actual.push_str(k);
+                actual.push('\n');
+            }
+
+            let file = format!("unmapped-{}.snap", lang.name());
+            let path = format!(
+                "{}/src/frontend/snapshots/{}",
+                env!("CARGO_MANIFEST_DIR"),
+                file
+            );
+            if std::env::var_os("UPDATE_GRAMMAR_SNAPSHOTS").is_some() {
+                std::fs::write(&path, &actual).expect("write unmapped snapshot");
+                continue;
+            }
+            let expected = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                panic!("missing unmapped snapshot {path}: {e}; regenerate with UPDATE_GRAMMAR_SNAPSHOTS=1")
+            });
+            assert_eq!(
+                actual, expected,
+                "unmapped-kinds advisory for {lang:?} drifted; a grammar bump may have added/renamed \
+                 a kind — review, then regenerate with UPDATE_GRAMMAR_SNAPSHOTS=1"
             );
         }
     }

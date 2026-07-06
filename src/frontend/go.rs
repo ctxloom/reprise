@@ -52,7 +52,7 @@ fn span_of(node: Node) -> (u32, u32) {
 /// exact table via [`super::lookup`] + [`super::dispatch`]; only the genuinely irreducible quirks the
 /// table can't express — the inline `index_expression` construction and the single-element
 /// `expression_list` unwrap guard — stay residue (see [`RESIDUE_KINDS`]).
-const MAP: &[(&str, super::Lowering)] = &[
+pub(crate) const MAP: &[(&str, super::Lowering)] = &[
     ("function_declaration", L::Function),
     ("method_declaration", L::Function),
     ("block", L::Block),
@@ -103,11 +103,10 @@ const MAP: &[(&str, super::Lowering)] = &[
 /// (The one referenced grammar kind deliberately left out is `parameter_declaration`, matched inside
 /// [`Frontend::lower_params`] — the same param-shape gate gap Rust (`parameter`) and Python
 /// (`typed_parameter`/`default_parameter`) leave open; tracked as cross-frontend deferred work.)
-// Registered-now/consumed-later: the increment-5 conformance gate is this list's first non-test reader;
-// today only the table-invariant test below exercises it, so this `allow` is scoped to the plain
-// library build (parity with Rust's/Python's `RESIDUE_KINDS`).
-#[allow(dead_code)]
-const RESIDUE_KINDS: &[&str] = &[
+// Consumed by the increment-5 conformance gate (via `super::frontend_table`), which asserts every
+// entry still exists in the linked grammar — so the increment-3 `allow(dead_code)` that scoped this
+// to the plain library build is gone (parity with Rust's/Python's `RESIDUE_KINDS`).
+pub(crate) const RESIDUE_KINDS: &[&str] = &[
     // Dispatched from `lower_node`'s residue arm (a table miss → an inline Go-local lowering).
     "index_expression", // xs[i] → Index (inline make_index)
     "expression_list",  // single-element unwrap guard; also lower_return_go's multi-value wrapper

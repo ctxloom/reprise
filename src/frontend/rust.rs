@@ -38,7 +38,7 @@ pub(crate) struct Rust;
 /// conformance gate. The runtime dispatch reads this exact table via [`super::lookup`] +
 /// [`super::dispatch`]; the irreducible Rust-local quirks the table can't express stay
 /// hand-written residue (see [`RESIDUE_KINDS`]).
-const MAP: &[(&str, super::Lowering)] = &[
+pub(crate) const MAP: &[(&str, super::Lowering)] = &[
     ("function_item", L::Function),
     ("block", L::Block),
     ("loop_expression", L::Loop),
@@ -94,11 +94,10 @@ const MAP: &[(&str, super::Lowering)] = &[
 ///
 /// One residue reference is a *suffix* match, not a fixed kind: [`return_tail`] treats any
 /// `*_item` node as a non-value. That is enumerated structurally by the gate, not as a string.
-// Registered-now/consumed-later: the increment-5 conformance gate is this list's first
-// non-test reader (increment 1 only makes the residue kinds enumerable as data). The table
-// invariant test already exercises it, so this `allow` is scoped to the plain library build.
-#[allow(dead_code)]
-const RESIDUE_KINDS: &[&str] = &[
+// Consumed by the increment-5 conformance gate (via `super::frontend_table`), which asserts every
+// entry still exists in the linked grammar — so the increment-1 `allow(dead_code)` that scoped this
+// to the plain library build is gone.
+pub(crate) const RESIDUE_KINDS: &[&str] = &[
     // Dispatched from `lower_node`'s residue arm (a table miss → a Rust-local lowering).
     "match_expression",      // subject-fold → Branch (lower_match)
     "reference_expression",  // &x / &mut x → Unop (lower_reference)

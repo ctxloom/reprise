@@ -41,7 +41,7 @@ pub(crate) struct Python;
 /// table as `Std` fn-pointers rather than a hand-written residue list. The runtime dispatch reads this
 /// exact table via [`super::lookup`] + [`super::dispatch`]; only the genuinely irreducible quirk that
 /// the table can't express — the inline `subscript` construction — stays residue (see [`RESIDUE_KINDS`]).
-const MAP: &[(&str, super::Lowering)] = &[
+pub(crate) const MAP: &[(&str, super::Lowering)] = &[
     ("function_definition", L::Function),
     ("block", L::Block),
     ("while_statement", L::While),
@@ -96,11 +96,10 @@ const MAP: &[(&str, super::Lowering)] = &[
 ///     grammar kinds it matches on internally (a `case_clause`, an `elif_clause`) are not — so they
 ///     are enumerated here, generalizing Rust's "residue helpers' internal discriminants" to
 ///     "residue arm ∪ Std helpers". (Go increment 3 inherits this rule.)
-// Registered-now/consumed-later: the increment-5 conformance gate is this list's first non-test
-// reader; today only the table-invariant test below exercises it, so this `allow` is scoped to the
-// plain library build (parity with Rust's `RESIDUE_KINDS`).
-#[allow(dead_code)]
-const RESIDUE_KINDS: &[&str] = &[
+// Consumed by the increment-5 conformance gate (via `super::frontend_table`), which asserts every
+// entry still exists in the linked grammar — so the increment-2 `allow(dead_code)` that scoped this
+// to the plain library build is gone (parity with Rust's `RESIDUE_KINDS`).
+pub(crate) const RESIDUE_KINDS: &[&str] = &[
     // Dispatched from `lower_node`'s residue arm (a table miss → an inline Python-local lowering).
     "subscript", // xs[i] → Index (inline make_index)
     // Internal discriminants of the `Std` language-local helpers (not MAP keys, still grammar-coupled).
