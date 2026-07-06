@@ -102,6 +102,12 @@ pub(crate) trait Frontend {
 /// Reused unchanged by every frontend — only a table's *contents* are per-language; the
 /// vocabulary of shared lowerings is shared (Rust adopts it here; Python/Go in later
 /// increments).
+/// The one lowering-fn signature every shared [`super`] helper and the [`dispatch`] runner already
+/// use — and the pointee of [`Lowering::Std`]. A language-local fn joins the table by matching it
+/// (taking `&dyn Frontend` in place of its own concrete frontend); nothing else about it changes.
+pub(crate) type LowerFn =
+    fn(&dyn Frontend, Node, Option<&str>, (u32, u32), &str, &mut TransformLog) -> NormNode;
+
 #[derive(Clone, Copy)]
 pub(crate) enum Lowering {
     /// [`lower_function`] — a function/method unit.
@@ -140,6 +146,18 @@ pub(crate) enum Lowering {
     Unwrap,
     /// [`drop_parens`] — drop redundant parentheses, recording `ParenDrop` (`Option`).
     DropParens,
+    /// A **language-local** lowering fn riding *in* the table (D-SP4-2; `docs/sp4-grammar-lift-plan.md`).
+    /// Increment 1 could only express a CST kind as data when a *shared* [`super`] helper handled it;
+    /// a frontend's own quirk-lowering (Python's `lower_if_py`/`lower_match_py`/…) had to stay a
+    /// hand-written residue arm. `Std` closes that gap: it carries a function pointer to the
+    /// per-language fn, so the entry is still a MAP key (gate-enumerable) while the *behavior* is the
+    /// frontend's. The pointee is the **exact** signature every shared helper and the [`dispatch`]
+    /// runner already use — `fn(&dyn Frontend, node, field, span, src, log) -> NormNode` — so a
+    /// language-local fn joins the table by taking `&dyn Frontend` (not its own concrete frontend)
+    /// and nothing else changes. A `NormNode` (never `Option`) is returned: an `Std` entry always
+    /// lowers to a node, so like the other node-returning variants its result is `Some`-wrapped by
+    /// [`dispatch`]; irreducible `Option`-returning / inline quirks stay residue.
+    Std(LowerFn),
     /// The node carries no similarity signal — dropped (`None`).
     Drop,
 }
@@ -193,6 +211,8 @@ pub(crate) fn dispatch(
         Lowering::ExtName => Some(ext_name(node, field, span, src)),
         Lowering::Unwrap => unwrap_stmt(fe, node, field, src, log),
         Lowering::DropParens => drop_parens(fe, node, field, span, src, log),
+        // A language-local fn-ptr: call it with the same args every shared helper gets.
+        Lowering::Std(f) => Some(f(fe, node, field, span, src, log)),
         Lowering::Drop => None,
     }
 }

@@ -3,12 +3,11 @@
 //! Rust frontend's. Contrast the historical `src/lang/python.rs` (the full per-grammar
 //! normalizer): this is a small fraction of it, and it re-implements *nothing*.
 
+use super::Lowering as L;
 use super::{
-    Frontend, bind_pattern_idents, block, drop_parens, eq_guard, leaf, lit, lower_assign,
-    lower_aug_assign, lower_binary, lower_call, lower_field, lower_for, lower_function,
-    lower_pattern, lower_return, lower_source, lower_unary_field, lower_unary_positional,
-    lower_unit, lower_while, make_arm, make_branch, make_index, make_lambda, make_multi_assign,
-    matches_guard, native, push_else_arm, unwrap_stmt, var,
+    Frontend, bind_pattern_idents, eq_guard, lower_assign, lower_pattern, lower_source,
+    lower_unary_field, lower_unit, make_arm, make_branch, make_index, make_lambda,
+    make_multi_assign, matches_guard, native, push_else_arm,
 };
 use crate::ir::kind;
 use crate::ir::transform::TransformLog;
@@ -34,6 +33,87 @@ pub fn lower_python_source(src: &str) -> Option<(NormNode, TransformLog)> {
 
 pub(crate) struct Python;
 
+/// The data-driven Python dispatch table (D-SP4-2; `docs/sp4-grammar-lift-plan.md` §4), extending
+/// the Rust increment-1 pattern with the [`super::Lowering::Std`] variant. Every **uniform** arm — a
+/// CST kind handled by a *shared* [`super`] helper — is data exactly as in Rust; Python's
+/// **language-local** lowerings (`lower_if_py`, `lower_ternary`, `lower_match_py`, `lower_comparison`,
+/// `lower_lambda`, `lower_assignment_py`, and the `not` → `!` adapter [`lower_not_py`]) ride in the
+/// table as `Std` fn-pointers rather than a hand-written residue list. The runtime dispatch reads this
+/// exact table via [`super::lookup`] + [`super::dispatch`]; only the genuinely irreducible quirk that
+/// the table can't express — the inline `subscript` construction — stays residue (see [`RESIDUE_KINDS`]).
+const MAP: &[(&str, super::Lowering)] = &[
+    ("function_definition", L::Function),
+    ("block", L::Block),
+    ("while_statement", L::While),
+    ("for_statement", L::For("left", "right")),
+    // Language-local lowerings — a shared node-set, a per-language shape — ride in the table as `Std`.
+    ("if_statement", L::Std(lower_if_py)),
+    ("conditional_expression", L::Std(lower_ternary)),
+    ("match_statement", L::Std(lower_match_py)),
+    ("comparison_operator", L::Std(lower_comparison)),
+    ("lambda", L::Std(lower_lambda)),
+    ("assignment", L::Std(lower_assignment_py)),
+    // `not x` → `!x` (the shared `lower_unary_field` with Python's `argument` field name pinned).
+    ("not_operator", L::Std(lower_not_py)),
+    ("unary_operator", L::UnaryPositional),
+    ("boolean_operator", L::Binary("left", "operator", "right")),
+    ("binary_operator", L::Binary("left", "operator", "right")),
+    // `a op= b` desugars to `a = a op b` — definitionally self-referential (the lvalue is read then
+    // written), so the target is a *mutation* (`@place`, `bind = false`), matching Go/Rust `op=`.
+    (
+        "augmented_assignment",
+        L::AugAssign("left", "operator", "right", false),
+    ),
+    ("break_statement", L::Leaf(kind::BREAK)),
+    ("continue_statement", L::Leaf(kind::CONTINUE)),
+    ("expression_statement", L::Unwrap),
+    ("call", L::Call("function", "arguments")),
+    ("return_statement", L::Return),
+    ("parenthesized_expression", L::DropParens),
+    ("attribute", L::Field("object", "attribute")),
+    ("integer", L::Lit(Bucket::Int)),
+    ("float", L::Lit(Bucket::Float)),
+    ("string", L::Lit(Bucket::Str)),
+    ("concatenated_string", L::Lit(Bucket::Str)),
+    ("true", L::Lit(Bucket::Bool)),
+    ("false", L::Lit(Bucket::Bool)),
+    ("identifier", L::Var),
+    // No similarity signal — dropped (Type-1 convergence / spec §5.2.7); `pass`/`comment` reduce to
+    // the shared `Drop` exactly as Rust's `line_comment`/`block_comment` do (one entry per kind).
+    ("pass_statement", L::Drop),
+    ("comment", L::Drop),
+];
+
+/// Tree-sitter kinds the Python frontend references but the shared [`MAP`] does not key on —
+/// registered as data so the increment-5 conformance gate can enumerate EVERY kind the frontend
+/// references (MAP keys ∪ `RESIDUE_KINDS`) and assert each still exists in the linked grammar.
+///
+/// Two sources, both grammar-coupled strings the gate must still see:
+///   * the one **residue-arm** kind — `subscript`, whose inline `Index` construction the table
+///     can't express (the analog of Rust's residue `index_expression`); and
+///   * the internal discriminants of the table-dispatched **language-local (`Std`)** helpers.
+///     This is the schema increment 2 introduces: an `Std` entry's *own* kind is a MAP key, but the
+///     grammar kinds it matches on internally (a `case_clause`, an `elif_clause`) are not — so they
+///     are enumerated here, generalizing Rust's "residue helpers' internal discriminants" to
+///     "residue arm ∪ Std helpers". (Go increment 3 inherits this rule.)
+// Registered-now/consumed-later: the increment-5 conformance gate is this list's first non-test
+// reader; today only the table-invariant test below exercises it, so this `allow` is scoped to the
+// plain library build (parity with Rust's `RESIDUE_KINDS`).
+#[allow(dead_code)]
+const RESIDUE_KINDS: &[&str] = &[
+    // Dispatched from `lower_node`'s residue arm (a table miss → an inline Python-local lowering).
+    "subscript", // xs[i] → Index (inline make_index)
+    // Internal discriminants of the `Std` language-local helpers (not MAP keys, still grammar-coupled).
+    "elif_clause",     // if_chain: an `elif` vs the trailing `else`
+    "case_clause",     // lower_match_py: `match`/`case` arm iteration
+    "case_pattern",    // lower_match_py / literal_pattern_value
+    "none",            // literal_pattern_value: a `case None:` literal arm
+    "pattern_list",    // tuple_elements: a parallel-assign target list
+    "tuple_pattern",   // tuple_elements: a destructuring target
+    "expression_list", // tuple_elements: a parallel-assign value list
+    "tuple",           // tuple_elements: a parenthesized value tuple
+];
+
 impl Frontend for Python {
     fn lower_node(
         &self,
@@ -42,63 +122,18 @@ impl Frontend for Python {
         src: &str,
         log: &mut TransformLog,
     ) -> Option<NormNode> {
+        // The uniform arms AND Python's language-local lowerings are data (`MAP`): look the kind up,
+        // dispatch it (shared helper or `Std` fn-ptr). A hit returning `None` is a deliberate drop
+        // (`Lowering::Drop`, or an `Unwrap`/`DropParens` that found nothing) — NOT a miss, so it
+        // never reaches residue.
+        if let Some(entry) = super::lookup(MAP, node.kind()) {
+            return super::dispatch(entry, self, node, field, src, log);
+        }
+        // Table miss → the Python-local residue (kinds registered in `RESIDUE_KINDS`): the one
+        // irreducible inline quirk — `subscript`'s field-based `Index` construction — else an
+        // unmodeled `native` leaf.
         let span = (node.start_byte() as u32, node.end_byte() as u32);
         match node.kind() {
-            "function_definition" => Some(lower_function(self, node, field, span, src, log)),
-            "block" => Some(block(self, node, field, span, src, log)),
-            "while_statement" => Some(lower_while(self, node, field, span, src, log)),
-            "for_statement" => Some(lower_for(
-                self,
-                node,
-                field,
-                span,
-                ("left", "right"),
-                src,
-                log,
-            )),
-            "if_statement" => Some(lower_if_py(self, node, field, span, src, log)),
-            "conditional_expression" => Some(lower_ternary(self, node, field, span, src, log)),
-            "match_statement" => Some(lower_match_py(self, node, field, span, src, log)),
-            "not_operator" => Some(lower_unary_field(
-                self, node, field, span, "argument", src, log,
-            )),
-            "unary_operator" => Some(lower_unary_positional(self, node, field, span, src, log)),
-            "boolean_operator" => Some(lower_binary(
-                self,
-                node,
-                field,
-                span,
-                ("left", "operator", "right"),
-                src,
-                log,
-            )),
-            "comparison_operator" => Some(lower_comparison(self, node, field, span, src, log)),
-            "lambda" => Some(lower_lambda(self, node, field, span, src, log)),
-            "break_statement" => Some(leaf(kind::BREAK, field, span)),
-            "continue_statement" => Some(leaf(kind::CONTINUE, field, span)),
-            // No similarity signal — dropped (Type-1 convergence / spec §5.2.7).
-            "pass_statement" | "comment" => None,
-            "expression_statement" => unwrap_stmt(self, node, field, src, log),
-            "call" => Some(lower_call(
-                self,
-                node,
-                field,
-                span,
-                ("function", "arguments"),
-                src,
-                log,
-            )),
-            "return_statement" => Some(lower_return(self, node, field, span, src, log)),
-            "parenthesized_expression" => drop_parens(self, node, field, span, src, log),
-            "attribute" => Some(lower_field(
-                self,
-                node,
-                field,
-                span,
-                ("object", "attribute"),
-                src,
-                log,
-            )),
             "subscript" => {
                 let base = node
                     .child_by_field_name("value")
@@ -108,33 +143,6 @@ impl Frontend for Python {
                     .and_then(|n| self.lower_node(n, Some("idx"), src, log));
                 Some(make_index(base, idx, field, span))
             }
-            "binary_operator" => Some(lower_binary(
-                self,
-                node,
-                field,
-                span,
-                ("left", "operator", "right"),
-                src,
-                log,
-            )),
-            "assignment" => Some(lower_assignment_py(self, node, field, span, src, log)),
-            // `a op= b` desugars to `a = a op b` — definitionally self-referential (the lvalue
-            // is read then written), so the target is a *mutation* (`@place`, `bind = false`),
-            // matching Go/Rust `op=`.
-            "augmented_assignment" => Some(lower_aug_assign(
-                self,
-                node,
-                ("left", "operator", "right", false),
-                field,
-                span,
-                src,
-                log,
-            )),
-            "integer" => Some(lit(node, field, span, Bucket::Int, src, log)),
-            "float" => Some(lit(node, field, span, Bucket::Float, src, log)),
-            "string" | "concatenated_string" => Some(lit(node, field, span, Bucket::Str, src, log)),
-            "true" | "false" => Some(lit(node, field, span, Bucket::Bool, src, log)),
-            "identifier" => Some(var(node, field, span, src)),
             _ => Some(native(self, node, field, span, src, log)),
         }
     }
@@ -173,7 +181,7 @@ impl Frontend for Python {
 /// (`a, b = f()`, unequal target/value counts — ANF territory, out of scope) falls through to the
 /// single path (its tuple pattern stays `native`).
 fn lower_assignment_py(
-    fe: &Python,
+    fe: &dyn Frontend,
     node: Node,
     field: Option<&str>,
     span: (u32, u32),
@@ -300,7 +308,7 @@ fn rhs_mentions_name(node: Node, name: &str, src: &str) -> bool {
 /// arms are spliced flat by `push_else_arm`, so the whole chain is one ordered `Branch`
 /// that converges with the equivalent `match`.
 fn lower_if_py(
-    fe: &Python,
+    fe: &dyn Frontend,
     node: Node,
     field: Option<&str>,
     span: (u32, u32),
@@ -318,7 +326,7 @@ fn lower_if_py(
 
 #[allow(clippy::too_many_arguments)]
 fn if_chain(
-    fe: &Python,
+    fe: &dyn Frontend,
     cond: Option<Node>,
     cons: Option<Node>,
     alts: &[Node],
@@ -358,7 +366,7 @@ fn if_chain(
 /// `match subj: case p: …` → `Branch{ subj@subject, Arm[p, body]… }` (§14). `case _:` is
 /// the trivial-guard arm; captures in a `case_pattern` become declared locals.
 fn lower_match_py(
-    fe: &Python,
+    fe: &dyn Frontend,
     node: Node,
     field: Option<&str>,
     span: (u32, u32),
@@ -392,7 +400,7 @@ fn lower_match_py(
 /// A Python `case` guard: `_` → none (else); a literal pattern → `subject == literal`
 /// (converges with an if-chain); anything else → `matches(subject, pattern)`.
 fn case_guard(
-    fe: &Python,
+    fe: &dyn Frontend,
     subject: Option<&NormNode>,
     pat: Node,
     span: (u32, u32),
@@ -426,7 +434,7 @@ fn literal_pattern_value(pat: Node) -> Option<Node> {
 /// `a if c else b` → a 2-arm `Branch` (§14). `conditional_expression` is positional:
 /// named children are `[value_if_true, condition, value_if_false]`.
 fn lower_ternary(
-    fe: &Python,
+    fe: &dyn Frontend,
     node: Node,
     field: Option<&str>,
     span: (u32, u32),
@@ -455,7 +463,7 @@ fn lower_ternary(
 /// (`Binop{ Binop{a < b} <= c }`), so each is a canonical 3-child `Binop` the order
 /// pass can act on and a simple `a == b` converges with the other languages' binaries.
 fn lower_comparison(
-    fe: &Python,
+    fe: &dyn Frontend,
     node: Node,
     field: Option<&str>,
     span: (u32, u32),
@@ -501,7 +509,7 @@ fn lower_comparison(
 
 /// `lambda x: e` → `Lambda{ x@param, e@body }` (§5 `Lambda`).
 fn lower_lambda(
-    fe: &Python,
+    fe: &dyn Frontend,
     node: Node,
     field: Option<&str>,
     span: (u32, u32),
@@ -525,12 +533,43 @@ fn lower_lambda(
     make_lambda(params, body, field, span)
 }
 
+/// Python `not x` → `Unop{ !, x }`: the shared [`lower_unary_field`] with Python's `argument` field
+/// name pinned, so `not` canonicalizes to `!` and converges with Rust's `!x` and the break-guard
+/// synthesis. A thin per-language adapter (the one Python quirk — the field name) around the shared
+/// helper, letting it ride in the table as an `Std` entry instead of a residue arm.
+fn lower_not_py(
+    fe: &dyn Frontend,
+    node: Node,
+    field: Option<&str>,
+    span: (u32, u32),
+    src: &str,
+    log: &mut TransformLog,
+) -> NormNode {
+    lower_unary_field(fe, node, field, span, "argument", src, log)
+}
+
 #[cfg(test)]
 mod tests {
     use super::lower_python_source;
     use crate::frontend::lower_rust_source;
     use crate::ir::render::to_sexpr;
     use crate::ir::transform::TransformKind;
+
+    #[test]
+    fn dispatch_table_is_a_consistent_single_source_of_truth() {
+        // The table is the SP4 gate's source of truth (D-SP4-2), so every referenced kind must be
+        // data in EXACTLY one place: a unique MAP key OR a residue kind, never both.
+        use std::collections::HashSet;
+        let mut keys = HashSet::new();
+        for (k, _) in super::MAP {
+            assert!(keys.insert(*k), "duplicate MAP key: {k}");
+        }
+        let mut residue = HashSet::new();
+        for k in super::RESIDUE_KINDS {
+            assert!(residue.insert(*k), "duplicate residue kind: {k}");
+            assert!(!keys.contains(k), "kind {k} is both a MAP key and residue");
+        }
+    }
 
     fn abs(src: &str) -> String {
         let (ir, _) = lower_python_source(src).unwrap();
