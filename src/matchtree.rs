@@ -63,6 +63,24 @@ pub struct RepData {
     offsets: Vec<(u128, Vec<u32>, Vec<u16>)>,
 }
 
+impl RepData {
+    /// Index into the `units` slice this rep was built from.
+    pub fn unit_idx(&self) -> usize {
+        self.unit_idx
+    }
+    /// Floor-`bag_min_subtree_tokens` deduplicated subtree-hash set (the bag layer's
+    /// features), sorted ascending. A `Retriever` reads this to build its own index.
+    pub fn bag_set(&self) -> &[u128] {
+        &self.bag_set
+    }
+    /// Hash → (pre-order offsets, tree depths) inventory, sorted by hash, the two
+    /// parallel per hash. The verify substrate; also the source a retriever derives
+    /// rare peaks / an ordered subtree stream from.
+    pub fn offsets(&self) -> &[(u128, Vec<u32>, Vec<u16>)] {
+        &self.offsets
+    }
+}
+
 /// A histogram-and-AU-verified pair, keyed on unit indices.
 struct VerifiedPair {
     a: usize,
@@ -87,25 +105,13 @@ pub fn find_near_groups(
     groups
 }
 
-fn near_groups_for_lang(
-    units: &[Unit],
-    lang: Lang,
-    cfg: &Config,
-    stats: &mut RetrievalStats,
-    exact_pairs: &HashSet<(usize, usize)>,
-) -> Vec<NearGroup> {
-    let profile = lang.profile();
-    let ir = crate::unit::is_ir(lang, cfg);
+/// Build the shared per-unit retrieval substrate for one language: one [`RepData`]
+/// per eligible unit (token floor met, one representative per exact fingerprint).
+/// This is the neutral input every [`Retriever`] and the verify chain read; it is
+/// public so the retrieval bake-off races the REAL substrate + real retrievers,
+/// not a reconstruction. Returns fewer than 2 reps when there is nothing to pair.
+pub fn build_reps(units: &[Unit], lang: Lang, cfg: &Config) -> Vec<RepData> {
     let floor = cfg.min_unit_floor();
-    let debug_timing = std::env::var_os("REPRISE_TIMING").is_some();
-    let mut t = std::time::Instant::now();
-    let mut mark = |label: &str| {
-        if debug_timing {
-            eprintln!("  near[{lang:?}] {label}: {}ms", t.elapsed().as_millis());
-        }
-        t = std::time::Instant::now();
-    };
-
     // One representative per exact fingerprint (exact tiers own equal units;
     // plain units precede variants in `units`, so a variant that exactly
     // matches a plain unit defers to the inline-exact grouping).
@@ -117,10 +123,7 @@ fn near_groups_for_lang(
         .filter(|(_, u)| seen_fp.insert(u.fingerprint))
         .map(|(idx, _)| idx)
         .collect();
-    if eligible.len() < 2 {
-        return Vec::new();
-    }
-    let reps: Vec<RepData> = eligible
+    eligible
         .par_iter()
         .map(|&idx| {
             // Histogram offsets use a finer inventory (floor 3) than the bag
@@ -161,7 +164,31 @@ fn near_groups_for_lang(
                 offsets,
             }
         })
-        .collect();
+        .collect()
+}
+
+fn near_groups_for_lang(
+    units: &[Unit],
+    lang: Lang,
+    cfg: &Config,
+    stats: &mut RetrievalStats,
+    exact_pairs: &HashSet<(usize, usize)>,
+) -> Vec<NearGroup> {
+    let profile = lang.profile();
+    let ir = crate::unit::is_ir(lang, cfg);
+    let debug_timing = std::env::var_os("REPRISE_TIMING").is_some();
+    let mut t = std::time::Instant::now();
+    let mut mark = |label: &str| {
+        if debug_timing {
+            eprintln!("  near[{lang:?}] {label}: {}ms", t.elapsed().as_millis());
+        }
+        t = std::time::Instant::now();
+    };
+
+    let reps = build_reps(units, lang, cfg);
+    if reps.len() < 2 {
+        return Vec::new();
+    }
 
     mark("reps");
     // ---- candidate retrieval (union of two layers; membership tracked for §7.4b) ----
@@ -700,8 +727,8 @@ fn offset_consistency(ev: &[SharedSubtree], needed: u32) -> bool {
 /// H-tree-verify depth-delta diagonal (§0.5): shared subtrees vote `depth_a−
 /// depth_b`. A genuine clone places its shared subtrees at consistent RELATIVE
 /// depths; a coincidental landmark collision sits at inconsistent depths and
-/// scatters. Opt-in (`retrieval.tree_verify`) — a peer of `offset_consistency`,
-/// reading the same evidence, not a wrapper around it.
+/// scatters. Selected by listing `h-tree` in `retrieval.verify` — a peer of
+/// `offset_consistency`, reading the same evidence, not a wrapper around it.
 fn depth_consistency(ev: &[SharedSubtree], needed: u32) -> bool {
     diagonal_passes(
         ev,
@@ -711,26 +738,43 @@ fn depth_consistency(ev: &[SharedSubtree], needed: u32) -> bool {
     )
 }
 
-/// The pre-AU verify histogram: a cost-ordered cascade of consistency criteria
-/// over the ONE shared-subtree evidence pass. Each criterion is a peer predicate
-/// on the shared evidence, evaluated cheap→expensive and short-circuiting on the
-/// first reject. Offset-delta (the Shazam diagonal) is always on; depth-delta
-/// (H-tree-verify, §0.5) is opt-in via `retrieval.tree_verify`. Both read the
-/// same evidence, so enabling depth adds no second walk.
+/// Registry of verify consistency criteria, by their `retrieval.verify` config
+/// name. Each is a pure predicate over the shared-subtree evidence; `anti_unify`
+/// is the FIXED terminal verify and is deliberately absent (it cannot be reordered
+/// into this list). Unknown names are rejected at config load via
+/// [`validate_verify_criterion`], so lookups here always hit for a loaded config.
+fn criterion_by_name(name: &str) -> Option<Criterion> {
+    match name {
+        "offset-histogram" => Some(offset_consistency),
+        "h-tree" => Some(depth_consistency),
+        _ => None,
+    }
+}
+
+/// Config load-time validation for a `retrieval.verify` criterion name.
+pub fn validate_verify_criterion(name: &str) -> Result<(), String> {
+    if criterion_by_name(name).is_some() {
+        Ok(())
+    } else {
+        Err(format!(
+            "unknown verify criterion `{name}` (known: offset-histogram, h-tree)"
+        ))
+    }
+}
+
+/// The pre-AU verify cascade: the configured consistency criteria (`retrieval.
+/// verify`), run in listed order as an AND — a pair must pass ALL to reach
+/// `anti_unify`. Every criterion reads the ONE shared-subtree evidence pass, so
+/// enabling `h-tree` adds no second tree walk. Order is result-invariant (a pure
+/// conjunction) — it only sets short-circuit cost. Unknown names are impossible on
+/// a validated config, so an unrecognized entry conservatively passes (skips).
 fn histogram_passes(a: &RepData, b: &RepData, cfg: &Config) -> bool {
     let ev = shared_subtree_evidence(a, b);
     let needed = votes_needed(a, b, cfg);
-    // (enabled, criterion) in cost order. A flat, toggleable criteria set — not a
-    // decorator chain: coverage-gate, offset-hist, depth-hist and anti_unify are
-    // peers in one cheap→expensive reject cascade.
-    let criteria: [(bool, Criterion); 2] = [
-        (true, offset_consistency),
-        (cfg.retrieval.tree_verify, depth_consistency),
-    ];
-    criteria
+    cfg.retrieval
+        .verify
         .iter()
-        .filter(|(enabled, _)| *enabled)
-        .all(|(_, criterion)| criterion(&ev, needed))
+        .all(|name| criterion_by_name(name).is_none_or(|criterion| criterion(&ev, needed)))
 }
 
 fn build_groups(pairs: Vec<VerifiedPair>, tier: Tier, units: &[Unit]) -> Vec<NearGroup> {

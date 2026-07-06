@@ -160,17 +160,26 @@ pub struct RetrievalCfg {
     /// candidate-generation filter — it never touches the fingerprint or cache key
     /// (hash-neutral). 0 disables the gate.
     pub landmark_coverage_min: f64,
-    /// H-tree-verify (docs/substantiality-metric.md §0.5): add a depth-delta
-    /// (depth_a−depth_b) consistency criterion alongside the offset-delta (Shazam
-    /// diagonal) one, over the SAME shared floor-3 subtrees, in the pre-AU verify
-    /// cascade. A genuine clone places its shared subtrees at consistent RELATIVE
-    /// depths; a coincidental landmark collision scatters. **Default ON** — promoted
-    /// after the whole-repo + inline-on byte-identical `verified_pairs` gate held
-    /// clean (verified_pairs 187=187, every clone-group set identical; the only stat
-    /// that moved was the diagnostic histogram_rejected, +98 = 98 fewer anti_unify
-    /// calls at zero recall loss). A pure candidate pre-filter: hash-neutral, never
-    /// in the cache key. Set false to disable the depth criterion (offset-delta only).
-    pub tree_verify: bool,
+    /// Ordered verify consistency criteria — the pre-`anti_unify` cascade. Each name
+    /// is a pure predicate over the shared floor-3 subtree evidence; a candidate pair
+    /// must pass ALL listed criteria (an AND-cascade, run in listed order purely for
+    /// short-circuit cost — order never changes the result, a conjunction being
+    /// commutative) to reach `anti_unify`. `anti_unify` is the FIXED terminal verify
+    /// and is deliberately never in this list, so it cannot be reordered away. Known
+    /// criteria:
+    ///   - `offset-histogram` — the Shazam Δoffset diagonal (spec §5.6), the incumbent.
+    ///   - `h-tree` — H-tree-verify, the Δdepth diagonal (docs/substantiality-metric.md
+    ///     §0.5): shared subtrees at consistent RELATIVE depths pass; coincidental
+    ///     landmark collisions at inconsistent depths are dropped before `anti_unify`.
+    ///
+    /// Both read the SAME single shared-subtree evidence pass, so adding `h-tree` costs
+    /// no extra tree walk. The default `[offset-histogram, h-tree]` was promoted from
+    /// `[offset-histogram]` after the whole-repo + inline-on byte-identical
+    /// `verified_pairs` gate held clean (verified_pairs 187=187, every clone-group set
+    /// identical; only the diagnostic histogram_rejected moved, +98 = 98 fewer
+    /// anti_unify calls at zero recall loss). Unknown names are rejected at config load.
+    /// Matching-time only — hash-neutral, never in the extraction cache key.
+    pub verify: Vec<String>,
 }
 
 impl Default for RetrievalCfg {
@@ -181,7 +190,7 @@ impl Default for RetrievalCfg {
             shared_landmarks_min: 2,
             owner_pair_window: 0,
             landmark_coverage_min: 0.05,
-            tree_verify: true,
+            verify: vec!["offset-histogram".into(), "h-tree".into()],
         }
     }
 }
@@ -388,6 +397,50 @@ impl Config {
     fn validate(&self) -> anyhow::Result<()> {
         crate::report::Tier::parse_fail_on(&self.report.fail_on)
             .map_err(|e| anyhow::anyhow!("reprise.toml [report] fail_on: {e}"))?;
+        for name in &self.retrieval.verify {
+            crate::matchtree::validate_verify_criterion(name)
+                .map_err(|e| anyhow::anyhow!("reprise.toml [retrieval] verify: {e}"))?;
+        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn default_verify_cascade_is_offset_then_h_tree() {
+        // The promoted default: offset-histogram first (incumbent), then h-tree.
+        assert_eq!(
+            Config::default().retrieval.verify,
+            vec!["offset-histogram".to_string(), "h-tree".to_string()]
+        );
+    }
+
+    #[test]
+    fn validate_rejects_an_unknown_verify_criterion() {
+        let toml = r#"[retrieval]
+verify = ["offset-histogram", "bogus"]
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("bogus"),
+            "error names the bad criterion: {err}"
+        );
+        assert!(
+            err.contains("offset-histogram"),
+            "error lists the known set: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_the_known_criteria_in_any_order() {
+        let toml = r#"[retrieval]
+verify = ["h-tree", "offset-histogram"]
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(cfg.validate().is_ok());
     }
 }
