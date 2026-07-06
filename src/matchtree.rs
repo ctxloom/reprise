@@ -215,20 +215,43 @@ fn near_groups_for_lang(
     stats.candidates_total += candidates.len();
     mark("pair-counting");
 
-    // ---- histogram verification + AU: plain pairs first, then variant pairs
-    // (inline pairs are excluded when a stronger tier already grouped the
-    // bases, which needs the plain outcomes known). Verification is per-pair
-    // independent — parallelized with order-preserving collects, so grouping
-    // stays deterministic. ----
+    // ---- verify: the `retrieval.filters` cascade, then anti_unify. Plain pairs
+    // first, then variant pairs (inline pairs are excluded when a stronger tier
+    // already grouped the bases, which needs the plain outcomes known). Verification
+    // is per-pair independent — parallelized with order-preserving collects, so
+    // grouping stays deterministic. `coverage` already ran in the landmark retriever
+    // (its landmark-candidacy-scoped phase); the remaining filters run here. ----
+    let filters = active_filters(cfg);
     enum Verify {
         HistogramRejected,
         DivergenceRejected,
         Verified(AuOutcome),
     }
     let verify = |i: usize, j: usize| -> Verify {
-        if !histogram_passes(&reps[i], &reps[j], cfg) {
+        // Filter cascade: pure predicates over the shared per-pair evidence, a
+        // short-circuiting AND (order is result-invariant — a conjunction — so it
+        // sets only cost). Evidence is memoized in Ctx, computed once for all filters.
+        let ctx = Ctx::new(&reps[i], &reps[j], cfg);
+        if !filters.iter().all(|f| f(&ctx)) {
             return Verify::HistogramRejected;
         }
+        // ── FIXED TERMINAL VERIFY: anti_unify ────────────────────────────────────
+        // anti_unify is deliberately kept OUT of `retrieval.filters` and pinned here
+        // as the terminal, for two reasons — both of which a future edit tempted to
+        // "just add it to the list" must reckon with:
+        //   1. It is a PRODUCER, not a predicate: it yields the match itself (the AU
+        //      template + divergence), not a pass/fail. Leaving it out keeps the
+        //      filter list homogeneous — pure predicates only — with no producer/
+        //      filter type-union or capability flag, and nothing can misorder it.
+        //   2. It is by far the DOMINANT per-pair cost. `au::anti_unify` recursively
+        //      aligns the two units' trees — a Needleman-Wunsch DP (`au::au_list`),
+        //      O(n·m) in the aligned child-list lengths at each level — orders of
+        //      magnitude heavier than the cheap filters (hash-set intersections for
+        //      coverage, one-vote-per-bin histogram counts for offset-histogram /
+        //      h-tree). The ENTIRE filter cascade exists to minimize how many pairs
+        //      reach this call: coverage cuts ≈ −44% and h-tree ≈ −48% of the flood,
+        //      pruning ~8k raw candidates to the few AU actually verifies. So it runs
+        //      ONCE, last, only on filter-survivors.
         let (ua, ub) = (reps[i].unit_idx, reps[j].unit_idx);
         let outcome = au::anti_unify(&units[ua].tree, &units[ub].tree, profile, ir);
         if outcome.divergence > cfg.thresholds.max_divergence {
@@ -456,7 +479,13 @@ impl Retriever for Landmark {
         // (dozens of pairs; audio ID works from 1–2% of thousands), so the
         // recall cost is nil on the benchmark, measured per §7.4(b).
         let shared_landmarks_min = cfg.retrieval.shared_landmarks_min;
-        let coverage_min = cfg.retrieval.landmark_coverage_min;
+        // The `coverage` pipeline stage gates this landmark-scoped filter; its
+        // threshold is `landmark_coverage_min`. Absent from the pipeline ⇒ off.
+        let coverage_min = if coverage_active(cfg) {
+            cfg.retrieval.landmark_coverage_min
+        } else {
+            0.0
+        };
         stats.landmark_index_size += landmarks.iter().map(Vec::len).sum::<usize>();
         let mut out = Vec::new();
         for ((i, j), shared) in
@@ -635,10 +664,6 @@ struct SharedSubtree<'a> {
     depths_b: &'a [u16],
 }
 
-/// A verify consistency criterion: a peer predicate over the shared-subtree
-/// evidence, given the vote budget. Offset- and depth-consistency are instances.
-type Criterion = fn(&[SharedSubtree], u32) -> bool;
-
 /// THE shared-subtree evidence pass: a single linear merge of the two hash-sorted
 /// inventories, yielding — per shared subtree — BOTH its offset lists and depth
 /// lists (borrowed, no copy). Every verify criterion reads this one pass; there is
@@ -727,7 +752,7 @@ fn offset_consistency(ev: &[SharedSubtree], needed: u32) -> bool {
 /// H-tree-verify depth-delta diagonal (§0.5): shared subtrees vote `depth_a−
 /// depth_b`. A genuine clone places its shared subtrees at consistent RELATIVE
 /// depths; a coincidental landmark collision sits at inconsistent depths and
-/// scatters. Selected by listing `h-tree` in `retrieval.verify` — a peer of
+/// scatters. Selected by listing `h-tree` in `retrieval.filters` — a peer of
 /// `offset_consistency`, reading the same evidence, not a wrapper around it.
 fn depth_consistency(ev: &[SharedSubtree], needed: u32) -> bool {
     diagonal_passes(
@@ -738,43 +763,100 @@ fn depth_consistency(ev: &[SharedSubtree], needed: u32) -> bool {
     )
 }
 
-/// Registry of verify consistency criteria, by their `retrieval.verify` config
-/// name. Each is a pure predicate over the shared-subtree evidence; `anti_unify`
-/// is the FIXED terminal verify and is deliberately absent (it cannot be reordered
-/// into this list). Unknown names are rejected at config load via
-/// [`validate_verify_criterion`], so lookups here always hit for a loaded config.
-fn criterion_by_name(name: &str) -> Option<Criterion> {
+/// Per-candidate-pair context the consistency filters read — a `&Ctx` shared,
+/// lazily-memoized view. The shared-subtree evidence (offset_delta + depth_delta per
+/// shared floor-3 subtree) and the vote budget are each computed ONCE on first demand
+/// and reused by every filter (`offset-histogram` + `h-tree`), so listing both costs
+/// one merge-join, not one walk per filter. Filters are PURE predicates over this —
+/// interior mutability (`OnceCell`) keeps memoization behind a shared `&Ctx`.
+struct Ctx<'a> {
+    a: &'a RepData,
+    b: &'a RepData,
+    cfg: &'a Config,
+    evidence: std::cell::OnceCell<Vec<SharedSubtree<'a>>>,
+    needed: std::cell::OnceCell<u32>,
+}
+
+impl<'a> Ctx<'a> {
+    fn new(a: &'a RepData, b: &'a RepData, cfg: &'a Config) -> Self {
+        Ctx {
+            a,
+            b,
+            cfg,
+            evidence: std::cell::OnceCell::new(),
+            needed: std::cell::OnceCell::new(),
+        }
+    }
+    fn evidence(&self) -> &[SharedSubtree<'a>] {
+        self.evidence
+            .get_or_init(|| shared_subtree_evidence(self.a, self.b))
+    }
+    fn needed(&self) -> u32 {
+        *self
+            .needed
+            .get_or_init(|| votes_needed(self.a, self.b, self.cfg))
+    }
+}
+
+/// A near-tier consistency filter: a PURE predicate over the shared per-pair context
+/// (`true` = pass, `false` = reject). The `retrieval.filters` list is a homogeneous
+/// short-circuiting AND-cascade of these; `anti_unify` is deliberately NOT one (it is
+/// the fixed terminal producer — see its call site).
+type Filter = fn(&Ctx) -> bool;
+
+fn filter_offset_histogram(ctx: &Ctx) -> bool {
+    offset_consistency(ctx.evidence(), ctx.needed())
+}
+fn filter_h_tree(ctx: &Ctx) -> bool {
+    depth_consistency(ctx.evidence(), ctx.needed())
+}
+
+/// Resolve a `retrieval.filters` name to its verify-phase [`Filter`] predicate.
+/// `coverage` is a known filter but returns `None` here: it is landmark-candidacy-
+/// scoped and runs in the landmark retriever's own phase (see [`coverage_active`]),
+/// not as a per-pair `&Ctx` predicate — so it is dispatched separately, not in the
+/// verify cascade. Unknown names are rejected at config load.
+fn filter_by_name(name: &str) -> Option<Filter> {
     match name {
-        "offset-histogram" => Some(offset_consistency),
-        "h-tree" => Some(depth_consistency),
+        "offset-histogram" => Some(filter_offset_histogram),
+        "h-tree" => Some(filter_h_tree),
         _ => None,
     }
 }
 
-/// Config load-time validation for a `retrieval.verify` criterion name.
-pub fn validate_verify_criterion(name: &str) -> Result<(), String> {
-    if criterion_by_name(name).is_some() {
-        Ok(())
-    } else {
-        Err(format!(
-            "unknown verify criterion `{name}` (known: offset-histogram, h-tree)"
-        ))
+/// The full set of known `retrieval.filters` names (for load-time validation),
+/// including `coverage` (dispatched to the retriever, not a `&Ctx` predicate).
+const KNOWN_FILTERS: &[&str] = &["coverage", "offset-histogram", "h-tree"];
+
+/// Config load-time validation of the `retrieval.filters` list: every name is known.
+/// Order is not validated — the cascade is a conjunction, so order is result-invariant
+/// (it sets only short-circuit cost).
+pub fn validate_filters(filters: &[String]) -> Result<(), String> {
+    for name in filters {
+        if !KNOWN_FILTERS.contains(&name.as_str()) {
+            return Err(format!(
+                "unknown filter `{name}` (known: {})",
+                KNOWN_FILTERS.join(", ")
+            ));
+        }
     }
+    Ok(())
 }
 
-/// The pre-AU verify cascade: the configured consistency criteria (`retrieval.
-/// verify`), run in listed order as an AND — a pair must pass ALL to reach
-/// `anti_unify`. Every criterion reads the ONE shared-subtree evidence pass, so
-/// enabling `h-tree` adds no second tree walk. Order is result-invariant (a pure
-/// conjunction) — it only sets short-circuit cost. Unknown names are impossible on
-/// a validated config, so an unrecognized entry conservatively passes (skips).
-fn histogram_passes(a: &RepData, b: &RepData, cfg: &Config) -> bool {
-    let ev = shared_subtree_evidence(a, b);
-    let needed = votes_needed(a, b, cfg);
+/// Whether the `coverage` filter is listed — gates the landmark retriever's §0.3
+/// coverage-fraction filter (landmark-candidacy-scoped, so it lives in that phase).
+fn coverage_active(cfg: &Config) -> bool {
+    cfg.retrieval.filters.iter().any(|n| n == "coverage")
+}
+
+/// The configured verify-phase filter predicates, in listed order, resolved once per
+/// language scan (`coverage` excluded — it runs in the retriever phase).
+fn active_filters(cfg: &Config) -> Vec<Filter> {
     cfg.retrieval
-        .verify
+        .filters
         .iter()
-        .all(|name| criterion_by_name(name).is_none_or(|criterion| criterion(&ev, needed)))
+        .filter_map(|name| filter_by_name(name))
+        .collect()
 }
 
 fn build_groups(pairs: Vec<VerifiedPair>, tier: Tier, units: &[Unit]) -> Vec<NearGroup> {

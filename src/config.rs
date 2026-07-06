@@ -160,26 +160,31 @@ pub struct RetrievalCfg {
     /// candidate-generation filter — it never touches the fingerprint or cache key
     /// (hash-neutral). 0 disables the gate.
     pub landmark_coverage_min: f64,
-    /// Ordered verify consistency criteria — the pre-`anti_unify` cascade. Each name
-    /// is a pure predicate over the shared floor-3 subtree evidence; a candidate pair
-    /// must pass ALL listed criteria (an AND-cascade, run in listed order purely for
-    /// short-circuit cost — order never changes the result, a conjunction being
-    /// commutative) to reach `anti_unify`. `anti_unify` is the FIXED terminal verify
-    /// and is deliberately never in this list, so it cannot be reordered away. Known
-    /// criteria:
-    ///   - `offset-histogram` — the Shazam Δoffset diagonal (spec §5.6), the incumbent.
+    /// Ordered near-tier FILTER cascade: a declarative list of named pre-`anti_unify`
+    /// filters, each a PURE predicate on a candidate pair (pass/reject). A pair must
+    /// pass ALL listed filters to reach `anti_unify`. The cascade is a conjunction, so
+    /// order is result-invariant — it sets only short-circuit cost, never recall. Known
+    /// filters:
+    ///   - `coverage` — the §0.3 coverage-fraction filter, scoped to LANDMARK candidacy
+    ///     (a pair also proposed by the bag layer is out of scope and always survives —
+    ///     recall-safe by scope; threshold = `landmark_coverage_min`). It runs in the
+    ///     landmark retriever's phase, not as a per-pair `&Ctx` predicate.
+    ///   - `offset-histogram` — the Shazam Δoffset diagonal (spec §5.6), a consistency
+    ///     predicate over the shared floor-3 subtree evidence.
     ///   - `h-tree` — H-tree-verify, the Δdepth diagonal (docs/substantiality-metric.md
-    ///     §0.5): shared subtrees at consistent RELATIVE depths pass; coincidental
-    ///     landmark collisions at inconsistent depths are dropped before `anti_unify`.
+    ///     §0.5), a consistency predicate over the SAME shared evidence (no extra walk).
     ///
-    /// Both read the SAME single shared-subtree evidence pass, so adding `h-tree` costs
-    /// no extra tree walk. The default `[offset-histogram, h-tree]` was promoted from
-    /// `[offset-histogram]` after the whole-repo + inline-on byte-identical
-    /// `verified_pairs` gate held clean (verified_pairs 187=187, every clone-group set
-    /// identical; only the diagnostic histogram_rejected moved, +98 = 98 fewer
-    /// anti_unify calls at zero recall loss). Unknown names are rejected at config load.
-    /// Matching-time only — hash-neutral, never in the extraction cache key.
-    pub verify: Vec<String>,
+    /// `anti_unify` is deliberately NOT a filter: it is the FIXED TERMINAL producer
+    /// (yields the match, not pass/fail) and the dominant cost, run once on the pairs
+    /// that survive every filter — the cascade exists precisely to minimize how many
+    /// reach it (see its call site in `matchtree`). Keeping it out keeps this list
+    /// homogeneous (pure predicates) and un-misorderable. The default
+    /// `[coverage, offset-histogram, h-tree]` was promoted from `[coverage,
+    /// offset-histogram]` after the whole-repo + inline-on byte-identical `verified_pairs`
+    /// gate held (187=187, every clone-group set identical; only the diagnostic
+    /// histogram_rejected moved, +98 = 98 fewer anti_unify calls). Unknown names error at
+    /// load. Matching-time only — hash-neutral, never in the extraction cache key.
+    pub filters: Vec<String>,
 }
 
 impl Default for RetrievalCfg {
@@ -190,7 +195,11 @@ impl Default for RetrievalCfg {
             shared_landmarks_min: 2,
             owner_pair_window: 0,
             landmark_coverage_min: 0.05,
-            verify: vec!["offset-histogram".into(), "h-tree".into()],
+            filters: vec![
+                "coverage".into(),
+                "offset-histogram".into(),
+                "h-tree".into(),
+            ],
         }
     }
 }
@@ -397,10 +406,8 @@ impl Config {
     fn validate(&self) -> anyhow::Result<()> {
         crate::report::Tier::parse_fail_on(&self.report.fail_on)
             .map_err(|e| anyhow::anyhow!("reprise.toml [report] fail_on: {e}"))?;
-        for name in &self.retrieval.verify {
-            crate::matchtree::validate_verify_criterion(name)
-                .map_err(|e| anyhow::anyhow!("reprise.toml [retrieval] verify: {e}"))?;
-        }
+        crate::matchtree::validate_filters(&self.retrieval.filters)
+            .map_err(|e| anyhow::anyhow!("reprise.toml [retrieval] filters: {e}"))?;
         Ok(())
     }
 }
@@ -410,37 +417,46 @@ mod tests {
     use super::Config;
 
     #[test]
-    fn default_verify_cascade_is_offset_then_h_tree() {
-        // The promoted default: offset-histogram first (incumbent), then h-tree.
+    fn default_filters_are_coverage_offset_h_tree() {
+        // The promoted default: coverage (landmark-scoped) + both consistency filters.
+        // anti_unify is NOT a filter — it is the fixed terminal producer.
         assert_eq!(
-            Config::default().retrieval.verify,
-            vec!["offset-histogram".to_string(), "h-tree".to_string()]
+            Config::default().retrieval.filters,
+            vec![
+                "coverage".to_string(),
+                "offset-histogram".to_string(),
+                "h-tree".to_string(),
+            ]
         );
     }
 
     #[test]
-    fn validate_rejects_an_unknown_verify_criterion() {
-        let toml = r#"[retrieval]
-verify = ["offset-histogram", "bogus"]
-"#;
+    fn validate_rejects_an_unknown_filter() {
+        let toml = "[retrieval]\nfilters = [\"offset-histogram\", \"bogus\"]\n";
         let cfg: Config = toml::from_str(toml).unwrap();
         let err = cfg.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("bogus"),
-            "error names the bad criterion: {err}"
-        );
-        assert!(
-            err.contains("offset-histogram"),
-            "error lists the known set: {err}"
-        );
+        assert!(err.contains("bogus"), "error names the bad filter: {err}");
+        assert!(err.contains("coverage"), "error lists the known set: {err}");
     }
 
     #[test]
-    fn validate_accepts_the_known_criteria_in_any_order() {
-        let toml = r#"[retrieval]
-verify = ["h-tree", "offset-histogram"]
-"#;
+    fn validate_rejects_anti_unify_as_a_filter() {
+        // anti_unify is the fixed terminal, never a filter — listing it is an error.
+        let toml = "[retrieval]\nfilters = [\"offset-histogram\", \"anti-unify\"]\n";
         let cfg: Config = toml::from_str(toml).unwrap();
-        assert!(cfg.validate().is_ok());
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_reordered_and_empty_filter_lists() {
+        // Filters are reorder-safe (a conjunction); an empty list is legal
+        // (anti_unify still runs as the fixed terminal).
+        for spec in [
+            "filters = [\"h-tree\", \"offset-histogram\", \"coverage\"]",
+            "filters = []",
+        ] {
+            let cfg: Config = toml::from_str(&format!("[retrieval]\n{spec}\n")).unwrap();
+            assert!(cfg.validate().is_ok(), "should accept: {spec}");
+        }
     }
 }
