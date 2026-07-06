@@ -2,12 +2,11 @@
 //! every synthesis and recursion helper is shared in [`super`]. Contrast the historical
 //! `src/lang/rust.rs` (the full per-grammar normalizer): this is a small fraction of it.
 
+use super::Lowering as L;
 use super::{
-    Frontend, bind_pattern_idents, block, block_wrap, drop_parens, eq_guard, ext_name, leaf, lit,
-    lower_assign, lower_aug_assign, lower_binary, lower_call, lower_field, lower_for,
-    lower_function, lower_if, lower_loop, lower_pattern, lower_return, lower_source,
-    lower_unary_positional, lower_unit, lower_while, make_arm, make_branch, make_index,
-    make_lambda, make_multi_assign, matches_guard, native, push_else_arm, unwrap_stmt, var,
+    Frontend, bind_pattern_idents, block_wrap, eq_guard, lower_assign, lower_pattern, lower_source,
+    lower_unit, make_arm, make_branch, make_index, make_lambda, make_multi_assign, matches_guard,
+    native, push_else_arm,
 };
 use crate::ir::kind;
 use crate::ir::transform::TransformLog;
@@ -33,6 +32,92 @@ pub fn lower_rust_source(src: &str) -> Option<(NormNode, TransformLog)> {
 
 pub(crate) struct Rust;
 
+/// The data-driven Rust dispatch table (D-SP4-1b; `docs/sp4-grammar-lift-plan.md` §4): every
+/// **uniform** `lower_node` arm — a CST kind handled by a *shared* [`super`] helper — lives
+/// here as data, so each referenced kind is enumerable (a MAP key) for the increment-5
+/// conformance gate. The runtime dispatch reads this exact table via [`super::lookup`] +
+/// [`super::dispatch`]; the irreducible Rust-local quirks the table can't express stay
+/// hand-written residue (see [`RESIDUE_KINDS`]).
+const MAP: &[(&str, super::Lowering)] = &[
+    ("function_item", L::Function),
+    ("block", L::Block),
+    ("loop_expression", L::Loop),
+    ("while_expression", L::While),
+    ("for_expression", L::For("pattern", "value")),
+    ("if_expression", L::If),
+    ("unary_expression", L::UnaryPositional),
+    ("return_expression", L::Return),
+    ("call_expression", L::Call("function", "arguments")),
+    ("field_expression", L::Field("value", "field")),
+    ("binary_expression", L::Binary("left", "operator", "right")),
+    (
+        "compound_assignment_expr",
+        L::AugAssign("left", "operator", "right", false),
+    ),
+    ("break_expression", L::Leaf(kind::BREAK)),
+    ("continue_expression", L::Leaf(kind::CONTINUE)),
+    ("integer_literal", L::Lit(Bucket::Int)),
+    ("float_literal", L::Lit(Bucket::Float)),
+    ("string_literal", L::Lit(Bucket::Str)),
+    ("raw_string_literal", L::Lit(Bucket::Str)),
+    ("char_literal", L::Lit(Bucket::Char)),
+    ("boolean_literal", L::Lit(Bucket::Bool)),
+    ("identifier", L::Var),
+    // Field/type/primitive names are external by structure (§5.2.4 exception).
+    ("field_identifier", L::ExtName),
+    ("type_identifier", L::ExtName),
+    ("primitive_type", L::ExtName),
+    ("shorthand_field_identifier", L::ExtName),
+    ("expression_statement", L::Unwrap),
+    // Binding patterns that merely wrap a name (`mut x`, `&x`): unwrap to the name.
+    ("mut_pattern", L::Unwrap),
+    ("reference_pattern", L::Unwrap),
+    ("parenthesized_expression", L::DropParens),
+    // Comments, attributes, lifetimes and the bare `mut` specifier carry no similarity
+    // signal — dropped (spec §5.2.1/§5.2.7; Type-1 convergence).
+    ("line_comment", L::Drop),
+    ("block_comment", L::Drop),
+    ("attribute_item", L::Drop),
+    ("inner_attribute_item", L::Drop),
+    ("mutable_specifier", L::Drop),
+    ("lifetime", L::Drop),
+];
+
+/// Tree-sitter kinds the hand-written Rust residue references but the shared [`MAP`] does
+/// not — registered as data so the increment-5 conformance gate can enumerate EVERY kind the
+/// frontend references (MAP keys ∪ `RESIDUE_KINDS`) and assert each still exists in the linked
+/// grammar. The residue is the irreducible per-language quirks the table can't express:
+/// subject-folded `match` ([`lower_match`]), tuple-assign ([`lower_assignment_rust`]), the
+/// `let` binding rule ([`lower_let_rust`]), and the non-uniform inline lowerings
+/// (`index`/`reference`/`range`/`closure`) — plus the tail-return path ([`Rust::lower_fn_body`]
+/// → [`lower_tail`]/[`return_tail`]) and the deeper discriminants those helpers test.
+///
+/// One residue reference is a *suffix* match, not a fixed kind: [`return_tail`] treats any
+/// `*_item` node as a non-value. That is enumerated structurally by the gate, not as a string.
+// Registered-now/consumed-later: the increment-5 conformance gate is this list's first
+// non-test reader (increment 1 only makes the residue kinds enumerable as data). The table
+// invariant test already exercises it, so this `allow` is scoped to the plain library build.
+#[allow(dead_code)]
+const RESIDUE_KINDS: &[&str] = &[
+    // Dispatched from `lower_node`'s residue arm (a table miss → a Rust-local lowering).
+    "match_expression",      // subject-fold → Branch (lower_match)
+    "reference_expression",  // &x / &mut x → Unop (lower_reference)
+    "range_expression",      // a..b / a..=b → Binop (lower_range)
+    "closure_expression",    // |x| e → Lambda (lower_closure)
+    "index_expression",      // xs[i] → Index (inline make_index)
+    "let_declaration",       // let PAT = v (lower_let_rust)
+    "assignment_expression", // x = v / (a, b) = (X, Y) (lower_assignment_rust)
+    // Referenced only by the tail-return residue (return_tail's non-value guards).
+    "use_declaration",
+    "empty_statement",
+    "macro_definition",
+    // Internal discriminants of the residue helpers (still grammar-coupled strings).
+    "match_arm",        // lower_match arm iteration
+    "match_pattern",    // literal_pattern_value
+    "negative_literal", // literal_pattern_value (a literal match arm)
+    "tuple_expression", // lower_assignment_rust parallel-assign detection
+];
+
 impl Frontend for Rust {
     fn lower_node(
         &self,
@@ -41,61 +126,22 @@ impl Frontend for Rust {
         src: &str,
         log: &mut TransformLog,
     ) -> Option<NormNode> {
+        // The uniform arms are data (`MAP`): look the kind up, dispatch to its shared helper.
+        // A hit that returns `None` is a deliberately-dropped node (`Lowering::Drop`, or an
+        // `Unwrap`/`DropParens` that found nothing) — NOT a miss, so it never reaches residue.
+        if let Some(entry) = super::lookup(MAP, node.kind()) {
+            return super::dispatch(entry, self, node, field, src, log);
+        }
+        // Table miss → the Rust-local residue (kinds registered in `RESIDUE_KINDS`): the
+        // irreducible quirks the shared table can't express — subject-folded `match`,
+        // tuple-`=`, the `let` binding rule — plus the non-uniform inline lowerings. Anything
+        // else is an unmodeled `native` leaf.
         let span = (node.start_byte() as u32, node.end_byte() as u32);
         match node.kind() {
-            "function_item" => Some(lower_function(self, node, field, span, src, log)),
-            "block" => Some(block(self, node, field, span, src, log)),
-            "loop_expression" => Some(lower_loop(self, node, field, span, src, log)),
-            "while_expression" => Some(lower_while(self, node, field, span, src, log)),
-            "for_expression" => Some(lower_for(
-                self,
-                node,
-                field,
-                span,
-                ("pattern", "value"),
-                src,
-                log,
-            )),
-            "if_expression" => Some(lower_if(self, node, field, span, src, log)),
             "match_expression" => Some(lower_match(self, node, field, span, src, log, false)),
-            "unary_expression" => Some(lower_unary_positional(self, node, field, span, src, log)),
             "reference_expression" => Some(lower_reference(self, node, field, span, src, log)),
             "range_expression" => Some(lower_range(self, node, field, span, src, log)),
             "closure_expression" => Some(lower_closure(self, node, field, span, src, log)),
-            "break_expression" => Some(leaf(kind::BREAK, field, span)),
-            "continue_expression" => Some(leaf(kind::CONTINUE, field, span)),
-            "expression_statement" => unwrap_stmt(self, node, field, src, log),
-            // Comments, attributes, lifetimes and the bare `mut` specifier carry no
-            // similarity signal — dropped (spec §5.2.1/§5.2.7; Type-1 convergence).
-            "line_comment"
-            | "block_comment"
-            | "attribute_item"
-            | "inner_attribute_item"
-            | "mutable_specifier"
-            | "lifetime" => None,
-            // Binding patterns that merely wrap a name (`mut x`, `&x`): unwrap to the name
-            // (the stripped `mut`/`&` drop out), so the binding stays a plain `@target`.
-            "mut_pattern" | "reference_pattern" => unwrap_stmt(self, node, field, src, log),
-            "call_expression" => Some(lower_call(
-                self,
-                node,
-                field,
-                span,
-                ("function", "arguments"),
-                src,
-                log,
-            )),
-            "return_expression" => Some(lower_return(self, node, field, span, src, log)),
-            "parenthesized_expression" => drop_parens(self, node, field, span, src, log),
-            "field_expression" => Some(lower_field(
-                self,
-                node,
-                field,
-                span,
-                ("value", "field"),
-                src,
-                log,
-            )),
             "index_expression" => {
                 let base = node
                     .named_child(0)
@@ -105,42 +151,11 @@ impl Frontend for Rust {
                     .and_then(|n| self.lower_node(n, Some("idx"), src, log));
                 Some(make_index(base, idx, field, span))
             }
-            "binary_expression" => Some(lower_binary(
-                self,
-                node,
-                field,
-                span,
-                ("left", "operator", "right"),
-                src,
-                log,
-            )),
             // `let x = …` binds; `x = …` (`assignment_expression`) mutates.
             "let_declaration" => Some(lower_let_rust(self, node, field, span, src, log)),
             "assignment_expression" => {
                 Some(lower_assignment_rust(self, node, field, span, src, log))
             }
-            "compound_assignment_expr" => Some(lower_aug_assign(
-                self,
-                node,
-                ("left", "operator", "right", false),
-                field,
-                span,
-                src,
-                log,
-            )),
-            "integer_literal" => Some(lit(node, field, span, Bucket::Int, src, log)),
-            "float_literal" => Some(lit(node, field, span, Bucket::Float, src, log)),
-            "string_literal" | "raw_string_literal" => {
-                Some(lit(node, field, span, Bucket::Str, src, log))
-            }
-            "char_literal" => Some(lit(node, field, span, Bucket::Char, src, log)),
-            "boolean_literal" => Some(lit(node, field, span, Bucket::Bool, src, log)),
-            "identifier" => Some(var(node, field, span, src)),
-            // Field/type/primitive names are external by structure (§5.2.4 exception).
-            "field_identifier"
-            | "type_identifier"
-            | "primitive_type"
-            | "shorthand_field_identifier" => Some(ext_name(node, field, span, src)),
             _ => Some(native(self, node, field, span, src, log)),
         }
     }
@@ -541,6 +556,22 @@ mod tests {
     fn abs(src: &str) -> String {
         let (ir, _) = rust(src);
         to_sexpr(&crate::ir::abstract_idents(ir))
+    }
+
+    #[test]
+    fn dispatch_table_is_a_consistent_single_source_of_truth() {
+        // The table is the SP4 gate's source of truth (D-SP4-1b), so every referenced kind
+        // must be data in EXACTLY one place: a unique MAP key OR a residue kind, never both.
+        use std::collections::HashSet;
+        let mut keys = HashSet::new();
+        for (k, _) in super::MAP {
+            assert!(keys.insert(*k), "duplicate MAP key: {k}");
+        }
+        let mut residue = HashSet::new();
+        for k in super::RESIDUE_KINDS {
+            assert!(residue.insert(*k), "duplicate residue kind: {k}");
+            assert!(!keys.contains(k), "kind {k} is both a MAP key and residue");
+        }
     }
 
     #[test]

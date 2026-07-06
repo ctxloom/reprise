@@ -82,6 +82,121 @@ pub(crate) trait Frontend {
     }
 }
 
+// ---- data-driven dispatch table (D-SP4-1b; docs/sp4-grammar-lift-plan.md §4) ----
+
+/// One entry of a frontend's `lower_node` dispatch table: **which shared lowering handles a
+/// CST kind**, plus the per-language CST field names / literal bucket that lowering needs.
+/// Each variant names one shared helper in this module; the [`dispatch`] runner turns an
+/// entry back into that helper's call.
+///
+/// This is the SP4 grammar-lift's single source of truth. A frontend's
+/// `const MAP: &[(&str, Lowering)]` makes every dispatched CST kind enumerable **as data**,
+/// so a future conformance gate (increment 5) can read the *same* table the runtime dispatch
+/// reads and assert every referenced kind still exists in the linked tree-sitter grammar —
+/// turning today's silent grammar drift (a renamed kind falls through to `native()` with a
+/// green build) into a loud, localized test failure. Because the table *is* the dispatch,
+/// completeness is structural rather than a parallel hand-maintained list. The irreducible
+/// per-language quirks the table cannot express stay hand-written residue, their kinds
+/// registered separately but still as data.
+///
+/// Reused unchanged by every frontend — only a table's *contents* are per-language; the
+/// vocabulary of shared lowerings is shared (Rust adopts it here; Python/Go in later
+/// increments).
+#[derive(Clone, Copy)]
+pub(crate) enum Lowering {
+    /// [`lower_function`] — a function/method unit.
+    Function,
+    /// [`block`] — a statement block.
+    Block,
+    /// [`lower_loop`] — an already-canonical infinite loop.
+    Loop,
+    /// [`lower_while`] — a `while` (break-guard synthesis).
+    While,
+    /// [`lower_if`] — an `if`/`else` conditional.
+    If,
+    /// [`lower_for`] with the `(pattern, iterable)` CST field names.
+    For(&'static str, &'static str),
+    /// [`lower_unary_positional`] — `<op> operand` with a positional operator token.
+    UnaryPositional,
+    /// [`lower_return`].
+    Return,
+    /// [`lower_call`] with the `(callee, arguments)` CST field names.
+    Call(&'static str, &'static str),
+    /// [`lower_field`] with the `(base, name)` CST field names.
+    Field(&'static str, &'static str),
+    /// [`lower_binary`] with the `(left, operator, right)` CST field names.
+    Binary(&'static str, &'static str, &'static str),
+    /// [`lower_aug_assign`] with `(left, operator, right, target_is_binding)`.
+    AugAssign(&'static str, &'static str, &'static str, bool),
+    /// [`lit`] into the given typed bucket.
+    Lit(Bucket),
+    /// [`leaf`] — a childless canonical node of the given `kind::*` (e.g. `Break`/`Continue`).
+    Leaf(&'static str),
+    /// [`var`] — a local read (`Raw`-labelled, later abstracted).
+    Var,
+    /// [`ext_name`] — a structurally-external name (field/type/package), never a local.
+    ExtName,
+    /// [`unwrap_stmt`] — splice through a wrapper to its first lowerable child (`Option`).
+    Unwrap,
+    /// [`drop_parens`] — drop redundant parentheses, recording `ParenDrop` (`Option`).
+    DropParens,
+    /// The node carries no similarity signal — dropped (`None`).
+    Drop,
+}
+
+/// Look up a CST `kind` in a frontend's dispatch table. `Some` ⇒ the table handles this kind
+/// (feed it to [`dispatch`]); `None` ⇒ a table *miss* the frontend resolves via its own
+/// hand-written residue (or a `native` leaf). Kept distinct from [`dispatch`] precisely so a
+/// table *hit* that legitimately drops the node ([`Lowering::Drop`] → `None`) is never
+/// confused with a miss.
+pub(crate) fn lookup<'a>(map: &'a [(&str, Lowering)], kind: &str) -> Option<&'a Lowering> {
+    map.iter().find(|(k, _)| *k == kind).map(|(_, l)| l)
+}
+
+/// Run one dispatch-table entry: reconstruct the shared-helper call the [`Lowering`] names,
+/// keyed off `node`'s span. A `None` result is a *lowered-away* node (a dropped/spliced
+/// wrapper), distinct from a table miss (see [`lookup`]). The single dispatch runner every
+/// frontend shares — the runtime half of the table that is the gate's source of truth.
+pub(crate) fn dispatch(
+    entry: &Lowering,
+    fe: &dyn Frontend,
+    node: Node,
+    field: Option<&str>,
+    src: &str,
+    log: &mut TransformLog,
+) -> Option<NormNode> {
+    let span = span_of(node);
+    match *entry {
+        Lowering::Function => Some(lower_function(fe, node, field, span, src, log)),
+        Lowering::Block => Some(block(fe, node, field, span, src, log)),
+        Lowering::Loop => Some(lower_loop(fe, node, field, span, src, log)),
+        Lowering::While => Some(lower_while(fe, node, field, span, src, log)),
+        Lowering::If => Some(lower_if(fe, node, field, span, src, log)),
+        Lowering::For(pat, iter) => Some(lower_for(fe, node, field, span, (pat, iter), src, log)),
+        Lowering::UnaryPositional => Some(lower_unary_positional(fe, node, field, span, src, log)),
+        Lowering::Return => Some(lower_return(fe, node, field, span, src, log)),
+        Lowering::Call(f, a) => Some(lower_call(fe, node, field, span, (f, a), src, log)),
+        Lowering::Field(b, n) => Some(lower_field(fe, node, field, span, (b, n), src, log)),
+        Lowering::Binary(l, o, r) => Some(lower_binary(fe, node, field, span, (l, o, r), src, log)),
+        Lowering::AugAssign(l, o, r, bind) => Some(lower_aug_assign(
+            fe,
+            node,
+            (l, o, r, bind),
+            field,
+            span,
+            src,
+            log,
+        )),
+        Lowering::Lit(bucket) => Some(lit(node, field, span, bucket, src, log)),
+        Lowering::Leaf(k) => Some(leaf(k, field, span)),
+        Lowering::Var => Some(var(node, field, span, src)),
+        Lowering::ExtName => Some(ext_name(node, field, span, src)),
+        Lowering::Unwrap => unwrap_stmt(fe, node, field, src, log),
+        Lowering::DropParens => drop_parens(fe, node, field, span, src, log),
+        Lowering::Drop => None,
+    }
+}
+
 /// Lower one function CST node to canonical IR, recording every lowering-time
 /// normalization into `log` (D-IR-12 construct-and-record). The caller owns the sink:
 /// a [`TransformLog::disabled`] one makes recording a zero-cost no-op without changing
