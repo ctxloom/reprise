@@ -58,6 +58,16 @@ bench-mutations-ir:
 bench-mutations-historical:
     REPRISE_NORMALIZER=historical cargo test --test mutation_recall -- --nocapture
 
+# Retrieval bake-off (docs/substantiality-metric.md §0.4): races the REAL
+# `matchtree::Retriever` seam — the shipping landmark retriever over
+# `matchtree::build_reps` — against canonical alternatives (minhash-lsh,
+# winnowing/MOSS, sourcerer-rare) that implement the SAME trait bench-side, judged
+# by a retriever-independent oracle (verify-on-union ACCEPT + synthetic mutants).
+# Fidelity is automatic: the incumbent IS the production code, not a reconstruction.
+# Pass roots as extra args (default: src). Mirrors `just bench-mutations`.
+bench-retrieval *ROOTS:
+    cargo run --release --example bakeoff -- {{ROOTS}}
+
 # Dogfood: the tool scans its own repo (spec §3)
 scan-self:
     cargo run --release -- scan .

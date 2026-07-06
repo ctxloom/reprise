@@ -2,21 +2,27 @@
 //!
 //! GOAL: answer with data whether the novel landmark/Shazam retriever earns its keep
 //! versus canonical alternatives, measured against an oracle INDEPENDENT of any single
-//! retriever. Generalizes `examples/lm_validate.rs`: the landmark reconstruction, the
-//! rep/feature substrate, and the trusted `size_gate -> offset_histogram -> anti_unify`
-//! verify chain are reused verbatim; a swappable `candidates(reps) -> Vec<(rep,rep)>`
-//! slot lets each retriever be evaluated on the SAME features + SAME labeling.
+//! retriever.
 //!
-//! Retrievers (all on the shared IR subtree bag substrate):
-//!   1. reprise-landmark  — incumbent: rare-peak constellation triples (matchtree.rs verbatim).
-//!   2. minhash-lsh       — bag-Jaccard over the floor-6 bag_set, MinHash sig + LSH banding.
-//!   3. winnowing         — MOSS-style k-gram winnowing over the floor-3 ordered subtree stream.
+//! FIDELITY IS NOW AUTOMATIC. The incumbent races the REAL production code: candidates
+//! come from `matchtree::Landmark` (the shipping retriever) over `matchtree::build_reps`
+//! (the shipping substrate) — no reconstruction to drift. The alternatives implement the
+//! SAME `matchtree::Retriever` trait bench-side, so every entrant is invoked through the
+//! identical seam the pipeline uses.
+//!
+//! Retrievers (all `matchtree::Retriever` over the shared `RepData` substrate):
+//!   1. reprise-landmark  — incumbent: the real `matchtree::Landmark` (rare-peak
+//!      constellation triples), invoked through the production trait.
+//!   2. minhash-lsh       — bag-Jaccard over `RepData::bag_set`, MinHash sig + LSH banding.
+//!   3. winnowing         — MOSS-style k-gram winnowing over the floor-3 ordered subtree
+//!      stream derived from `RepData::offsets`.
 //!   4. sourcerer-rare    — inverted rare-feature overlap (landmark's rare peaks WITHOUT the
 //!      triples): the ablation isolating whether the constellation earns its keep.
 //!
 //! Oracles (retriever-independent):
-//!   (A) verify-on-union — union all four retrievers' candidates, run the trusted verify chain;
-//!       pairs that ACCEPT = the positive set. recall = fraction of that verified-union surfaced.
+//!   (A) verify-on-union — union all retrievers' candidates, run the trusted verify chain
+//!       (size gate -> offset histogram -> anti_unify); pairs that ACCEPT = the positive
+//!       set. recall = fraction of that verified-union surfaced.
 //!   (B) synthetic — bench-mutations seed<->mutant pairs, known clones by construction.
 //!
 //! Usage: cargo run --release --example bakeoff -- [<root> ...]   (default root: src)
@@ -24,268 +30,53 @@
 use rayon::prelude::*;
 use reprise::au;
 use reprise::config::Config;
-use reprise::fingerprint::{self, HashMode, Subtree};
 use reprise::lang::Lang;
+use reprise::matchtree::{self, RepData, RetrievalStats, Retriever};
 use reprise::unit::{self, Unit};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
 use std::path::PathBuf;
 use std::time::Instant;
 use xxhash_rust::xxh3::xxh3_128;
 
-/// A set of unit-index pairs (canonical min < max).
-type PairSet = HashSet<(usize, usize)>;
 /// A list of rep-index pairs (a retriever's candidate output).
-type RepPairs = Vec<(u32, u32)>;
-
-/// Whether `lang` extracts via the IR normalizer (mirrors the crate-private `unit::is_ir`).
-fn is_ir(lang: Lang, cfg: &Config) -> bool {
-    cfg.normalize.normalizer == "ir" && reprise::frontend::has_ir_frontend(lang)
-}
-
-// ============================ shared feature substrate ============================
-
-/// Per-eligible-unit features. ALL retrievers draw from the one subtree inventory
-/// (`subtree_inventory(tree, 3, MaskedLocals)`); which slice each uses is documented
-/// per field so any feature difference is attributable to the retrieval *scheme*.
-struct Rep {
-    unit_idx: usize,
-    /// Floor-6 dedup subtree-hash set (matchtree's `bag_set`, the D16 bag layer's features).
-    /// Substrate for MinHash+LSH.
-    bag_set: Vec<u128>,
-    /// Floor-3 subtree-hash -> sorted offsets, hash-sorted: the histogram-verify inventory
-    /// (shared, retriever-independent — it is part of the trusted oracle chain, not retrieval).
-    offsets: Vec<(u128, Vec<u32>)>,
-    /// Floor-3 rare peaks `(offset, hash)` with `df <= rare_cap` (df over floor-6 bag_set),
-    /// sorted by offset. The EXACT set matchtree pairs into triples. Substrate for landmark
-    /// (constellation) and sourcerer (bare overlap) — the ablation shares this substrate exactly.
-    rare_peaks: Vec<(u32, u128)>,
-    /// Dedup sorted rare-peak hashes. Substrate for sourcerer.
-    rare_set: Vec<u128>,
-    /// Floor-3 subtree hashes in pre-order (offset order), folded to u64. Substrate for winnowing.
-    stream: Vec<u64>,
-    /// SWEEP EXTENSION: full floor-3 inventory with tree metadata (offset, hash, tokens, depth,
-    /// kind-salience tier), offset-sorted. Substrate for the H-tree-*, H-peak-cap, H-floor-align,
-    /// and H-salience variants. Additive — does not alter the fields the four incumbent
-    /// retrievers read, so their measurements are unchanged.
-    nodes3: Vec<Node3>,
-}
-
-/// SWEEP EXTENSION: one floor-3 subtree with the tree metadata the alternate landmark
-/// DEFINITIONS need. `depth` is the tree depth (all NormNodes counted), `kind_code` the
-/// salience tier of the subtree root (0 low / 1 med / 2 high). The subtree spans pre-order
-/// node indices `[offset, offset+tokens)` (token_count == node count, D1), so containment
-/// between two Node3 is a cheap span test.
-#[derive(Clone, Copy)]
-struct Node3 {
-    offset: u32,
-    hash: u128,
-    tokens: u32,
-    depth: u16,
-    kind_code: u8,
-}
-
-/// One language partition: the rep set plus the unit-index<->rep-index maps.
-struct LangCorpus {
-    lang: Lang,
-    ir: bool,
-    reps: Vec<Rep>,
-    /// SWEEP EXTENSION: corpus df over the floor-6 bag_set (the incumbent rare test's df,
-    /// which the `unwrap_or(0)` leak reads — floor-3 sub-floor subtrees are absent, df 0).
-    df6: HashMap<u128, u32>,
-    /// SWEEP EXTENSION: corpus df over the FULL floor-3 inventory (H-floor-align's real df —
-    /// 3..6-token subtrees get a genuine count instead of leaking to 0/rare-by-default).
-    df3: HashMap<u128, u32>,
-    /// SWEEP EXTENSION: the incumbent `rare_cap = 3.max(units/20)`.
-    rare_cap: u32,
-}
+type RepPairs = Vec<(usize, usize)>;
 
 fn fold128(h: u128) -> u64 {
     (h as u64) ^ ((h >> 64) as u64)
 }
 
-// ============================ SWEEP EXTENSION: tree metadata helpers ============================
+// ============================ shared substrate: the REAL RepData ============================
 
-/// Salience tier of an IR node kind (H-salience). HIGH (2) = control-flow, calls, opaque
-/// native constructs — the discriminative skeleton. MED (1) = operators / assignment / index /
-/// lambda. LOW (0) = structure and leaves (Block/Field/Var/Lit/Unit) and language operator
-/// tokens. The corpus is IR-normalized (Rust/Python/Go frontends), so kinds are the canonical
-/// vocabulary in `ir::kind` (or a language token). Unknown kinds default LOW.
-fn kind_tier(kind: &str) -> u8 {
-    match kind {
-        "Branch" | "Loop" | "Arm" | "Return" | "Break" | "Continue" | "Call" | "Iter"
-        | "NativeStmt" | "NativeExpr" | "NativePat" | "NativeType" => 2,
-        "Binop" | "Unop" | "Assign" | "Index" | "Lambda" => 1,
-        _ => 0,
-    }
+/// One language partition: the REAL production reps (`matchtree::build_reps`) plus the
+/// language metadata the oracle's anti_unify needs. Every retriever and the oracle read
+/// this same substrate, so any difference is attributable to the retrieval *scheme*.
+struct LangCorpus {
+    lang: Lang,
+    ir: bool,
+    reps: Vec<RepData>,
 }
 
-/// Pre-order walk assigning each NormNode its offset (a per-node counter, matching
-/// `fingerprint::walk_inventory`'s numbering — node before children, children in order) and
-/// recording `(depth, kind_tier)`. `out[offset]` is dense over `0..node_count`, so it joins
-/// against `subtree_inventory` (which shares the numbering) by offset.
-fn preorder_dk(
-    node: &reprise::tree::NormNode,
-    depth: u16,
-    ctr: &mut u32,
-    out: &mut Vec<(u16, u8)>,
-) {
-    out.push((depth, kind_tier(&node.kind)));
-    *ctr += 1;
-    for c in &node.children {
-        preorder_dk(c, depth + 1, ctr, out);
-    }
-}
-
-/// Build the shared substrate for one language, mirroring matchtree.rs / lm_validate.rs.
 fn build_lang_corpus(units: &[Unit], lang: Lang, cfg: &Config) -> Option<LangCorpus> {
-    let ir = is_ir(lang, cfg);
-    let floor = cfg.min_unit_floor();
-    let mut seen_fp = HashSet::new();
-    let eligible: Vec<usize> = units
-        .iter()
-        .enumerate()
-        .filter(|(_, u)| u.lang == lang && u.token_count >= floor)
-        .filter(|(_, u)| seen_fp.insert(u.fingerprint))
-        .map(|(idx, _)| idx)
-        .collect();
-    if eligible.len() < 2 {
+    let reps = matchtree::build_reps(units, lang, cfg);
+    if reps.len() < 2 {
         return None;
     }
-
-    // reps: floor-3 inventory -> offsets + stream; floor-6 -> bag_set.
-    struct Partial {
-        unit_idx: usize,
-        bag_set: Vec<u128>,
-        offsets: Vec<(u128, Vec<u32>)>,
-        stream: Vec<u64>,
-        nodes3: Vec<Node3>,
-    }
-    let mut partials: Vec<Partial> = eligible
-        .par_iter()
-        .map(|&idx| {
-            let inv: Vec<Subtree> =
-                fingerprint::subtree_inventory(&units[idx].tree, 3, HashMode::MaskedLocals);
-            // SWEEP EXTENSION: parallel pre-order (depth, kind_tier) per node offset, joined to
-            // the floor-3 inventory to build nodes3 (offset-sorted).
-            let mut dk: Vec<(u16, u8)> = Vec::new();
-            let mut ctr = 0u32;
-            preorder_dk(&units[idx].tree, 0, &mut ctr, &mut dk);
-            let mut nodes3: Vec<Node3> = inv
-                .iter()
-                .map(|s| {
-                    let (depth, kind_code) = dk[s.offset as usize];
-                    Node3 {
-                        offset: s.offset,
-                        hash: s.hash,
-                        tokens: s.tokens,
-                        depth,
-                        kind_code,
-                    }
-                })
-                .collect();
-            nodes3.sort_unstable_by_key(|n| n.offset);
-            // offsets (hash-sorted, hash -> offsets)
-            let mut flat: Vec<(u128, u32)> = inv.iter().map(|s| (s.hash, s.offset)).collect();
-            flat.sort_unstable();
-            let mut offsets: Vec<(u128, Vec<u32>)> = Vec::new();
-            for (h, o) in &flat {
-                match offsets.last_mut() {
-                    Some((last, offs)) if last == h => offs.push(*o),
-                    _ => offsets.push((*h, vec![*o])),
-                }
-            }
-            // stream: floor-3 hashes in pre-order (offset order)
-            let mut by_off: Vec<(u32, u128)> = inv.iter().map(|s| (s.offset, s.hash)).collect();
-            by_off.sort_unstable();
-            let stream: Vec<u64> = by_off.iter().map(|(_, h)| fold128(*h)).collect();
-            // bag_set: floor-6
-            let mut bag_set: Vec<u128> = inv
-                .iter()
-                .filter(|s| s.tokens >= cfg.thresholds.bag_min_subtree_tokens)
-                .map(|s| s.hash)
-                .collect();
-            bag_set.sort_unstable();
-            bag_set.dedup();
-            Partial {
-                unit_idx: idx,
-                bag_set,
-                offsets,
-                stream,
-                nodes3,
-            }
-        })
-        .collect();
-
-    // corpus df over floor-6 bag_set; rare_cap identical to matchtree.
-    let mut df: HashMap<u128, u32> = HashMap::new();
-    for p in &partials {
-        for h in &p.bag_set {
-            *df.entry(*h).or_insert(0) += 1;
-        }
-    }
-    // SWEEP EXTENSION: corpus df over the FULL floor-3 inventory (one count per unit per hash,
-    // matching how df6 counts the deduped bag_set) — H-floor-align's leak-free df.
-    let mut df3: HashMap<u128, u32> = HashMap::new();
-    for p in &partials {
-        for (h, _) in &p.offsets {
-            *df3.entry(*h).or_insert(0) += 1;
-        }
-    }
-    let rare_cap = 3.max(partials.len() as u32 / 20);
-
-    let reps: Vec<Rep> = partials
-        .drain(..)
-        .map(|p| {
-            let mut rare_peaks: Vec<(u32, u128)> = p
-                .offsets
-                .iter()
-                .filter(|(h, _)| df.get(h).copied().unwrap_or(0) <= rare_cap)
-                .flat_map(|(h, offs)| offs.iter().map(move |o| (*o, *h)))
-                .collect();
-            rare_peaks.sort_unstable();
-            let mut rare_set: Vec<u128> = rare_peaks.iter().map(|(_, h)| *h).collect();
-            rare_set.sort_unstable();
-            rare_set.dedup();
-            Rep {
-                unit_idx: p.unit_idx,
-                bag_set: p.bag_set,
-                offsets: p.offsets,
-                rare_peaks,
-                rare_set,
-                stream: p.stream,
-                nodes3: p.nodes3,
-            }
-        })
-        .collect();
-
-    Some(LangCorpus {
-        lang,
-        ir,
-        reps,
-        df6: df,
-        df3,
-        rare_cap,
-    })
+    let ir = cfg.normalize.normalizer == "ir" && reprise::frontend::has_ir_frontend(lang);
+    Some(LangCorpus { lang, ir, reps })
 }
 
-// ============================ generic shared-count retrieval ============================
+// ============================ bench-side alternative retrievers ============================
+//
+// Each implements the SAME `matchtree::Retriever` trait the production landmark retriever
+// implements, reading the shared `RepData` substrate via its public accessors. They live
+// bench-side (not shipped) but race through the identical trait seam.
 
 /// Candidate pairs sharing >= `min_shared` features, skipping features owned by more than
-/// `df_cap` units. Full clique per feature (matchtree uses owner_pair_window=0 by default).
-/// Returns rep-index pairs (i < j).
-fn shared_count_pairs<F>(
-    reps: &[Rep],
-    feats: F,
-    df_cap: usize,
-    min_shared: usize,
-) -> Vec<(u32, u32)>
-where
-    F: Fn(&Rep) -> &[u128],
-{
+/// `df_cap` units. Full clique per feature (matches the incumbent's owner_pair_window=0).
+fn shared_count_pairs(feats: &[Vec<u128>], df_cap: usize, min_shared: usize) -> RepPairs {
     let mut owners: HashMap<u128, Vec<u32>> = HashMap::new();
-    for (i, rep) in reps.iter().enumerate() {
-        for &h in feats(rep) {
+    for (i, f) in feats.iter().enumerate() {
+        for &h in f {
             owners.entry(h).or_default().push(i as u32);
         }
     }
@@ -303,83 +94,86 @@ where
     counts
         .into_iter()
         .filter(|&(_, c)| c as usize >= min_shared)
-        .map(|(p, _)| p)
+        .map(|((a, b), _)| (a as usize, b as usize))
         .collect()
 }
 
-// ---- retriever 1: reprise-landmark (matchtree.rs verbatim) ----
-
-/// Constellation triple hashes for one rep (matchtree.rs:154-176 verbatim).
-fn landmark_hashes(rep: &Rep) -> Vec<u128> {
-    const FAN_OUT: usize = 3;
-    let rare = &rep.rare_peaks; // already offset-sorted
-    let mut out = Vec::new();
-    for i in 0..rare.len() {
-        for j in i + 1..(i + 1 + FAN_OUT).min(rare.len()) {
-            let delta = (rare[j].0 - rare[i].0) / 8;
-            let mut buf = Vec::with_capacity(36);
-            buf.extend_from_slice(&rare[i].1.to_le_bytes());
-            buf.extend_from_slice(&rare[j].1.to_le_bytes());
-            buf.extend_from_slice(&delta.to_le_bytes());
-            out.push(xxh3_128(&buf));
-        }
-    }
-    out.sort_unstable();
-    out.dedup();
-    out
-}
-
-/// Landmark retrieval at a configurable `min_shared` (matchtree default 2, D22 used 4).
-fn retr_landmark_ms(reps: &[Rep], min_shared: usize) -> (Vec<(u32, u32)>, usize) {
-    let lms: Vec<Vec<u128>> = reps.par_iter().map(landmark_hashes).collect();
-    let entries: usize = lms.iter().map(|l| l.len()).sum();
-    let mut owners: HashMap<u128, Vec<u32>> = HashMap::new();
-    for (i, l) in lms.iter().enumerate() {
-        for &h in l {
-            owners.entry(h).or_default().push(i as u32);
-        }
-    }
-    let df_cap = 50usize;
-    let mut counts: HashMap<(u32, u32), u32> = HashMap::new();
-    for own in owners.values() {
-        if own.len() < 2 || own.len() > df_cap {
-            continue;
-        }
-        for a in 0..own.len() {
-            for b in a + 1..own.len() {
-                *counts.entry((own[a], own[b])).or_insert(0) += 1;
-            }
-        }
-    }
-    let pairs = counts
-        .into_iter()
-        .filter(|&(_, c)| c as usize >= min_shared)
-        .map(|(p, _)| p)
+/// Floor-3 rare peaks for one rep: `(offset, hash)` with df <= rare_cap, offset-sorted.
+/// df is over the floor-6 bag_set (the incumbent's rare test, reproduced from the public
+/// substrate).
+fn rare_peaks(rep: &RepData, df: &HashMap<u128, u32>, rare_cap: u32) -> Vec<(u32, u128)> {
+    let mut peaks: Vec<(u32, u128)> = rep
+        .offsets()
+        .iter()
+        .filter(|(h, _, _)| df.get(h).copied().unwrap_or(0) <= rare_cap)
+        .flat_map(|(h, offs, _)| offs.iter().map(move |o| (*o, *h)))
         .collect();
-    (pairs, entries)
+    peaks.sort_unstable();
+    peaks
 }
 
-fn retr_landmark(reps: &[Rep]) -> (Vec<(u32, u32)>, usize) {
-    retr_landmark_ms(reps, 2)
+/// Corpus df over the floor-6 bag_set + the incumbent rare_cap.
+fn corpus_df(reps: &[RepData]) -> (HashMap<u128, u32>, u32) {
+    let mut df: HashMap<u128, u32> = HashMap::new();
+    for rep in reps {
+        for &h in rep.bag_set() {
+            *df.entry(h).or_insert(0) += 1;
+        }
+    }
+    (df, 3.max(reps.len() as u32 / 20))
 }
 
-// ---- retriever 4: sourcerer-rare (ablation: rare peaks, no triples) ----
+// ---- sourcerer-rare (ablation: rare peaks, no triples) ----
 
-fn retr_sourcerer(reps: &[Rep], min_shared: usize) -> (Vec<(u32, u32)>, usize) {
-    let entries: usize = reps.iter().map(|r| r.rare_set.len()).sum();
-    let pairs = shared_count_pairs(reps, |r| &r.rare_set, 50, min_shared);
-    (pairs, entries)
+struct SourcererRare {
+    min_shared: usize,
+}
+impl Retriever for SourcererRare {
+    fn name(&self) -> &'static str {
+        "sourcerer-rare"
+    }
+    fn candidates(&self, reps: &[RepData], _cfg: &Config, _stats: &mut RetrievalStats) -> RepPairs {
+        let (df, rare_cap) = corpus_df(reps);
+        let feats: Vec<Vec<u128>> = reps
+            .par_iter()
+            .map(|rep| {
+                let mut set: Vec<u128> = rare_peaks(rep, &df, rare_cap)
+                    .iter()
+                    .map(|(_, h)| *h)
+                    .collect();
+                set.sort_unstable();
+                set.dedup();
+                set
+            })
+            .collect();
+        shared_count_pairs(&feats, 50, self.min_shared)
+    }
 }
 
-// ---- retriever 3: winnowing (MOSS-style k-gram) ----
+// ---- winnowing (MOSS-style k-gram) ----
 
-/// Winnowing fingerprints of a stream: k-grams hashed, min selected per window of `w`
-/// (rightmost minimum). Returns dedup selected gram hashes.
+struct Winnowing {
+    k: usize,
+    w: usize,
+    min_shared: usize,
+}
+
+/// Floor-3 subtree hashes in pre-order (offset order), folded to u64 — the winnowing stream.
+fn stream(rep: &RepData) -> Vec<u64> {
+    let mut by_off: Vec<(u32, u128)> = rep
+        .offsets()
+        .iter()
+        .flat_map(|(h, offs, _)| offs.iter().map(move |o| (*o, *h)))
+        .collect();
+    by_off.sort_unstable();
+    by_off.iter().map(|(_, h)| fold128(*h)).collect()
+}
+
+/// Winnowing fingerprints: k-grams hashed, min selected per window of `w` (rightmost min).
 fn winnow(stream: &[u64], k: usize, w: usize) -> Vec<u128> {
     if stream.is_empty() {
         return Vec::new();
     }
-    // k-gram hashes (numeric, used directly for min selection).
     let grams: Vec<u128> = if stream.len() < k {
         let mut buf = Vec::with_capacity(stream.len() * 8);
         for &x in stream {
@@ -398,10 +192,7 @@ fn winnow(stream: &[u64], k: usize, w: usize) -> Vec<u128> {
             .collect()
     };
     if grams.len() <= w {
-        // one window: select the single minimum
-        let mut sel = *grams.iter().min().unwrap();
-        // dedup trivial
-        let mut out = vec![std::mem::take(&mut sel)];
+        let mut out = vec![*grams.iter().min().unwrap()];
         out.sort_unstable();
         out.dedup();
         return out;
@@ -409,7 +200,6 @@ fn winnow(stream: &[u64], k: usize, w: usize) -> Vec<u128> {
     let mut positions: Vec<usize> = Vec::new();
     for start in 0..=grams.len() - w {
         let window = &grams[start..start + w];
-        // rightmost minimum
         let mut min_i = 0;
         for i in 1..w {
             if window[i] <= window[min_i] {
@@ -429,36 +219,20 @@ fn winnow(stream: &[u64], k: usize, w: usize) -> Vec<u128> {
     out
 }
 
-fn retr_winnow(reps: &[Rep], k: usize, w: usize, min_shared: usize) -> (Vec<(u32, u32)>, usize) {
-    let grams: Vec<Vec<u128>> = reps.par_iter().map(|r| winnow(&r.stream, k, w)).collect();
-    let entries: usize = grams.iter().map(|g| g.len()).sum();
-    let mut owners: HashMap<u128, Vec<u32>> = HashMap::new();
-    for (i, g) in grams.iter().enumerate() {
-        for &h in g {
-            owners.entry(h).or_default().push(i as u32);
-        }
+impl Retriever for Winnowing {
+    fn name(&self) -> &'static str {
+        "winnowing"
     }
-    let df_cap = 50usize;
-    let mut counts: HashMap<(u32, u32), u32> = HashMap::new();
-    for own in owners.values() {
-        if own.len() < 2 || own.len() > df_cap {
-            continue;
-        }
-        for a in 0..own.len() {
-            for b in a + 1..own.len() {
-                *counts.entry((own[a], own[b])).or_insert(0) += 1;
-            }
-        }
+    fn candidates(&self, reps: &[RepData], _cfg: &Config, _stats: &mut RetrievalStats) -> RepPairs {
+        let feats: Vec<Vec<u128>> = reps
+            .par_iter()
+            .map(|rep| winnow(&stream(rep), self.k, self.w))
+            .collect();
+        shared_count_pairs(&feats, 50, self.min_shared)
     }
-    let pairs = counts
-        .into_iter()
-        .filter(|&(_, c)| c as usize >= min_shared)
-        .map(|(p, _)| p)
-        .collect();
-    (pairs, entries)
 }
 
-// ---- retriever 2: minhash + LSH ----
+// ---- minhash + LSH ----
 
 const MINHASH_K: usize = 128;
 
@@ -469,8 +243,6 @@ fn splitmix64(state: &mut u64) -> u64 {
     z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
     z ^ (z >> 31)
 }
-
-/// Deterministic MinHash permutation params (a odd, b arbitrary).
 fn minhash_params() -> (Vec<u64>, Vec<u64>) {
     let mut s = 0xD1B54A32D192ED03u64;
     let mut a = Vec::with_capacity(MINHASH_K);
@@ -481,7 +253,6 @@ fn minhash_params() -> (Vec<u64>, Vec<u64>) {
     }
     (a, b)
 }
-
 fn minhash_sig(bag: &[u128], a: &[u64], b: &[u64]) -> Vec<u64> {
     let mut sig = vec![u64::MAX; MINHASH_K];
     for &e in bag {
@@ -496,238 +267,116 @@ fn minhash_sig(bag: &[u128], a: &[u64], b: &[u64]) -> Vec<u64> {
     sig
 }
 
-/// MinHash+LSH: `bands` bands of `rows` rows (bands*rows = K). Two units are candidates
-/// when they collide in any band. Approx Jaccard threshold (1/bands)^(1/rows).
-fn retr_minhash(reps: &[Rep], bands: usize, rows: usize) -> (Vec<(u32, u32)>, usize) {
-    assert!(bands * rows <= MINHASH_K);
-    let (a, b) = minhash_params();
-    let sigs: Vec<Vec<u64>> = reps
-        .par_iter()
-        .map(|r| minhash_sig(&r.bag_set, &a, &b))
-        .collect();
-    // index entries = signatures (n*K) as the stored-index footprint.
-    let entries = sigs.len() * MINHASH_K;
-    let mut buckets: HashMap<u128, Vec<u32>> = HashMap::new();
-    for (i, sig) in sigs.iter().enumerate() {
-        for band in 0..bands {
-            let mut buf = Vec::with_capacity(rows * 8 + 2);
-            buf.extend_from_slice(&(band as u16).to_le_bytes());
-            for r in 0..rows {
-                buf.extend_from_slice(&sig[band * rows + r].to_le_bytes());
-            }
-            buckets.entry(xxh3_128(&buf)).or_default().push(i as u32);
-        }
+struct MinHashLsh {
+    bands: usize,
+    rows: usize,
+}
+impl Retriever for MinHashLsh {
+    fn name(&self) -> &'static str {
+        "minhash-lsh"
     }
-    let df_cap = 50usize; // ubiquitous-signature guard (parity with the other retrievers' df_cap)
-    let mut pairs: HashSet<(u32, u32)> = HashSet::new();
-    for own in buckets.values() {
-        if own.len() < 2 || own.len() > df_cap {
-            continue;
-        }
-        for x in 0..own.len() {
-            for y in x + 1..own.len() {
-                pairs.insert((own[x].min(own[y]), own[x].max(own[y])));
+    fn candidates(&self, reps: &[RepData], _cfg: &Config, _stats: &mut RetrievalStats) -> RepPairs {
+        assert!(self.bands * self.rows <= MINHASH_K);
+        let (a, b) = minhash_params();
+        let sigs: Vec<Vec<u64>> = reps
+            .par_iter()
+            .map(|r| minhash_sig(r.bag_set(), &a, &b))
+            .collect();
+        let mut buckets: HashMap<u128, Vec<u32>> = HashMap::new();
+        for (i, sig) in sigs.iter().enumerate() {
+            for band in 0..self.bands {
+                let mut buf = Vec::with_capacity(self.rows * 8 + 2);
+                buf.extend_from_slice(&(band as u16).to_le_bytes());
+                for r in 0..self.rows {
+                    buf.extend_from_slice(&sig[band * self.rows + r].to_le_bytes());
+                }
+                buckets.entry(xxh3_128(&buf)).or_default().push(i as u32);
             }
         }
-    }
-    (pairs.into_iter().collect(), entries)
-}
-
-// ============================ SWEEP EXTENSION: alternate landmark DEFINITIONS ============================
-//
-// Each variant below is a new `candidates()` entrant that reuses the SAME shared substrate
-// (nodes3 / df6 / df3) and the SAME owner->count->min_shared clique as the incumbent — only
-// the landmark DEFINITION (peak selection + relation encoding) changes, so any flood/recall
-// delta is attributable to the definition. Measurement only; src/ is untouched.
-
-/// The incumbent owner->pair-count->min_shared clique, factored out (identical to
-/// `retr_landmark_ms`'s body). `df_cap = 50` matches every incumbent retriever.
-fn pairs_from_lms(lms: &[Vec<u128>], min_shared: usize) -> Vec<(u32, u32)> {
-    let df_cap = 50usize;
-    let mut owners: HashMap<u128, Vec<u32>> = HashMap::new();
-    for (i, l) in lms.iter().enumerate() {
-        for &h in l {
-            owners.entry(h).or_default().push(i as u32);
-        }
-    }
-    let mut counts: HashMap<(u32, u32), u32> = HashMap::new();
-    for own in owners.values() {
-        if own.len() < 2 || own.len() > df_cap {
-            continue;
-        }
-        for a in 0..own.len() {
-            for b in a + 1..own.len() {
-                *counts.entry((own[a], own[b])).or_insert(0) += 1;
+        let df_cap = 50usize;
+        let mut pairs: HashSet<(usize, usize)> = HashSet::new();
+        for own in buckets.values() {
+            if own.len() < 2 || own.len() > df_cap {
+                continue;
+            }
+            for x in 0..own.len() {
+                for y in x + 1..own.len() {
+                    let (i, j) = (own[x] as usize, own[y] as usize);
+                    pairs.insert((i.min(j), i.max(j)));
+                }
             }
         }
+        pairs.into_iter().collect()
     }
-    counts
-        .into_iter()
-        .filter(|&(_, c)| c as usize >= min_shared)
-        .map(|(p, _)| p)
-        .collect()
 }
 
-// ---- peak-selection strategies (each returns offset-sorted rare peaks as Node3) ----
+// ============================ retriever registry (all real-trait) ============================
 
-/// H-baseline: the incumbent rare test — df over floor-6 bag_set with the `unwrap_or(0)` leak
-/// (floor-3 sub-floor subtrees absent from the bag count as df 0 => rare-by-default).
-fn peaks_baseline(lc: &LangCorpus, rep: &Rep) -> Vec<Node3> {
-    rep.nodes3
-        .iter()
-        .copied()
-        .filter(|n| lc.df6.get(&n.hash).copied().unwrap_or(0) <= lc.rare_cap)
-        .collect()
+fn retrievers() -> Vec<(&'static str, Box<dyn Retriever>)> {
+    vec![
+        ("reprise-landmark", Box::new(matchtree::Landmark)),
+        (
+            "minhash-lsh",
+            Box::new(MinHashLsh { bands: 32, rows: 4 }), // thr ~ (1/32)^(1/4) ~ 0.42
+        ),
+        (
+            "winnowing",
+            Box::new(Winnowing {
+                k: 5,
+                w: 4,
+                min_shared: 2,
+            }),
+        ),
+        ("sourcerer-rare", Box::new(SourcererRare { min_shared: 2 })),
+    ]
 }
 
-/// H-floor-align: same rare_cap, but the df is the leak-free FULL floor-3 df (df3), so 3..6-token
-/// subtrees get a genuine corpus count instead of auto-rare.
-fn peaks_aligned(lc: &LangCorpus, rep: &Rep) -> Vec<Node3> {
-    rep.nodes3
-        .iter()
-        .copied()
-        .filter(|n| lc.df3.get(&n.hash).copied().unwrap_or(0) <= lc.rare_cap)
-        .collect()
+// ============================ trusted verify chain (the retriever-independent oracle) ============================
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Verdict {
+    SizeRej,
+    HistRej,
+    DivRej,
+    Weak,
+    Accept,
 }
 
-/// H-peak-cap: keep only the top-K rarest of a base peak set (rarity = df3 ascending, ties to
-/// larger subtrees first), then re-sort by offset for constellation building.
-fn cap_topk(mut peaks: Vec<Node3>, lc: &LangCorpus, k: usize) -> Vec<Node3> {
-    if peaks.len() <= k {
-        return peaks;
-    }
-    peaks.sort_unstable_by(|a, b| {
-        let da = lc.df3.get(&a.hash).copied().unwrap_or(0);
-        let db = lc.df3.get(&b.hash).copied().unwrap_or(0);
-        da.cmp(&db)
-            .then(b.tokens.cmp(&a.tokens))
-            .then(a.offset.cmp(&b.offset))
-    });
-    peaks.truncate(k);
-    peaks.sort_unstable_by_key(|n| n.offset);
-    peaks
+fn size_gate_passes(ta: u32, tb: u32, cfg: &Config) -> bool {
+    let (lo, hi) = (u64::from(ta.min(tb)), u64::from(ta.max(tb)));
+    let ratio = 1.0 + 2.0 * cfg.thresholds.max_divergence + 0.15;
+    hi as f64 <= lo as f64 * ratio + 64.0
 }
 
-/// H-salience: keep only base peaks whose subtree-root kind tier is >= `tier_min`.
-fn filter_salient(peaks: Vec<Node3>, tier_min: u8) -> Vec<Node3> {
-    peaks
-        .into_iter()
-        .filter(|n| n.kind_code >= tier_min)
-        .collect()
-}
-
-// ---- constellation (relation) encodings ----
-
-/// Incumbent LINEAR encoding: each peak x its next `fan_out` by offset, tuple
-/// (anchorHash, targetHash, (Δoffset)/8). With `fan_out=3` over `peaks_baseline` this is
-/// byte-identical to `landmark_hashes` (verified in the sweep: reproduces flood 8013).
-fn constellation_linear(peaks: &[Node3], fan_out: usize) -> Vec<u128> {
-    let mut out = Vec::new();
-    for i in 0..peaks.len() {
-        for j in i + 1..(i + 1 + fan_out).min(peaks.len()) {
-            let delta = (peaks[j].offset - peaks[i].offset) / 8;
-            let mut buf = Vec::with_capacity(36);
-            buf.extend_from_slice(&peaks[i].hash.to_le_bytes());
-            buf.extend_from_slice(&peaks[j].hash.to_le_bytes());
-            buf.extend_from_slice(&delta.to_le_bytes());
-            out.push(xxh3_128(&buf));
-        }
-    }
-    out.sort_unstable();
-    out.dedup();
-    out
-}
-
-/// H-tree-constellation: replace the linear Δoffset with an AST RELATION. For anchor i and
-/// target j (offset i < j), the relation code packs (containment, depth-delta):
-///   - nested bit: 1 iff j lies inside i's subtree span `[off_i, off_i+tok_i)` (i is an ancestor
-///     of j), else 0 (j is disjoint/following).
-///   - depth-delta: `depth_j - depth_i` clamped to [-15, 15].
-///
-/// Hypothesis: a structural relation is less coincidental than a quantized token gap, so equal
-/// structures collide while unrelated peaks at the same token distance do not => less flood.
-fn constellation_tree(peaks: &[Node3], fan_out: usize) -> Vec<u128> {
-    let mut out = Vec::new();
-    for i in 0..peaks.len() {
-        for j in i + 1..(i + 1 + fan_out).min(peaks.len()) {
-            let nested = peaks[j].offset < peaks[i].offset + peaks[i].tokens && peaks[i].tokens > 1;
-            let dd = (i32::from(peaks[j].depth) - i32::from(peaks[i].depth)).clamp(-15, 15);
-            let relcode: u32 = ((nested as u32) << 8) | ((dd + 16) as u32);
-            let mut buf = Vec::with_capacity(36);
-            buf.extend_from_slice(&peaks[i].hash.to_le_bytes());
-            buf.extend_from_slice(&peaks[j].hash.to_le_bytes());
-            buf.extend_from_slice(&relcode.to_le_bytes());
-            out.push(xxh3_128(&buf));
-        }
-    }
-    out.sort_unstable();
-    out.dedup();
-    out
-}
-
-// ---- generic variant runner (peaks x encoding x min_shared) ----
-
-/// Build landmark hashes for every rep via `(select, encode)` and return the shared-count pairs.
-fn retr_variant(
-    lc: &LangCorpus,
-    select: &(dyn Fn(&LangCorpus, &Rep) -> Vec<Node3> + Sync),
-    encode: &(dyn Fn(&[Node3]) -> Vec<u128> + Sync),
-    min_shared: usize,
-) -> Vec<(u32, u32)> {
-    let lms: Vec<Vec<u128>> = lc
-        .reps
-        .par_iter()
-        .map(|rep| encode(&select(lc, rep)))
-        .collect();
-    pairs_from_lms(&lms, min_shared)
-}
-
-// ---- H-tree-verify: structural depth-delta histogram, used as a retriever-side pre-filter ----
-
-/// Structural analog of `offset_histogram_passes`: over shared floor-3 subtrees, vote on the
-/// DEPTH delta `depth_a - depth_b` (not the token-offset delta). Consistent clones place shared
-/// subtrees at consistent relative depths. Same vote budget (`needed`) as the offset histogram.
-/// Used to FILTER a retriever's candidates (reduce flood); the trusted oracle is unchanged.
-fn tree_hist_passes(a: &Rep, b: &Rep, cfg: &Config) -> bool {
-    // hash -> depths, per unit (sorted by hash for a merge join).
-    fn by_hash(rep: &Rep) -> Vec<(u128, Vec<u16>)> {
-        let mut v: Vec<(u128, Vec<u16>)> = Vec::new();
-        for n in &rep.nodes3 {
-            match v.last_mut() {
-                Some((h, ds)) if *h == n.hash => ds.push(n.depth),
-                _ => v.push((n.hash, vec![n.depth])),
-            }
-        }
-        // nodes3 is offset-sorted, so re-sort by hash for the join.
-        v.sort_unstable_by_key(|(h, _)| *h);
-        v
-    }
-    let ha = by_hash(a);
-    let hb = by_hash(b);
-    let min_inventory = ha.len().min(hb.len()) as u32;
+/// Offset-delta diagonal over the shared floor-3 subtrees (the trusted §5.6 verify, the
+/// SAME logic the pipeline's `offset-histogram` filter runs — reproduced here over the
+/// public `RepData::offsets` so the oracle is retriever-independent).
+fn offset_histogram_passes(a: &RepData, b: &RepData, cfg: &Config) -> bool {
+    let (oa, ob) = (a.offsets(), b.offsets());
+    let min_inventory = oa.len().min(ob.len()) as u32;
     let needed = cfg.histogram_min_votes().max(min_inventory / 8);
-    let mut bins: HashMap<i32, u32> = HashMap::new();
+    let mut bins: HashMap<i64, u32> = HashMap::new();
     let mut best = 0u32;
-    let mut local: Vec<i32> = Vec::with_capacity(16);
+    let mut hash_bins: Vec<i64> = Vec::with_capacity(16);
     let (mut i, mut j) = (0usize, 0usize);
-    while i < ha.len() && j < hb.len() {
+    while i < oa.len() && j < ob.len() {
         if best >= needed {
             return true;
         }
-        match ha[i].0.cmp(&hb[j].0) {
+        match oa[i].0.cmp(&ob[j].0) {
             std::cmp::Ordering::Less => i += 1,
             std::cmp::Ordering::Greater => j += 1,
             std::cmp::Ordering::Equal => {
-                local.clear();
-                for &da in ha[i].1.iter().take(4) {
-                    for &db in hb[j].1.iter().take(4) {
-                        let bin = i32::from(da) - i32::from(db);
-                        if !local.contains(&bin) {
-                            local.push(bin);
+                hash_bins.clear();
+                for &va in oa[i].1.iter().take(4) {
+                    for &vb in ob[j].1.iter().take(4) {
+                        let bin = (i64::from(va) - i64::from(vb)) / 4;
+                        if !hash_bins.contains(&bin) {
+                            hash_bins.push(bin);
                         }
                     }
                 }
-                for &bin in &local {
+                for &bin in &hash_bins {
                     let v = bins.entry(bin).or_insert(0);
                     *v += 1;
                     best = best.max(*v);
@@ -740,30 +389,11 @@ fn tree_hist_passes(a: &Rep, b: &Rep, cfg: &Config) -> bool {
     best >= needed
 }
 
-/// Apply the structural depth-delta histogram as a post-filter to a candidate rep-pair set.
-fn filter_tree_hist(lc: &LangCorpus, pairs: Vec<(u32, u32)>, cfg: &Config) -> Vec<(u32, u32)> {
-    pairs
-        .into_par_iter()
-        .filter(|&(i, j)| tree_hist_passes(&lc.reps[i as usize], &lc.reps[j as usize], cfg))
-        .collect()
-}
-
-// ============================ trusted verify chain (lm_validate.rs verbatim) ============================
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Verdict {
-    SizeRej,
-    HistRej,
-    DivRej,
-    Weak,
-    Accept,
-}
-
 fn verify(
     ua: &Unit,
     ub: &Unit,
-    a: &Rep,
-    b: &Rep,
+    a: &RepData,
+    b: &RepData,
     profile: &'static dyn reprise::lang::LanguageProfile,
     ir: bool,
     cfg: &Config,
@@ -784,138 +414,63 @@ fn verify(
     Verdict::Accept
 }
 
-fn size_gate_passes(ta: u32, tb: u32, cfg: &Config) -> bool {
-    let (lo, hi) = (u64::from(ta.min(tb)), u64::from(ta.max(tb)));
-    let ratio = 1.0 + 2.0 * cfg.thresholds.max_divergence + 0.15;
-    hi as f64 <= lo as f64 * ratio + 64.0
-}
+// ============================ runner ============================
 
-fn offset_histogram_passes(a: &Rep, b: &Rep, cfg: &Config) -> bool {
-    let min_inventory = a.offsets.len().min(b.offsets.len()) as u32;
-    let needed = cfg.histogram_min_votes().max(min_inventory / 8);
-    let mut bins: HashMap<i64, u32> = HashMap::new();
-    let mut best = 0u32;
-    let mut hash_bins: Vec<i64> = Vec::with_capacity(16);
-    let (mut i, mut j) = (0usize, 0usize);
-    while i < a.offsets.len() && j < b.offsets.len() {
-        if best >= needed {
-            return true;
-        }
-        let remaining = (a.offsets.len() - i).min(b.offsets.len() - j) as u32;
-        if best + remaining < needed {
-            return false;
-        }
-        let (ha, offs_a) = &a.offsets[i];
-        let (hb, offs_b) = &b.offsets[j];
-        match ha.cmp(hb) {
-            std::cmp::Ordering::Less => i += 1,
-            std::cmp::Ordering::Greater => j += 1,
-            std::cmp::Ordering::Equal => {
-                hash_bins.clear();
-                for &oa in offs_a.iter().take(4) {
-                    for &ob in offs_b.iter().take(4) {
-                        let bin = (i64::from(oa) - i64::from(ob)) / 4;
-                        if !hash_bins.contains(&bin) {
-                            hash_bins.push(bin);
-                        }
-                    }
-                }
-                for &bin in &hash_bins {
-                    let v = bins.entry(bin).or_insert(0);
-                    *v += 1;
-                    best = best.max(*v);
-                }
-                i += 1;
-                j += 1;
-            }
-        }
-    }
-    best >= needed
-}
-
-// ============================ retriever registry + runner ============================
-
-const RETRIEVERS: [&str; 4] = [
-    "reprise-landmark",
-    "minhash-lsh",
-    "winnowing",
-    "sourcerer-rare",
-];
+type PairSet = HashSet<(usize, usize)>;
 
 #[derive(Default, Clone)]
 struct Cost {
-    build_ms: f64,
     query_ms: f64,
     index_entries: usize,
 }
 
-/// One retriever's candidate set for one lang, as unit-index pairs (min,max) + timing.
-struct RetrOut {
-    pairs: HashSet<(usize, usize)>, // unit-index pairs
-    cost: Cost,
-}
-
-fn run_retriever(name: &str, lc: &LangCorpus) -> RetrOut {
-    let reps = &lc.reps;
-    let to_units = |raw: Vec<(u32, u32)>| -> HashSet<(usize, usize)> {
-        raw.into_iter()
-            .map(|(i, j)| {
-                let (a, b) = (reps[i as usize].unit_idx, reps[j as usize].unit_idx);
-                (a.min(b), a.max(b))
-            })
-            .collect()
-    };
-    let t = Instant::now();
-    let (raw, entries) = match name {
-        "reprise-landmark" => retr_landmark(reps),
-        "minhash-lsh" => retr_minhash(reps, 32, 4), // thr ~ (1/32)^(1/4) ~ 0.42
-        "winnowing" => retr_winnow(reps, 5, 4, 2),
-        "sourcerer-rare" => retr_sourcerer(reps, 2),
-        _ => unreachable!(),
-    };
-    let elapsed = t.elapsed().as_secs_f64() * 1000.0;
-    RetrOut {
-        pairs: to_units(raw),
-        cost: Cost {
-            // build+query aren't separable cheaply here; report combined as query_ms,
-            // and index footprint as index_entries.
-            build_ms: 0.0,
-            query_ms: elapsed,
-            index_entries: entries,
-        },
-    }
-}
-
-/// All retrievers over a corpus, per lang. Returns (per-retriever unit-pair set, per-retriever
-/// cost) aggregated across langs, plus the lang corpora (for verify) and rep-index maps.
 struct CorpusRun {
     langs: Vec<LangCorpus>,
-    // retriever name -> unit-pair set (union across langs)
-    retr_pairs: HashMap<String, HashSet<(usize, usize)>>,
+    retr_pairs: HashMap<String, PairSet>, // retriever name -> unit-pair set (union across langs)
     retr_cost: HashMap<String, Cost>,
+}
+
+/// Run one retriever over one lang's reps, returning unit-index pairs (min,max) + timing.
+fn run_retriever(r: &dyn Retriever, lc: &LangCorpus, cfg: &Config) -> (PairSet, Cost) {
+    let mut stats = RetrievalStats::default();
+    let t = Instant::now();
+    let raw = r.candidates(&lc.reps, cfg, &mut stats);
+    let query_ms = t.elapsed().as_secs_f64() * 1000.0;
+    let pairs: PairSet = raw
+        .into_iter()
+        .map(|(i, j)| {
+            let (a, b) = (lc.reps[i].unit_idx(), lc.reps[j].unit_idx());
+            (a.min(b), a.max(b))
+        })
+        .collect();
+    (
+        pairs,
+        Cost {
+            query_ms,
+            index_entries: stats.landmark_index_size,
+        },
+    )
 }
 
 fn run_corpus(units: &[Unit], cfg: &Config) -> CorpusRun {
     let mut langs_present: Vec<Lang> = units.iter().map(|u| u.lang).collect();
     langs_present.sort();
     langs_present.dedup();
-
     let langs: Vec<LangCorpus> = langs_present
         .iter()
         .filter_map(|&l| build_lang_corpus(units, l, cfg))
         .collect();
 
-    let mut retr_pairs: HashMap<String, HashSet<(usize, usize)>> = HashMap::new();
+    let mut retr_pairs: HashMap<String, PairSet> = HashMap::new();
     let mut retr_cost: HashMap<String, Cost> = HashMap::new();
-    for name in RETRIEVERS {
-        let mut all = HashSet::new();
+    for (name, r) in retrievers() {
+        let mut all = PairSet::new();
         let mut cost = Cost::default();
         for lc in &langs {
-            let out = run_retriever(name, lc);
-            all.extend(out.pairs);
-            cost.build_ms += out.cost.build_ms;
-            cost.query_ms += out.cost.query_ms;
-            cost.index_entries += out.cost.index_entries;
+            let (pairs, c) = run_retriever(r.as_ref(), lc, cfg);
+            all.extend(pairs);
+            cost.query_ms += c.query_ms;
+            cost.index_entries += c.index_entries;
         }
         retr_pairs.insert(name.to_string(), all);
         retr_cost.insert(name.to_string(), cost);
@@ -928,16 +483,15 @@ fn run_corpus(units: &[Unit], cfg: &Config) -> CorpusRun {
 }
 
 /// Verify the union of candidate pairs (verify-on-union oracle A). Returns the ACCEPT and
-/// WEAK positive sets as unit-pair sets, plus a per-pair verdict memo (for precision).
-fn verify_union(units: &[Unit], run: &CorpusRun) -> (PairSet, PairSet) {
-    // rep lookup per lang
-    let mut rep_of_unit: HashMap<usize, (usize, usize)> = HashMap::new(); // unit_idx -> (lang_i, rep_i)
+/// WEAK positive sets as unit-pair sets.
+fn verify_union(units: &[Unit], run: &CorpusRun, cfg: &Config) -> (PairSet, PairSet) {
+    let mut rep_of_unit: HashMap<usize, (usize, usize)> = HashMap::new();
     for (li, lc) in run.langs.iter().enumerate() {
         for (ri, rep) in lc.reps.iter().enumerate() {
-            rep_of_unit.insert(rep.unit_idx, (li, ri));
+            rep_of_unit.insert(rep.unit_idx(), (li, ri));
         }
     }
-    let mut union: HashSet<(usize, usize)> = HashSet::new();
+    let mut union: PairSet = HashSet::new();
     for set in run.retr_pairs.values() {
         union.extend(set.iter().copied());
     }
@@ -948,15 +502,14 @@ fn verify_union(units: &[Unit], run: &CorpusRun) -> (PairSet, PairSet) {
             let (la, ra) = rep_of_unit[&ua];
             let (_lb, rb) = rep_of_unit[&ub];
             let lc = &run.langs[la];
-            let profile = lc.lang.profile();
             verify(
                 &units[ua],
                 &units[ub],
                 &lc.reps[ra],
                 &lc.reps[rb],
-                profile,
+                lc.lang.profile(),
                 lc.ir,
-                &Config::default(),
+                cfg,
             )
         })
         .collect();
@@ -976,7 +529,7 @@ fn verify_union(units: &[Unit], run: &CorpusRun) -> (PairSet, PairSet) {
     (accept, weak)
 }
 
-// ============================ oracle B: synthetic mutation corpus ============================
+// ============================ oracle B: synthetic mutation corpus (verbatim) ============================
 
 #[derive(serde::Deserialize)]
 struct SeedMeta {
@@ -1196,95 +749,6 @@ fn build_synthetic(cfg: &Config) -> (Vec<Unit>, Vec<SynPair>) {
     (units, pairs)
 }
 
-// ============================ fidelity vs reprise::scan ============================
-
-/// Re-prove the landmark reconstruction against the shipping pipeline: run reprise::scan
-/// with inline disabled (both see plain units) and compare candidate + verify accounting.
-fn fidelity_check(root: &Path) -> String {
-    let mut cfg = Config::default();
-    cfg.cache.enabled = false;
-    cfg.inline.enabled = false; // both reconstruction and scan see plain units only
-    let report = match reprise::scan(root, &cfg) {
-        Ok(r) => r,
-        Err(e) => return format!("  scan failed: {e}"),
-    };
-    let rs = &report.stats.retrieval;
-
-    // reconstruct landmark candidates + verify over the SAME corpus
-    let mut units: Vec<Unit> = Vec::new();
-    let files = reprise::walk::collect_files(root, &cfg).expect("collect_files");
-    for (path, lang) in files {
-        let Ok(src) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        if reprise::walk::is_generated(&src, &cfg) {
-            continue;
-        }
-        let (fus, _rep) = unit::extract_file_units(&path, &src, lang, &cfg);
-        units.extend(fus);
-    }
-    let mut langs: Vec<Lang> = units.iter().map(|u| u.lang).collect();
-    langs.sort();
-    langs.dedup();
-
-    let mut recon_landmark = 0usize;
-    let mut recon_hist_rej = 0usize;
-    let mut recon_verified = 0usize; // accept + weak (matchtree counts both as verified)
-    for lang in langs {
-        let Some(lc) = build_lang_corpus(&units, lang, &cfg) else {
-            continue;
-        };
-        let (raw, _entries) = retr_landmark(&lc.reps);
-        recon_landmark += raw.len();
-        let profile = lang.profile();
-        let verdicts: Vec<Verdict> = raw
-            .par_iter()
-            .map(|&(i, j)| {
-                verify(
-                    &units[lc.reps[i as usize].unit_idx],
-                    &units[lc.reps[j as usize].unit_idx],
-                    &lc.reps[i as usize],
-                    &lc.reps[j as usize],
-                    profile,
-                    lc.ir,
-                    &cfg,
-                )
-            })
-            .collect();
-        for v in verdicts {
-            match v {
-                Verdict::HistRej => recon_hist_rej += 1,
-                Verdict::DivRej => {}
-                Verdict::Weak | Verdict::Accept => recon_verified += 1,
-                Verdict::SizeRej => {}
-            }
-        }
-    }
-    let cand_ok = recon_landmark == rs.candidates_landmark;
-    let hist_ok = recon_hist_rej == rs.histogram_rejected;
-    let ver_ok = recon_verified == rs.verified_pairs;
-    format!(
-        "  candidates_landmark: recon {} vs scan {} -> {}\n  \
-         histogram_rejected:  recon {} vs scan {} -> {}\n  \
-         verified_pairs:      recon {} vs scan {} -> {}\n  \
-         OVERALL: {}",
-        recon_landmark,
-        rs.candidates_landmark,
-        if cand_ok { "MATCH" } else { "DIFF" },
-        recon_hist_rej,
-        rs.histogram_rejected,
-        if hist_ok { "MATCH" } else { "DIFF" },
-        recon_verified,
-        rs.verified_pairs,
-        if ver_ok { "MATCH" } else { "DIFF" },
-        if cand_ok && hist_ok && ver_ok {
-            "FIDELITY PROVEN"
-        } else {
-            "FIDELITY MISMATCH (see above)"
-        },
-    )
-}
-
 // ============================ main ============================
 
 fn main() {
@@ -1296,11 +760,7 @@ fn main() {
     };
     let mut cfg = Config::default();
     cfg.cache.enabled = false;
-    cfg.inline.enabled = false; // plain units only, matches the fidelity-proven substrate
-
-    // ---- fidelity ----
-    println!("=== FIDELITY: landmark reconstruction vs reprise::scan (inline off) ===");
-    println!("{}", fidelity_check(&roots[0]));
+    cfg.inline.enabled = false; // plain units only
 
     // ---- collect real corpus ----
     let mut units: Vec<Unit> = Vec::new();
@@ -1319,10 +779,11 @@ fn main() {
     }
     let n_units = units.len();
     let run = run_corpus(&units, &cfg);
-    let (accept, weak) = verify_union(&units, &run);
+    let (accept, weak) = verify_union(&units, &run, &cfg);
+    let names: Vec<String> = retrievers().iter().map(|(n, _)| n.to_string()).collect();
 
     println!(
-        "\n=== ORACLE A: verify-on-union  (corpus: {} plain units, {:?}) ===",
+        "=== ORACLE A: verify-on-union (real Retriever trait)  (corpus: {} plain units, {:?}) ===",
         n_units, roots
     );
     let union_size: usize = {
@@ -1338,26 +799,16 @@ fn main() {
         accept.len(),
         weak.len()
     );
-
-    // per-retriever oracle-A metrics
     println!("\n  retriever         flood     recallA   precision   idx-entries   query-ms");
-    let mut rowsa: Vec<(String, usize, f64, f64, usize, f64)> = Vec::new();
-    for name in RETRIEVERS {
+    let mut rowsa: Vec<(String, usize, f64, f64)> = Vec::new();
+    for name in &names {
         let set = &run.retr_pairs[name];
         let cost = &run.retr_cost[name];
         let flood = set.len();
         let surfaced = set.iter().filter(|p| accept.contains(*p)).count();
         let recall = surfaced as f64 / accept.len().max(1) as f64;
-        // raw precision = candidates that verify ACCEPT / candidates
         let prec = surfaced as f64 / flood.max(1) as f64;
-        rowsa.push((
-            name.to_string(),
-            flood,
-            recall,
-            prec,
-            cost.index_entries,
-            cost.query_ms,
-        ));
+        rowsa.push((name.clone(), flood, recall, prec));
         println!(
             "  {name:<16} {flood:>7}    {recall:>6.3}    {prec:>7.4}   {:>11}   {:>7.1}",
             cost.index_entries, cost.query_ms
@@ -1367,10 +818,9 @@ fn main() {
     // ---- oracle B ----
     let (syn_units, syn_pairs) = build_synthetic(&cfg);
     let syn_run = run_corpus(&syn_units, &cfg);
-    // classify known pairs
     #[derive(Default)]
     struct BClass {
-        near: Vec<(usize, usize, String)>, // distinct-fp near pairs
+        near: Vec<(usize, usize)>,
         exact: usize,
         inline: usize,
         excluded: usize,
@@ -1398,7 +848,7 @@ fn main() {
         } else if su.fingerprint == mu.fingerprint {
             bc.exact += 1;
         } else {
-            bc.near.push((key.0, key.1, p.class.clone()));
+            bc.near.push(key);
         }
     }
     println!(
@@ -1406,7 +856,7 @@ fn main() {
         syn_units.len()
     );
     println!(
-        "  known seed<->mutant pairs: near(distinct-fp)={}  exact(same-fp, exact-tier)={}  \
+        "  known seed<->mutant pairs: near(distinct-fp)={}  exact(same-fp)={}  \
          inline-tier(t4)={}  below-floor/excluded={}  control(ctl)={}",
         bc.near.len(),
         bc.exact,
@@ -1415,258 +865,20 @@ fn main() {
         bc.ctl.len()
     );
     println!("\n  retriever         recallB   surfaced/near   ctl-surfaced(FP)");
-    let mut rowsb: Vec<(String, f64)> = Vec::new();
-    for name in RETRIEVERS {
+    for name in &names {
         let set = &syn_run.retr_pairs[name];
-        let surfaced = bc
-            .near
-            .iter()
-            .filter(|(a, b, _)| set.contains(&(*a, *b)))
-            .count();
+        let surfaced = bc.near.iter().filter(|k| set.contains(k)).count();
         let ctl_fp = bc.ctl.iter().filter(|k| set.contains(k)).count();
         let recall = surfaced as f64 / bc.near.len().max(1) as f64;
-        rowsb.push((name.to_string(), recall));
         println!(
             "  {name:<16} {recall:>6.3}      {surfaced:>3}/{:<3}          {ctl_fp}",
             bc.near.len()
         );
     }
 
-    // ---- knob sweep: fair operating points (don't cripple a challenger) ----
-    // For each variant compute flood + recallA (vs verify-union ACCEPT) + recallB (vs synthetic
-    // near). Answers: can a tuned challenger reach landmark's recall, and at what flood?
-    let variant_pairs = |langs: &[LangCorpus], f: &dyn Fn(&[Rep]) -> RepPairs| -> PairSet {
-        let mut all = HashSet::new();
-        for lc in langs {
-            for (i, j) in f(&lc.reps) {
-                let (a, b) = (lc.reps[i as usize].unit_idx, lc.reps[j as usize].unit_idx);
-                all.insert((a.min(b), a.max(b)));
-            }
-        }
-        all
-    };
-    let eval = |label: &str, real: &HashSet<(usize, usize)>, syn: &HashSet<(usize, usize)>| {
-        let flood = real.len();
-        let ra =
-            real.iter().filter(|p| accept.contains(*p)).count() as f64 / accept.len().max(1) as f64;
-        let rb = bc
-            .near
-            .iter()
-            .filter(|(a, b, _)| syn.contains(&(*a, *b)))
-            .count() as f64
-            / bc.near.len().max(1) as f64;
-        println!("    {label:<34} floodA {flood:>7}   recallA {ra:>6.3}   recallB {rb:>6.3}");
-    };
-    println!("\n=== KNOB SWEEP (recall-flood curves — fair operating points) ===");
-    println!("  -- reprise-landmark (min_shared) [incumbent; default 2] --");
-    for ms in [2usize, 3, 4, 6, 8] {
-        let r = variant_pairs(&run.langs, &move |reps| retr_landmark_ms(reps, ms).0);
-        let s = variant_pairs(&syn_run.langs, &move |reps| retr_landmark_ms(reps, ms).0);
-        eval(&format!("min_shared={ms}"), &r, &s);
-    }
-    println!("  -- minhash-lsh (bands x rows, approx Jaccard thr) --");
-    for (bnd, row, thr) in [
-        (16usize, 8usize, "0.68"),
-        (32, 4, "0.42"),
-        (64, 2, "0.125"),
-        (128, 1, "0.008"),
-    ] {
-        let r = variant_pairs(&run.langs, &move |reps| retr_minhash(reps, bnd, row).0);
-        let s = variant_pairs(&syn_run.langs, &move |reps| retr_minhash(reps, bnd, row).0);
-        eval(&format!("b={bnd} r={row} (thr~{thr})"), &r, &s);
-    }
-    println!("  -- winnowing (k,w,min_shared) --");
-    for (k, w, ms) in [(5usize, 4usize, 1usize), (5, 4, 2), (4, 3, 1), (3, 2, 1)] {
-        let r = variant_pairs(&run.langs, &move |reps| retr_winnow(reps, k, w, ms).0);
-        let s = variant_pairs(&syn_run.langs, &move |reps| retr_winnow(reps, k, w, ms).0);
-        eval(&format!("k={k} w={w} min_shared={ms}"), &r, &s);
-    }
-    println!("  -- sourcerer-rare (min_shared) [the ablation: landmark rare peaks, NO triples] --");
-    for ms in [2usize, 3, 4, 6, 8, 12] {
-        let r = variant_pairs(&run.langs, &move |reps| retr_sourcerer(reps, ms).0);
-        let s = variant_pairs(&syn_run.langs, &move |reps| retr_sourcerer(reps, ms).0);
-        eval(&format!("min_shared={ms}"), &r, &s);
-    }
-
-    // ================= SWEEP EXTENSION: alternate landmark DEFINITIONS =================
-    // Each row is a new candidate DEFINITION on the shared substrate; recall is measured
-    // against the FIXED oracle A (verify-union ACCEPT, 45 pairs) and oracle B (synthetic near).
-    let variant_pairs_lc =
-        |langs: &[LangCorpus], f: &(dyn Fn(&LangCorpus) -> RepPairs + Sync)| -> PairSet {
-            let mut all = HashSet::new();
-            for lc in langs {
-                for (i, j) in f(lc) {
-                    let (a, b) = (lc.reps[i as usize].unit_idx, lc.reps[j as usize].unit_idx);
-                    all.insert((a.min(b), a.max(b)));
-                }
-            }
-            all
-        };
-    let stat = |real: &PairSet, syn: &PairSet| -> (usize, f64, f64, f64) {
-        let flood = real.len();
-        let surf = real.iter().filter(|p| accept.contains(*p)).count();
-        let ra = surf as f64 / accept.len().max(1) as f64;
-        let rb = bc
-            .near
-            .iter()
-            .filter(|(a, b, _)| syn.contains(&(*a, *b)))
-            .count() as f64
-            / bc.near.len().max(1) as f64;
-        let prec = surf as f64 / flood.max(1) as f64;
-        (flood, ra, rb, prec)
-    };
-    // summary rows: (label, flood, recallA, recallB, precision, query-ms)
-    let mut summary: Vec<(String, usize, f64, f64, f64, f64)> = Vec::new();
-    let cfg_ref = &cfg;
-    let mut go = |label: String, f: &(dyn Fn(&LangCorpus) -> RepPairs + Sync)| {
-        let t = Instant::now();
-        let real = variant_pairs_lc(&run.langs, f);
-        let ms = t.elapsed().as_secs_f64() * 1000.0;
-        let syn = variant_pairs_lc(&syn_run.langs, f);
-        let (flood, ra, rb, prec) = stat(&real, &syn);
-        println!(
-            "    {label:<40} floodA {flood:>7}  recallA {ra:>6.3}  recallB {rb:>6.3}  prec {prec:>7.4}  {ms:>6.1}ms"
-        );
-        summary.push((label, flood, ra, rb, prec, ms));
-    };
-
-    println!("\n=== LANDMARK-DEFINITION SWEEP (alternate definitions; oracle fixed) ===");
-
-    println!(
-        "  -- H-fanout-sweep: linear encoding, baseline rare peaks (fan=3,ms=2 == incumbent) --"
-    );
-    for fan in [2usize, 3, 4] {
-        for ms in [2usize, 3, 4] {
-            let f = move |lc: &LangCorpus| -> RepPairs {
-                retr_variant(
-                    lc,
-                    &|lc, rep| peaks_baseline(lc, rep),
-                    &move |p: &[Node3]| constellation_linear(p, fan),
-                    ms,
-                )
-            };
-            go(format!("fan={fan} ms={ms}"), &f);
-        }
-    }
-
-    println!("  -- H-tree-constellation: structural relcode (containment + depth-delta) --");
-    for fan in [2usize, 3, 4] {
-        for ms in [2usize, 3, 4] {
-            let f = move |lc: &LangCorpus| -> RepPairs {
-                retr_variant(
-                    lc,
-                    &|lc, rep| peaks_baseline(lc, rep),
-                    &move |p: &[Node3]| constellation_tree(p, fan),
-                    ms,
-                )
-            };
-            go(format!("tree fan={fan} ms={ms}"), &f);
-        }
-    }
-
-    println!(
-        "  -- H-tree-verify: linear candidates (fan,ms), then structural depth-delta hist filter --"
-    );
-    for (fan, ms) in [(3usize, 2usize), (3, 3), (2, 2), (2, 3), (4, 4), (2, 4)] {
-        let f = move |lc: &LangCorpus| -> RepPairs {
-            let cands = retr_variant(
-                lc,
-                &|lc, rep| peaks_baseline(lc, rep),
-                &move |p: &[Node3]| constellation_linear(p, fan),
-                ms,
-            );
-            filter_tree_hist(lc, cands, cfg_ref)
-        };
-        go(format!("linear fan={fan} ms={ms} + tree-hist"), &f);
-    }
-
-    println!("  -- H-peak-cap: baseline peaks capped to top-K rarest, linear fan=3 --");
-    for k in [4usize, 6, 8, 12, 16, 24] {
-        for ms in [2usize, 3] {
-            let f = move |lc: &LangCorpus| -> RepPairs {
-                retr_variant(
-                    lc,
-                    &move |lc, rep| cap_topk(peaks_baseline(lc, rep), lc, k),
-                    &|p: &[Node3]| constellation_linear(p, 3),
-                    ms,
-                )
-            };
-            go(format!("cap K={k} ms={ms}"), &f);
-        }
-    }
-
-    println!("  -- H-floor-align: rare test on leak-free floor-3 df (df3), linear fan=3 --");
-    for ms in [2usize, 3, 4] {
-        let f = move |lc: &LangCorpus| -> RepPairs {
-            retr_variant(
-                lc,
-                &|lc, rep| peaks_aligned(lc, rep),
-                &|p: &[Node3]| constellation_linear(p, 3),
-                ms,
-            )
-        };
-        go(format!("floor-align ms={ms}"), &f);
-    }
-
-    println!(
-        "  -- H-salience: peaks filtered by kind tier (1=+ops, 2=control/call), linear fan=3 --"
-    );
-    for tier in [1u8, 2] {
-        for ms in [2usize, 3] {
-            let f = move |lc: &LangCorpus| -> RepPairs {
-                retr_variant(
-                    lc,
-                    &move |lc, rep| filter_salient(peaks_baseline(lc, rep), tier),
-                    &|p: &[Node3]| constellation_linear(p, 3),
-                    ms,
-                )
-            };
-            go(format!("salient tier>={tier} ms={ms}"), &f);
-        }
-    }
-    println!("  -- H-salience x floor-align (aligned df + tier filter) --");
-    for tier in [1u8, 2] {
-        for ms in [2usize, 3] {
-            let f = move |lc: &LangCorpus| -> RepPairs {
-                retr_variant(
-                    lc,
-                    &move |lc, rep| filter_salient(peaks_aligned(lc, rep), tier),
-                    &|p: &[Node3]| constellation_linear(p, 3),
-                    ms,
-                )
-            };
-            go(format!("aligned+salient tier>={tier} ms={ms}"), &f);
-        }
-    }
-
-    // ---- recall=1.0 winners: definitions that hold BOTH recalls at 1.0, ranked by flood ----
-    let incumbent_flood = run.retr_pairs["reprise-landmark"].len();
-    println!(
-        "\n=== RECALL=1.0 FLOOD RANKING (vs incumbent flood {incumbent_flood}; free win min_shared=3) ==="
-    );
-    let eps = 1e-9;
-    let mut winners: Vec<&(String, usize, f64, f64, f64, f64)> = summary
-        .iter()
-        .filter(|(_, _, ra, rb, _, _)| *ra >= 1.0 - eps && *rb >= 1.0 - eps)
-        .collect();
-    winners.sort_by_key(|(_, flood, _, _, _, _)| *flood);
-    println!("  definitions holding recallA=1.0 AND recallB=1.0, by flood ascending:");
-    for (label, flood, _ra, _rb, prec, ms) in &winners {
-        let vs = if *flood < incumbent_flood {
-            format!("-{} vs incumbent", incumbent_flood - flood)
-        } else {
-            format!("+{} vs incumbent", flood - incumbent_flood)
-        };
-        println!("    {label:<40} flood {flood:>7}  prec {prec:>7.4}  {ms:>6.1}ms   ({vs})");
-    }
-    if winners.is_empty() {
-        println!("    (none held both recalls at 1.0)");
-    }
-
     // ---- verdict ----
     println!("\n=== VERDICT ===");
     let lm = &run.retr_pairs["reprise-landmark"];
-    // (1) does landmark miss ACCEPT pairs the canonical schemes catch?
     let missed: Vec<(usize, usize)> = accept
         .iter()
         .filter(|p| !lm.contains(*p))
@@ -1686,10 +898,12 @@ fn main() {
             missed.len()
         );
         for &(a, b) in &missed {
-            let catchers: Vec<&str> = RETRIEVERS
+            let catchers: Vec<&str> = names
                 .iter()
-                .filter(|&&r| r != "reprise-landmark" && run.retr_pairs[r].contains(&(a, b)))
-                .copied()
+                .filter(|n| {
+                    n.as_str() != "reprise-landmark" && run.retr_pairs[*n].contains(&(a, b))
+                })
+                .map(|n| n.as_str())
                 .collect();
             println!(
                 "      {}  <->  {}   [caught by: {}]",
@@ -1703,40 +917,27 @@ fn main() {
             );
         }
     }
-    // pairs ONLY landmark caught (its unique contribution)
-    let only_lm: Vec<(usize, usize)> = accept
+    let only_lm = accept
         .iter()
         .filter(|p| {
             lm.contains(*p)
-                && RETRIEVERS
+                && names
                     .iter()
-                    .filter(|&&r| r != "reprise-landmark")
-                    .all(|&r| !run.retr_pairs[r].contains(*p))
+                    .filter(|n| n.as_str() != "reprise-landmark")
+                    .all(|n| !run.retr_pairs[n].contains(*p))
         })
-        .copied()
-        .collect();
+        .count();
     println!(
-        "\n(2) verified ACCEPT pairs caught ONLY by landmark (no canonical scheme): {}",
-        only_lm.len()
+        "\n(2) verified ACCEPT pairs caught ONLY by landmark (no canonical scheme): {only_lm}"
     );
-    for &(a, b) in only_lm.iter().take(20) {
-        println!(
-            "      {}  <->  {}",
-            unit_label(&units[a]),
-            unit_label(&units[b])
-        );
-    }
-
-    // (3) can a canonical scheme match landmark recall at lower flood/cost?
     let lm_flood = lm.len();
     let lm_recall = rowsa[0].2;
     println!(
-        "\n(3) does any canonical scheme match landmark recall ({:.3}) at lower flood ({})?",
-        lm_recall, lm_flood
+        "\n(3) does any canonical scheme match landmark recall ({lm_recall:.3}) at lower flood ({lm_flood})?"
     );
-    for (name, flood, recall, _prec, _idx, _q) in rowsa.iter().skip(1) {
+    for (name, flood, recall, _prec) in rowsa.iter().skip(1) {
         let verdict = if *recall >= lm_recall - 1e-9 && *flood < lm_flood {
-            "YES — matches/beats recall at LOWER flood (grounds to reconsider landmark)"
+            "YES — matches/beats recall at LOWER flood"
         } else if *recall >= lm_recall - 1e-9 {
             "recall-match but NOT lower flood"
         } else {
