@@ -64,6 +64,25 @@ struct Rep {
     rare_set: Vec<u128>,
     /// Floor-3 subtree hashes in pre-order (offset order), folded to u64. Substrate for winnowing.
     stream: Vec<u64>,
+    /// SWEEP EXTENSION: full floor-3 inventory with tree metadata (offset, hash, tokens, depth,
+    /// kind-salience tier), offset-sorted. Substrate for the H-tree-*, H-peak-cap, H-floor-align,
+    /// and H-salience variants. Additive — does not alter the fields the four incumbent
+    /// retrievers read, so their measurements are unchanged.
+    nodes3: Vec<Node3>,
+}
+
+/// SWEEP EXTENSION: one floor-3 subtree with the tree metadata the alternate landmark
+/// DEFINITIONS need. `depth` is the tree depth (all NormNodes counted), `kind_code` the
+/// salience tier of the subtree root (0 low / 1 med / 2 high). The subtree spans pre-order
+/// node indices `[offset, offset+tokens)` (token_count == node count, D1), so containment
+/// between two Node3 is a cheap span test.
+#[derive(Clone, Copy)]
+struct Node3 {
+    offset: u32,
+    hash: u128,
+    tokens: u32,
+    depth: u16,
+    kind_code: u8,
 }
 
 /// One language partition: the rep set plus the unit-index<->rep-index maps.
@@ -71,10 +90,51 @@ struct LangCorpus {
     lang: Lang,
     ir: bool,
     reps: Vec<Rep>,
+    /// SWEEP EXTENSION: corpus df over the floor-6 bag_set (the incumbent rare test's df,
+    /// which the `unwrap_or(0)` leak reads — floor-3 sub-floor subtrees are absent, df 0).
+    df6: HashMap<u128, u32>,
+    /// SWEEP EXTENSION: corpus df over the FULL floor-3 inventory (H-floor-align's real df —
+    /// 3..6-token subtrees get a genuine count instead of leaking to 0/rare-by-default).
+    df3: HashMap<u128, u32>,
+    /// SWEEP EXTENSION: the incumbent `rare_cap = 3.max(units/20)`.
+    rare_cap: u32,
 }
 
 fn fold128(h: u128) -> u64 {
     (h as u64) ^ ((h >> 64) as u64)
+}
+
+// ============================ SWEEP EXTENSION: tree metadata helpers ============================
+
+/// Salience tier of an IR node kind (H-salience). HIGH (2) = control-flow, calls, opaque
+/// native constructs — the discriminative skeleton. MED (1) = operators / assignment / index /
+/// lambda. LOW (0) = structure and leaves (Block/Field/Var/Lit/Unit) and language operator
+/// tokens. The corpus is IR-normalized (Rust/Python/Go frontends), so kinds are the canonical
+/// vocabulary in `ir::kind` (or a language token). Unknown kinds default LOW.
+fn kind_tier(kind: &str) -> u8 {
+    match kind {
+        "Branch" | "Loop" | "Arm" | "Return" | "Break" | "Continue" | "Call" | "Iter"
+        | "NativeStmt" | "NativeExpr" | "NativePat" | "NativeType" => 2,
+        "Binop" | "Unop" | "Assign" | "Index" | "Lambda" => 1,
+        _ => 0,
+    }
+}
+
+/// Pre-order walk assigning each NormNode its offset (a per-node counter, matching
+/// `fingerprint::walk_inventory`'s numbering — node before children, children in order) and
+/// recording `(depth, kind_tier)`. `out[offset]` is dense over `0..node_count`, so it joins
+/// against `subtree_inventory` (which shares the numbering) by offset.
+fn preorder_dk(
+    node: &reprise::tree::NormNode,
+    depth: u16,
+    ctr: &mut u32,
+    out: &mut Vec<(u16, u8)>,
+) {
+    out.push((depth, kind_tier(&node.kind)));
+    *ctr += 1;
+    for c in &node.children {
+        preorder_dk(c, depth + 1, ctr, out);
+    }
 }
 
 /// Build the shared substrate for one language, mirroring matchtree.rs / lm_validate.rs.
@@ -99,12 +159,32 @@ fn build_lang_corpus(units: &[Unit], lang: Lang, cfg: &Config) -> Option<LangCor
         bag_set: Vec<u128>,
         offsets: Vec<(u128, Vec<u32>)>,
         stream: Vec<u64>,
+        nodes3: Vec<Node3>,
     }
     let mut partials: Vec<Partial> = eligible
         .par_iter()
         .map(|&idx| {
             let inv: Vec<Subtree> =
                 fingerprint::subtree_inventory(&units[idx].tree, 3, HashMode::MaskedLocals);
+            // SWEEP EXTENSION: parallel pre-order (depth, kind_tier) per node offset, joined to
+            // the floor-3 inventory to build nodes3 (offset-sorted).
+            let mut dk: Vec<(u16, u8)> = Vec::new();
+            let mut ctr = 0u32;
+            preorder_dk(&units[idx].tree, 0, &mut ctr, &mut dk);
+            let mut nodes3: Vec<Node3> = inv
+                .iter()
+                .map(|s| {
+                    let (depth, kind_code) = dk[s.offset as usize];
+                    Node3 {
+                        offset: s.offset,
+                        hash: s.hash,
+                        tokens: s.tokens,
+                        depth,
+                        kind_code,
+                    }
+                })
+                .collect();
+            nodes3.sort_unstable_by_key(|n| n.offset);
             // offsets (hash-sorted, hash -> offsets)
             let mut flat: Vec<(u128, u32)> = inv.iter().map(|s| (s.hash, s.offset)).collect();
             flat.sort_unstable();
@@ -132,6 +212,7 @@ fn build_lang_corpus(units: &[Unit], lang: Lang, cfg: &Config) -> Option<LangCor
                 bag_set,
                 offsets,
                 stream,
+                nodes3,
             }
         })
         .collect();
@@ -141,6 +222,14 @@ fn build_lang_corpus(units: &[Unit], lang: Lang, cfg: &Config) -> Option<LangCor
     for p in &partials {
         for h in &p.bag_set {
             *df.entry(*h).or_insert(0) += 1;
+        }
+    }
+    // SWEEP EXTENSION: corpus df over the FULL floor-3 inventory (one count per unit per hash,
+    // matching how df6 counts the deduped bag_set) — H-floor-align's leak-free df.
+    let mut df3: HashMap<u128, u32> = HashMap::new();
+    for p in &partials {
+        for (h, _) in &p.offsets {
+            *df3.entry(*h).or_insert(0) += 1;
         }
     }
     let rare_cap = 3.max(partials.len() as u32 / 20);
@@ -165,11 +254,19 @@ fn build_lang_corpus(units: &[Unit], lang: Lang, cfg: &Config) -> Option<LangCor
                 rare_peaks,
                 rare_set,
                 stream: p.stream,
+                nodes3: p.nodes3,
             }
         })
         .collect();
 
-    Some(LangCorpus { lang, ir, reps })
+    Some(LangCorpus {
+        lang,
+        ir,
+        reps,
+        df6: df,
+        df3,
+        rare_cap,
+    })
 }
 
 // ============================ generic shared-count retrieval ============================
@@ -434,6 +531,221 @@ fn retr_minhash(reps: &[Rep], bands: usize, rows: usize) -> (Vec<(u32, u32)>, us
         }
     }
     (pairs.into_iter().collect(), entries)
+}
+
+// ============================ SWEEP EXTENSION: alternate landmark DEFINITIONS ============================
+//
+// Each variant below is a new `candidates()` entrant that reuses the SAME shared substrate
+// (nodes3 / df6 / df3) and the SAME owner->count->min_shared clique as the incumbent — only
+// the landmark DEFINITION (peak selection + relation encoding) changes, so any flood/recall
+// delta is attributable to the definition. Measurement only; src/ is untouched.
+
+/// The incumbent owner->pair-count->min_shared clique, factored out (identical to
+/// `retr_landmark_ms`'s body). `df_cap = 50` matches every incumbent retriever.
+fn pairs_from_lms(lms: &[Vec<u128>], min_shared: usize) -> Vec<(u32, u32)> {
+    let df_cap = 50usize;
+    let mut owners: HashMap<u128, Vec<u32>> = HashMap::new();
+    for (i, l) in lms.iter().enumerate() {
+        for &h in l {
+            owners.entry(h).or_default().push(i as u32);
+        }
+    }
+    let mut counts: HashMap<(u32, u32), u32> = HashMap::new();
+    for own in owners.values() {
+        if own.len() < 2 || own.len() > df_cap {
+            continue;
+        }
+        for a in 0..own.len() {
+            for b in a + 1..own.len() {
+                *counts.entry((own[a], own[b])).or_insert(0) += 1;
+            }
+        }
+    }
+    counts
+        .into_iter()
+        .filter(|&(_, c)| c as usize >= min_shared)
+        .map(|(p, _)| p)
+        .collect()
+}
+
+// ---- peak-selection strategies (each returns offset-sorted rare peaks as Node3) ----
+
+/// H-baseline: the incumbent rare test — df over floor-6 bag_set with the `unwrap_or(0)` leak
+/// (floor-3 sub-floor subtrees absent from the bag count as df 0 => rare-by-default).
+fn peaks_baseline(lc: &LangCorpus, rep: &Rep) -> Vec<Node3> {
+    rep.nodes3
+        .iter()
+        .copied()
+        .filter(|n| lc.df6.get(&n.hash).copied().unwrap_or(0) <= lc.rare_cap)
+        .collect()
+}
+
+/// H-floor-align: same rare_cap, but the df is the leak-free FULL floor-3 df (df3), so 3..6-token
+/// subtrees get a genuine corpus count instead of auto-rare.
+fn peaks_aligned(lc: &LangCorpus, rep: &Rep) -> Vec<Node3> {
+    rep.nodes3
+        .iter()
+        .copied()
+        .filter(|n| lc.df3.get(&n.hash).copied().unwrap_or(0) <= lc.rare_cap)
+        .collect()
+}
+
+/// H-peak-cap: keep only the top-K rarest of a base peak set (rarity = df3 ascending, ties to
+/// larger subtrees first), then re-sort by offset for constellation building.
+fn cap_topk(mut peaks: Vec<Node3>, lc: &LangCorpus, k: usize) -> Vec<Node3> {
+    if peaks.len() <= k {
+        return peaks;
+    }
+    peaks.sort_unstable_by(|a, b| {
+        let da = lc.df3.get(&a.hash).copied().unwrap_or(0);
+        let db = lc.df3.get(&b.hash).copied().unwrap_or(0);
+        da.cmp(&db)
+            .then(b.tokens.cmp(&a.tokens))
+            .then(a.offset.cmp(&b.offset))
+    });
+    peaks.truncate(k);
+    peaks.sort_unstable_by_key(|n| n.offset);
+    peaks
+}
+
+/// H-salience: keep only base peaks whose subtree-root kind tier is >= `tier_min`.
+fn filter_salient(peaks: Vec<Node3>, tier_min: u8) -> Vec<Node3> {
+    peaks
+        .into_iter()
+        .filter(|n| n.kind_code >= tier_min)
+        .collect()
+}
+
+// ---- constellation (relation) encodings ----
+
+/// Incumbent LINEAR encoding: each peak x its next `fan_out` by offset, tuple
+/// (anchorHash, targetHash, (Δoffset)/8). With `fan_out=3` over `peaks_baseline` this is
+/// byte-identical to `landmark_hashes` (verified in the sweep: reproduces flood 8013).
+fn constellation_linear(peaks: &[Node3], fan_out: usize) -> Vec<u128> {
+    let mut out = Vec::new();
+    for i in 0..peaks.len() {
+        for j in i + 1..(i + 1 + fan_out).min(peaks.len()) {
+            let delta = (peaks[j].offset - peaks[i].offset) / 8;
+            let mut buf = Vec::with_capacity(36);
+            buf.extend_from_slice(&peaks[i].hash.to_le_bytes());
+            buf.extend_from_slice(&peaks[j].hash.to_le_bytes());
+            buf.extend_from_slice(&delta.to_le_bytes());
+            out.push(xxh3_128(&buf));
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// H-tree-constellation: replace the linear Δoffset with an AST RELATION. For anchor i and
+/// target j (offset i < j), the relation code packs (containment, depth-delta):
+///   - nested bit: 1 iff j lies inside i's subtree span `[off_i, off_i+tok_i)` (i is an ancestor
+///     of j), else 0 (j is disjoint/following).
+///   - depth-delta: `depth_j - depth_i` clamped to [-15, 15].
+///
+/// Hypothesis: a structural relation is less coincidental than a quantized token gap, so equal
+/// structures collide while unrelated peaks at the same token distance do not => less flood.
+fn constellation_tree(peaks: &[Node3], fan_out: usize) -> Vec<u128> {
+    let mut out = Vec::new();
+    for i in 0..peaks.len() {
+        for j in i + 1..(i + 1 + fan_out).min(peaks.len()) {
+            let nested = peaks[j].offset < peaks[i].offset + peaks[i].tokens && peaks[i].tokens > 1;
+            let dd = (i32::from(peaks[j].depth) - i32::from(peaks[i].depth)).clamp(-15, 15);
+            let relcode: u32 = ((nested as u32) << 8) | ((dd + 16) as u32);
+            let mut buf = Vec::with_capacity(36);
+            buf.extend_from_slice(&peaks[i].hash.to_le_bytes());
+            buf.extend_from_slice(&peaks[j].hash.to_le_bytes());
+            buf.extend_from_slice(&relcode.to_le_bytes());
+            out.push(xxh3_128(&buf));
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+// ---- generic variant runner (peaks x encoding x min_shared) ----
+
+/// Build landmark hashes for every rep via `(select, encode)` and return the shared-count pairs.
+fn retr_variant(
+    lc: &LangCorpus,
+    select: &(dyn Fn(&LangCorpus, &Rep) -> Vec<Node3> + Sync),
+    encode: &(dyn Fn(&[Node3]) -> Vec<u128> + Sync),
+    min_shared: usize,
+) -> Vec<(u32, u32)> {
+    let lms: Vec<Vec<u128>> = lc
+        .reps
+        .par_iter()
+        .map(|rep| encode(&select(lc, rep)))
+        .collect();
+    pairs_from_lms(&lms, min_shared)
+}
+
+// ---- H-tree-verify: structural depth-delta histogram, used as a retriever-side pre-filter ----
+
+/// Structural analog of `offset_histogram_passes`: over shared floor-3 subtrees, vote on the
+/// DEPTH delta `depth_a - depth_b` (not the token-offset delta). Consistent clones place shared
+/// subtrees at consistent relative depths. Same vote budget (`needed`) as the offset histogram.
+/// Used to FILTER a retriever's candidates (reduce flood); the trusted oracle is unchanged.
+fn tree_hist_passes(a: &Rep, b: &Rep, cfg: &Config) -> bool {
+    // hash -> depths, per unit (sorted by hash for a merge join).
+    fn by_hash(rep: &Rep) -> Vec<(u128, Vec<u16>)> {
+        let mut v: Vec<(u128, Vec<u16>)> = Vec::new();
+        for n in &rep.nodes3 {
+            match v.last_mut() {
+                Some((h, ds)) if *h == n.hash => ds.push(n.depth),
+                _ => v.push((n.hash, vec![n.depth])),
+            }
+        }
+        // nodes3 is offset-sorted, so re-sort by hash for the join.
+        v.sort_unstable_by_key(|(h, _)| *h);
+        v
+    }
+    let ha = by_hash(a);
+    let hb = by_hash(b);
+    let min_inventory = ha.len().min(hb.len()) as u32;
+    let needed = cfg.histogram_min_votes().max(min_inventory / 8);
+    let mut bins: HashMap<i32, u32> = HashMap::new();
+    let mut best = 0u32;
+    let mut local: Vec<i32> = Vec::with_capacity(16);
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < ha.len() && j < hb.len() {
+        if best >= needed {
+            return true;
+        }
+        match ha[i].0.cmp(&hb[j].0) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                local.clear();
+                for &da in ha[i].1.iter().take(4) {
+                    for &db in hb[j].1.iter().take(4) {
+                        let bin = i32::from(da) - i32::from(db);
+                        if !local.contains(&bin) {
+                            local.push(bin);
+                        }
+                    }
+                }
+                for &bin in &local {
+                    let v = bins.entry(bin).or_insert(0);
+                    *v += 1;
+                    best = best.max(*v);
+                }
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    best >= needed
+}
+
+/// Apply the structural depth-delta histogram as a post-filter to a candidate rep-pair set.
+fn filter_tree_hist(lc: &LangCorpus, pairs: Vec<(u32, u32)>, cfg: &Config) -> Vec<(u32, u32)> {
+    pairs
+        .into_par_iter()
+        .filter(|&(i, j)| tree_hist_passes(&lc.reps[i as usize], &lc.reps[j as usize], cfg))
+        .collect()
 }
 
 // ============================ trusted verify chain (lm_validate.rs verbatim) ============================
@@ -1174,6 +1486,181 @@ fn main() {
         let r = variant_pairs(&run.langs, &move |reps| retr_sourcerer(reps, ms).0);
         let s = variant_pairs(&syn_run.langs, &move |reps| retr_sourcerer(reps, ms).0);
         eval(&format!("min_shared={ms}"), &r, &s);
+    }
+
+    // ================= SWEEP EXTENSION: alternate landmark DEFINITIONS =================
+    // Each row is a new candidate DEFINITION on the shared substrate; recall is measured
+    // against the FIXED oracle A (verify-union ACCEPT, 45 pairs) and oracle B (synthetic near).
+    let variant_pairs_lc =
+        |langs: &[LangCorpus], f: &(dyn Fn(&LangCorpus) -> RepPairs + Sync)| -> PairSet {
+            let mut all = HashSet::new();
+            for lc in langs {
+                for (i, j) in f(lc) {
+                    let (a, b) = (lc.reps[i as usize].unit_idx, lc.reps[j as usize].unit_idx);
+                    all.insert((a.min(b), a.max(b)));
+                }
+            }
+            all
+        };
+    let stat = |real: &PairSet, syn: &PairSet| -> (usize, f64, f64, f64) {
+        let flood = real.len();
+        let surf = real.iter().filter(|p| accept.contains(*p)).count();
+        let ra = surf as f64 / accept.len().max(1) as f64;
+        let rb = bc
+            .near
+            .iter()
+            .filter(|(a, b, _)| syn.contains(&(*a, *b)))
+            .count() as f64
+            / bc.near.len().max(1) as f64;
+        let prec = surf as f64 / flood.max(1) as f64;
+        (flood, ra, rb, prec)
+    };
+    // summary rows: (label, flood, recallA, recallB, precision, query-ms)
+    let mut summary: Vec<(String, usize, f64, f64, f64, f64)> = Vec::new();
+    let cfg_ref = &cfg;
+    let mut go = |label: String, f: &(dyn Fn(&LangCorpus) -> RepPairs + Sync)| {
+        let t = Instant::now();
+        let real = variant_pairs_lc(&run.langs, f);
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        let syn = variant_pairs_lc(&syn_run.langs, f);
+        let (flood, ra, rb, prec) = stat(&real, &syn);
+        println!(
+            "    {label:<40} floodA {flood:>7}  recallA {ra:>6.3}  recallB {rb:>6.3}  prec {prec:>7.4}  {ms:>6.1}ms"
+        );
+        summary.push((label, flood, ra, rb, prec, ms));
+    };
+
+    println!("\n=== LANDMARK-DEFINITION SWEEP (alternate definitions; oracle fixed) ===");
+
+    println!(
+        "  -- H-fanout-sweep: linear encoding, baseline rare peaks (fan=3,ms=2 == incumbent) --"
+    );
+    for fan in [2usize, 3, 4] {
+        for ms in [2usize, 3, 4] {
+            let f = move |lc: &LangCorpus| -> RepPairs {
+                retr_variant(
+                    lc,
+                    &|lc, rep| peaks_baseline(lc, rep),
+                    &move |p: &[Node3]| constellation_linear(p, fan),
+                    ms,
+                )
+            };
+            go(format!("fan={fan} ms={ms}"), &f);
+        }
+    }
+
+    println!("  -- H-tree-constellation: structural relcode (containment + depth-delta) --");
+    for fan in [2usize, 3, 4] {
+        for ms in [2usize, 3, 4] {
+            let f = move |lc: &LangCorpus| -> RepPairs {
+                retr_variant(
+                    lc,
+                    &|lc, rep| peaks_baseline(lc, rep),
+                    &move |p: &[Node3]| constellation_tree(p, fan),
+                    ms,
+                )
+            };
+            go(format!("tree fan={fan} ms={ms}"), &f);
+        }
+    }
+
+    println!(
+        "  -- H-tree-verify: linear candidates (fan,ms), then structural depth-delta hist filter --"
+    );
+    for (fan, ms) in [(3usize, 2usize), (3, 3), (2, 2), (2, 3), (4, 4), (2, 4)] {
+        let f = move |lc: &LangCorpus| -> RepPairs {
+            let cands = retr_variant(
+                lc,
+                &|lc, rep| peaks_baseline(lc, rep),
+                &move |p: &[Node3]| constellation_linear(p, fan),
+                ms,
+            );
+            filter_tree_hist(lc, cands, cfg_ref)
+        };
+        go(format!("linear fan={fan} ms={ms} + tree-hist"), &f);
+    }
+
+    println!("  -- H-peak-cap: baseline peaks capped to top-K rarest, linear fan=3 --");
+    for k in [4usize, 6, 8, 12, 16, 24] {
+        for ms in [2usize, 3] {
+            let f = move |lc: &LangCorpus| -> RepPairs {
+                retr_variant(
+                    lc,
+                    &move |lc, rep| cap_topk(peaks_baseline(lc, rep), lc, k),
+                    &|p: &[Node3]| constellation_linear(p, 3),
+                    ms,
+                )
+            };
+            go(format!("cap K={k} ms={ms}"), &f);
+        }
+    }
+
+    println!("  -- H-floor-align: rare test on leak-free floor-3 df (df3), linear fan=3 --");
+    for ms in [2usize, 3, 4] {
+        let f = move |lc: &LangCorpus| -> RepPairs {
+            retr_variant(
+                lc,
+                &|lc, rep| peaks_aligned(lc, rep),
+                &|p: &[Node3]| constellation_linear(p, 3),
+                ms,
+            )
+        };
+        go(format!("floor-align ms={ms}"), &f);
+    }
+
+    println!(
+        "  -- H-salience: peaks filtered by kind tier (1=+ops, 2=control/call), linear fan=3 --"
+    );
+    for tier in [1u8, 2] {
+        for ms in [2usize, 3] {
+            let f = move |lc: &LangCorpus| -> RepPairs {
+                retr_variant(
+                    lc,
+                    &move |lc, rep| filter_salient(peaks_baseline(lc, rep), tier),
+                    &|p: &[Node3]| constellation_linear(p, 3),
+                    ms,
+                )
+            };
+            go(format!("salient tier>={tier} ms={ms}"), &f);
+        }
+    }
+    println!("  -- H-salience x floor-align (aligned df + tier filter) --");
+    for tier in [1u8, 2] {
+        for ms in [2usize, 3] {
+            let f = move |lc: &LangCorpus| -> RepPairs {
+                retr_variant(
+                    lc,
+                    &move |lc, rep| filter_salient(peaks_aligned(lc, rep), tier),
+                    &|p: &[Node3]| constellation_linear(p, 3),
+                    ms,
+                )
+            };
+            go(format!("aligned+salient tier>={tier} ms={ms}"), &f);
+        }
+    }
+
+    // ---- recall=1.0 winners: definitions that hold BOTH recalls at 1.0, ranked by flood ----
+    let incumbent_flood = run.retr_pairs["reprise-landmark"].len();
+    println!(
+        "\n=== RECALL=1.0 FLOOD RANKING (vs incumbent flood {incumbent_flood}; free win min_shared=3) ==="
+    );
+    let eps = 1e-9;
+    let mut winners: Vec<&(String, usize, f64, f64, f64, f64)> = summary
+        .iter()
+        .filter(|(_, _, ra, rb, _, _)| *ra >= 1.0 - eps && *rb >= 1.0 - eps)
+        .collect();
+    winners.sort_by_key(|(_, flood, _, _, _, _)| *flood);
+    println!("  definitions holding recallA=1.0 AND recallB=1.0, by flood ascending:");
+    for (label, flood, _ra, _rb, prec, ms) in &winners {
+        let vs = if *flood < incumbent_flood {
+            format!("-{} vs incumbent", incumbent_flood - flood)
+        } else {
+            format!("+{} vs incumbent", flood - incumbent_flood)
+        };
+        println!("    {label:<40} flood {flood:>7}  prec {prec:>7.4}  {ms:>6.1}ms   ({vs})");
+    }
+    if winners.is_empty() {
+        println!("    (none held both recalls at 1.0)");
     }
 
     // ---- verdict ----
