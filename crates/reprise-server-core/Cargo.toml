@@ -1,0 +1,11 @@
+[package]
+name = "reprise-server-core"
+version = "0.1.0"
+edition = "2024"
+license = "BSD-3-Clause"
+description = "Protocol-neutral helpers shared by reprise's LSP and MCP server surfaces (docs/SERVERS.md). Sync and tokio-free by design."
+publish = false
+
+[dependencies]
+reprise = { path = "../.." }
+anyhow = "1.0.103"

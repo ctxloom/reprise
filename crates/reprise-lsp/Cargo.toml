@@ -1,0 +1,18 @@
+[package]
+name = "reprise-lsp"
+version = "0.1.0"
+edition = "2024"
+license = "BSD-3-Clause"
+description = "Language Server Protocol server surfacing reprise clone findings as advisory diagnostics (docs/SERVERS.md §4)."
+publish = false
+
+[dependencies]
+reprise = { path = "../.." }
+reprise-server-core = { path = "../reprise-server-core" }
+anyhow = "1.0.103"
+serde_json = "1.0.150"
+# The maintained fork of tower-lsp (the original is unmaintained); it renames the
+# root module to `tower_lsp_server` and re-exports protocol types as `ls_types`.
+# Runtime confined to this crate; the static reprise CLI never sees it.
+tower-lsp-server = "0.23"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std"] }
