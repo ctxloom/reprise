@@ -141,6 +141,16 @@ pub struct RetrievalCfg {
     /// Pair-event window for hashes with many owners; 0 = unlimited (df_cap
     /// already bounds the quadratic). The M3b window of 3 cost 30/43 pairs (D27).
     pub owner_pair_window: usize,
+    /// Coverage-fraction candidate gate (docs/substantiality-metric.md §0.3):
+    /// retain a landmark candidate only when its shared constellation is at least
+    /// this fraction of the smaller unit's landmark set. A whole-unit clone covers
+    /// most of each unit (accepted near-clones sit at median ~0.61); a coincidental
+    /// boilerplate region covers little (rejected flood sits at ~0.06). Gating
+    /// pre-AU cuts the landmark flood at zero recall cost: the live sweep found
+    /// t=0.05 → recall 1.000, flood cut ~0.44 (fidelity-proven). A pure
+    /// candidate-generation filter — it never touches the fingerprint or cache key
+    /// (hash-neutral). 0 disables the gate.
+    pub landmark_coverage_min: f64,
 }
 
 impl Default for RetrievalCfg {
@@ -149,6 +159,7 @@ impl Default for RetrievalCfg {
             landmark_pairs: true,
             shared_landmarks_min: 2,
             owner_pair_window: 0,
+            landmark_coverage_min: 0.05,
         }
     }
 }

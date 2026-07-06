@@ -32,6 +32,10 @@ pub struct NearGroup {
 pub struct RetrievalStats {
     pub candidates_bag: usize,
     pub candidates_landmark: usize,
+    /// Landmark candidates dropped by the coverage-fraction gate (§0.3): the
+    /// recall-neutral pre-AU flood cut. Reported so the gate's marginal effect is
+    /// a live number, not an assumption.
+    pub candidates_landmark_coverage_gated: usize,
     pub candidates_total: usize,
     pub histogram_rejected: usize,
     pub verified_pairs: usize,
@@ -196,13 +200,32 @@ fn near_groups_for_lang(
         // (dozens of pairs; audio ID works from 1–2% of thousands), so the
         // recall cost is nil on the benchmark, measured per §7.4(b).
         let shared_landmarks_min = cfg.retrieval.shared_landmarks_min;
+        let coverage_min = cfg.retrieval.landmark_coverage_min;
         stats.landmark_index_size += reps.iter().map(|r| r.landmarks.len()).sum::<usize>();
         for ((i, j), shared) in shared_count_pairs(&reps, |r| &r.landmarks, df_cap, window) {
-            if shared >= shared_landmarks_min {
-                let entry = candidates.entry((i, j)).or_default();
-                entry.1 = true;
-                stats.candidates_landmark += 1;
+            if shared < shared_landmarks_min {
+                continue;
             }
+            // Coverage-fraction candidate gate (docs/substantiality-metric.md
+            // §0.3): the shared constellation as a fraction of the smaller unit's
+            // landmark set. A whole-unit clone covers most of each unit; a
+            // coincidental boilerplate region covers little — exactly the flood
+            // mechanism. Uses the FULL (df-uncapped) landmark intersection so the
+            // gate is never MORE aggressive than the validated definition, and is
+            // strictly recall-safe: a pair also proposed by the bag layer keeps its
+            // `.0` flag and is still verified. Pre-AU, so it saves the O(n·m)
+            // anti-unification on the coincidences it drops.
+            if coverage_min > 0.0 {
+                let denom = reps[i].landmarks.len().min(reps[j].landmarks.len()).max(1) as f64;
+                let full_shared = intersect_count(&reps[i].landmarks, &reps[j].landmarks);
+                if (full_shared as f64) / denom < coverage_min {
+                    stats.candidates_landmark_coverage_gated += 1;
+                    continue;
+                }
+            }
+            let entry = candidates.entry((i, j)).or_default();
+            entry.1 = true;
+            stats.candidates_landmark += 1;
         }
     }
     stats.candidates_total += candidates.len();
@@ -369,6 +392,25 @@ fn tautological(units: &[Unit], a: usize, b: usize) -> bool {
     };
     let (ba, bb) = (base_of(units, a), base_of(units, b));
     units[ba].fingerprint == units[bb].fingerprint || one_way(a, b) || one_way(b, a)
+}
+
+/// Count of shared hashes between two sorted, deduplicated hash lists (a linear
+/// merge). Used by the coverage-fraction gate: the FULL landmark intersection
+/// (no df cap), matching the validated §0.3 coverage definition.
+fn intersect_count(a: &[u128], b: &[u128]) -> usize {
+    let (mut i, mut j, mut n) = (0usize, 0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                n += 1;
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    n
 }
 
 /// Shared-hash counts for all pairs (skip hashes with df > cap). Fully
