@@ -360,6 +360,58 @@ pub fn has_ir_frontend(lang: Lang) -> bool {
     !ir_root_kinds(lang).is_empty()
 }
 
+// ---- grammar-schema probe (D-SP4; docs/sp4-grammar-lift-plan.md §4, increment 4) ----
+
+/// A readable, sorted dump of a grammar's reflection surface — the **named** node kinds and the
+/// field names the *actually linked* tree-sitter [`tree_sitter::Language`] exposes, via the 0.26
+/// reflection API (`node_kind_count`/`node_kind_for_id`/`node_kind_is_named`,
+/// `field_count`/`field_name_for_id`). Snapshotted (increment 4) so a future grammar-crate bump
+/// surfaces as a **reviewable diff** rather than a silent hash move — the cheap readable-schema
+/// harness of `docs/SIMILARITY-IR.md` §12.1 applied to the grammar surface. It is additive tooling:
+/// no canonical-form or parity claim. (It is also the ground truth the increment-5 conformance gate
+/// checks the dispatch tables against — the inverse direction.)
+///
+/// Anonymous/auxiliary kinds are filtered out (`node_kind_is_named`) and field id 0 ("no field") is
+/// skipped (field ids are `1..=field_count`); the result is sorted + de-duplicated for a stable,
+/// order-independent snapshot. The named filter matches the gate's `id_for_node_kind(kind, named =
+/// true)` resolution, so schema and gate agree on what "a kind exists" means.
+// Registered-now/consumed-later: the snapshot test (increment 4) and the conformance gate
+// (increment 5) are the only readers, both `#[cfg(test)]`, so this is dead in the plain library
+// build — the same scoped `allow` the `RESIDUE_KINDS` tables carry.
+#[allow(dead_code)]
+pub(crate) fn grammar_schema(lang: Lang) -> String {
+    use std::fmt::Write as _;
+    let language = lang.ts_language();
+    let mut kinds: Vec<&str> = (0..language.node_kind_count())
+        .filter_map(|id| {
+            let id = id as u16;
+            language
+                .node_kind_is_named(id)
+                .then(|| language.node_kind_for_id(id))
+                .flatten()
+        })
+        .collect();
+    kinds.sort_unstable();
+    kinds.dedup();
+    let mut fields: Vec<&str> = (1..=language.field_count())
+        .filter_map(|id| language.field_name_for_id(id as u16))
+        .collect();
+    fields.sort_unstable();
+    fields.dedup();
+
+    let mut out = String::new();
+    let _ = writeln!(out, "grammar: {}", lang.name());
+    let _ = writeln!(out, "named kinds ({}):", kinds.len());
+    for k in &kinds {
+        let _ = writeln!(out, "  {k}");
+    }
+    let _ = writeln!(out, "fields ({}):", fields.len());
+    for f in &fields {
+        let _ = writeln!(out, "  {f}");
+    }
+    out
+}
+
 /// Walk `src`'s CST and IR-normalize every function-like unit — the IR-path analog of
 /// `normalize::extract_raw_units`. Rust/Python/Go.
 pub fn extract_ir_units(src: &str, lang: Lang, path: &std::path::Path) -> Vec<IrUnit> {
@@ -1421,5 +1473,52 @@ mod tests {
         let mut off = TransformLog::disabled();
         let _ = pipeline(CASES[0].1, Lang::Rust, &mut off);
         assert!(off.is_empty(), "disabled sink recorded events");
+    }
+}
+
+#[cfg(test)]
+mod grammar_schema_tests {
+    use super::grammar_schema;
+    use crate::lang::Lang;
+
+    /// The grammars that have an IR frontend (the increment-5 gate's scope). TS/Kotlin have no
+    /// frontend yet (`docs/SIMILARITY-IR.md` §9 P2), so their grammar surface is not snapshotted
+    /// until their frontends (and tables) exist.
+    const SNAPSHOTTED: &[(Lang, &str)] = &[
+        (Lang::Rust, "grammar-rust.snap"),
+        (Lang::Python, "grammar-python.snap"),
+        (Lang::Go, "grammar-go.snap"),
+    ];
+
+    /// Snapshot each frontend grammar's named-kind + field surface (increment 4). A grammar-crate
+    /// bump that renames/adds/removes a kind or field then produces a **reviewable diff** here
+    /// instead of silently moving a hash. Regenerate deliberately, after *reviewing* a bump's diff,
+    /// with `UPDATE_GRAMMAR_SNAPSHOTS=1 cargo test` (the bump ritual — increment 6). This is
+    /// additive tooling: it makes no canonical-form/parity claim, it only watches the grammar edge.
+    #[test]
+    fn grammar_schema_matches_snapshot() {
+        for &(lang, file) in SNAPSHOTTED {
+            let actual = grammar_schema(lang);
+            let path = format!(
+                "{}/src/frontend/snapshots/{}",
+                env!("CARGO_MANIFEST_DIR"),
+                file
+            );
+            if std::env::var_os("UPDATE_GRAMMAR_SNAPSHOTS").is_some() {
+                std::fs::write(&path, &actual).expect("write grammar snapshot");
+                continue;
+            }
+            let expected = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                panic!(
+                    "missing grammar snapshot {path}: {e}; \
+                     regenerate with UPDATE_GRAMMAR_SNAPSHOTS=1"
+                )
+            });
+            assert_eq!(
+                actual, expected,
+                "grammar schema for {lang:?} drifted from {file}; if a grammar bump is intended, \
+                 review the diff then regenerate with UPDATE_GRAMMAR_SNAPSHOTS=1"
+            );
+        }
     }
 }
