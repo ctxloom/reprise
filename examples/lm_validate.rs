@@ -261,15 +261,7 @@ fn main() {
                     df_sum as f64 / shared.len() as f64
                 };
                 let (ua, ub) = (a.unit_idx, b.unit_idx);
-                let verdict = verify(
-                    &units_ref[ua],
-                    &units_ref[ub],
-                    a,
-                    b,
-                    profile,
-                    ir,
-                    cfg_ref,
-                );
+                let verdict = verify(&units_ref[ua], &units_ref[ub], a, b, profile, ir, cfg_ref);
                 let region = pair_region.get(&(i.min(j), i.max(j)));
                 let (has_region, region_frag_df) = match region {
                     Some(&(_len, fp)) => (true, frag_units[&fp].len() as u32),
@@ -325,7 +317,10 @@ fn main() {
         .iter()
         .filter(|r| r.verdict == Verdict::Accept)
         .count();
-    let weak = records.iter().filter(|r| r.verdict == Verdict::Weak).count();
+    let weak = records
+        .iter()
+        .filter(|r| r.verdict == Verdict::Weak)
+        .count();
     let rej = total - acc - weak;
     println!(
         "\npopulation (all landmark candidates): {total}  | ACCEPT(near-clone)={acc}  WEAK={weak}  REJECT={rej}"
@@ -338,7 +333,12 @@ fn main() {
         .collect();
     let neg: Vec<&Record> = records
         .iter()
-        .filter(|r| matches!(r.verdict, Verdict::SizeRej | Verdict::HistRej | Verdict::DivRej))
+        .filter(|r| {
+            matches!(
+                r.verdict,
+                Verdict::SizeRej | Verdict::HistRej | Verdict::DivRej
+            )
+        })
         .collect();
     println!(
         "\n[A] Accept vs Rejected  (pos={} neg={})",
@@ -403,9 +403,7 @@ fn main() {
         .collect();
     let class2: Vec<&Record> = records
         .iter()
-        .filter(|r| {
-            r.verdict != Verdict::Accept && (!r.has_region || r.region_frag_df >= 6)
-        })
+        .filter(|r| r.verdict != Verdict::Accept && (!r.has_region || r.region_frag_df >= 6))
         .collect();
     // Cleanest boiler-vs-genuine: BOTH have a real >=30-tok exact region, differ only in
     // corpus recurrence of that region (region_frag_df). No circularity with landmark-df.
@@ -416,7 +414,9 @@ fn main() {
     // Diagnostic: among REJECTED candidates that DO carry a >=30-tok exact region, how does
     // shared-landmark-df behave as the region's corpus recurrence (frag_df) grows? This is the
     // ambiguous middle where a df discount could wrongly fire on a genuine small clone family.
-    println!("\n[D0] rejected candidates WITH a >=30-tok exact region, bucketed by region_frag_df:");
+    println!(
+        "\n[D0] rejected candidates WITH a >=30-tok exact region, bucketed by region_frag_df:"
+    );
     let rej_reg: Vec<&Record> = records
         .iter()
         .filter(|r| r.verdict != Verdict::Accept && r.has_region)
@@ -458,30 +458,21 @@ fn main() {
     class_stats("class3 genuine-frag  (exact reg, dfrag=2)", &class3);
     if !class2.is_empty() && !class3.is_empty() {
         println!("\n   separation shared-landmark-df  class2(boiler) vs class3(genuine):");
-        auc_report(
-            "  df sep (AUC boiler>genuine)",
-            &class2,
-            &class3,
-            |r| r.shared_lm_df,
-        );
+        auc_report("  df sep (AUC boiler>genuine)", &class2, &class3, |r| {
+            r.shared_lm_df
+        });
         println!("   separation coverage-fraction  class2(boiler) vs class3(genuine):");
-        auc_report(
-            "  cov sep (AUC genuine>boiler)",
-            &class3,
-            &class2,
-            |r| r.coverage,
-        );
+        auc_report("  cov sep (AUC genuine>boiler)", &class3, &class2, |r| {
+            r.coverage
+        });
     }
     if !class2_reg.is_empty() && !class3.is_empty() {
         println!(
             "\n   CRISP (both have >=30-tok region): boiler-region(df>=6) vs genuine-region(df=2):"
         );
-        auc_report(
-            "  df sep (AUC boiler>genuine)",
-            &class2_reg,
-            &class3,
-            |r| r.shared_lm_df,
-        );
+        auc_report("  df sep (AUC boiler>genuine)", &class2_reg, &class3, |r| {
+            r.shared_lm_df
+        });
     }
 }
 
