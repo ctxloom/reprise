@@ -160,6 +160,16 @@ pub struct RetrievalCfg {
     /// candidate-generation filter — it never touches the fingerprint or cache key
     /// (hash-neutral). 0 disables the gate.
     pub landmark_coverage_min: f64,
+    /// H-tree-verify (docs/substantiality-metric.md §0.5): add a depth-delta
+    /// (depth_a−depth_b) consistency criterion alongside the offset-delta (Shazam
+    /// diagonal) one, over the SAME shared floor-3 subtrees, in the pre-AU verify
+    /// cascade. A genuine clone places its shared subtrees at consistent RELATIVE
+    /// depths; a coincidental landmark collision scatters. The §0.5 sweep measured
+    /// this cutting the pre-AU candidate flood ~48% at recall 1.000 (zero verified
+    /// pairs lost) on plain units — but that oracle was small, so it ships OFF and is
+    /// promoted only once the whole-repo + inline-on byte-identical `verified_pairs`
+    /// gate holds. A pure candidate pre-filter: hash-neutral, never in the cache key.
+    pub tree_verify: bool,
 }
 
 impl Default for RetrievalCfg {
@@ -170,6 +180,7 @@ impl Default for RetrievalCfg {
             shared_landmarks_min: 2,
             owner_pair_window: 0,
             landmark_coverage_min: 0.05,
+            tree_verify: false,
         }
     }
 }

@@ -54,10 +54,13 @@ pub struct RetrievalStats {
 pub struct RepData {
     unit_idx: usize,
     bag_set: Vec<u128>,
-    /// Subtree hash → pre-order offsets, sorted by hash: the histogram
-    /// intersects two of these by linear merge, no hashing (M3b/D22 — the
-    /// per-candidate HashMap probes dominated 500k-LOC scans).
-    offsets: Vec<(u128, Vec<u32>)>,
+    /// Subtree hash → (pre-order offsets, tree depths), the two parallel per
+    /// hash and in ascending-offset order, sorted by hash: the verify cascade
+    /// intersects two of these by a single linear merge, no hashing (M3b/D22 —
+    /// the per-candidate HashMap probes dominated 500k-LOC scans). Offsets feed
+    /// the Shazam offset-delta diagonal; depths feed the H-tree-verify depth-delta
+    /// criterion (§0.5) — both derived from the one shared-subtree evidence pass.
+    offsets: Vec<(u128, Vec<u32>, Vec<u16>)>,
 }
 
 /// A histogram-and-AU-verified pair, keyed on unit indices.
@@ -125,13 +128,24 @@ fn near_groups_for_lang(
             // itself keeps the §9 floor.
             let inv: Vec<Subtree> =
                 fingerprint::subtree_inventory(&units[idx].tree, 3, HashMode::MaskedLocals);
-            let mut flat: Vec<(u128, u32)> = inv.iter().map(|s| (s.hash, s.offset)).collect();
+            // Pre-order depth per node offset (same numbering as `walk_inventory`:
+            // node before children), so each subtree's root depth is `depths[offset]`.
+            let depth_by_offset = preorder_depths(&units[idx].tree);
+            // (hash, offset, depth) sorted by hash then offset — depth rides the
+            // offset it belongs to so the two stay paired through the grouping.
+            let mut flat: Vec<(u128, u32, u16)> = inv
+                .iter()
+                .map(|s| (s.hash, s.offset, depth_by_offset[s.offset as usize]))
+                .collect();
             flat.sort_unstable();
-            let mut offsets: Vec<(u128, Vec<u32>)> = Vec::new();
-            for (h, o) in flat {
+            let mut offsets: Vec<(u128, Vec<u32>, Vec<u16>)> = Vec::new();
+            for (h, o, d) in flat {
                 match offsets.last_mut() {
-                    Some((last, offs)) if *last == h => offs.push(o),
-                    _ => offsets.push((h, vec![o])),
+                    Some((last, offs, deps)) if *last == h => {
+                        offs.push(o);
+                        deps.push(d);
+                    }
+                    _ => offsets.push((h, vec![o], vec![d])),
                 }
             }
             let mut bag_set: Vec<u128> = inv
@@ -185,7 +199,7 @@ fn near_groups_for_lang(
         Verified(AuOutcome),
     }
     let verify = |i: usize, j: usize| -> Verify {
-        if !offset_histogram_passes(&reps[i], &reps[j], cfg) {
+        if !histogram_passes(&reps[i], &reps[j], cfg) {
             return Verify::HistogramRejected;
         }
         let (ua, ub) = (reps[i].unit_idx, reps[j].unit_idx);
@@ -320,7 +334,7 @@ fn near_groups_for_lang(
 
 /// Candidate-generation seam (spec §5.5, §7.4b). A retriever reads the shared
 /// [`RepData`] substrate and emits candidate rep-index pairs `(i, j)` with `i < j`
-/// for the shared verify chain (`offset_histogram_passes` → `anti_unify`). It is
+/// for the shared verify chain (`histogram_passes` → `anti_unify`). It is
 /// candidate generation ONLY — it never verifies. Retrieval is post-fingerprint,
 /// so which retriever runs is hash-neutral (it does not enter the extraction cache
 /// key). The default is [`Landmark`]; the bake-off registers alternatives
@@ -384,8 +398,8 @@ impl Retriever for Landmark {
                 let mut rare: Vec<(u32, u128)> = rep
                     .offsets
                     .iter()
-                    .filter(|(h, _)| df.get(h).copied().unwrap_or(0) <= rare_cap)
-                    .flat_map(|(h, offs)| offs.iter().map(move |o| (*o, *h)))
+                    .filter(|(h, _, _)| df.get(h).copied().unwrap_or(0) <= rare_cap)
+                    .flat_map(|(h, offs, _)| offs.iter().map(move |o| (*o, *h)))
                     .collect();
                 rare.sort_unstable();
                 const FAN_OUT: usize = 3;
@@ -569,62 +583,154 @@ fn size_gate_passes(ta: u32, tb: u32, cfg: &Config) -> bool {
     hi as f64 <= lo as f64 * ratio + 64.0
 }
 
-/// Shazam-style diagonal check: shared fingerprints vote Δoffset; a genuine
-/// clone concentrates in one bin, coincidence scatters (spec §5.6).
-///
-/// M3b hardening (D22): each shared hash contributes at most ONE vote per
-/// bin (a repeated small idiom must not fake a diagonal by multiplicity),
-/// and the acceptance threshold scales with unit size — a clone that can
-/// survive the `max_divergence` gate shares a material fraction of the
-/// smaller unit's subtree inventory, so a fixed 5-vote bar on a 250-token
-/// unit (2% coverage) admits pairs AU is guaranteed to reject, at O(n·m)
-/// AU cost per admission. Wang's original scores by aligned-cluster SIZE
-/// for the same reason.
-fn offset_histogram_passes(a: &RepData, b: &RepData, cfg: &Config) -> bool {
-    let min_inventory = a.offsets.len().min(b.offsets.len()) as u32;
-    let needed = cfg.histogram_min_votes().max(min_inventory / 8);
-    let mut bins: HashMap<i64, u32> = HashMap::new();
-    let mut best = 0u32;
-    let mut hash_bins: Vec<i64> = Vec::with_capacity(16);
-    // Linear merge of the hash-sorted offset inventories.
+/// Pre-order depth per node offset, numbered exactly as `fingerprint::
+/// walk_inventory` (node before its children), so `out[subtree.offset]` is the
+/// tree depth of that subtree's root. Dense over `0..node_count`.
+fn preorder_depths(root: &crate::tree::NormNode) -> Vec<u16> {
+    fn walk(node: &crate::tree::NormNode, depth: u16, out: &mut Vec<u16>) {
+        out.push(depth);
+        for c in &node.children {
+            walk(c, depth.saturating_add(1), out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, 0, &mut out);
+    out
+}
+
+/// One shared floor-3 subtree's positional evidence: the (≤4×4) offset lists and
+/// depth lists from each unit. Every consistency criterion derives its own delta
+/// bins from this — nothing here is retriever- or criterion-specific.
+struct SharedSubtree<'a> {
+    offs_a: &'a [u32],
+    offs_b: &'a [u32],
+    depths_a: &'a [u16],
+    depths_b: &'a [u16],
+}
+
+/// A verify consistency criterion: a peer predicate over the shared-subtree
+/// evidence, given the vote budget. Offset- and depth-consistency are instances.
+type Criterion = fn(&[SharedSubtree], u32) -> bool;
+
+/// THE shared-subtree evidence pass: a single linear merge of the two hash-sorted
+/// inventories, yielding — per shared subtree — BOTH its offset lists and depth
+/// lists (borrowed, no copy). Every verify criterion reads this one pass; there is
+/// no second walk (the §0.5 "near-free" property the sweep relied on).
+fn shared_subtree_evidence<'a>(a: &'a RepData, b: &'a RepData) -> Vec<SharedSubtree<'a>> {
+    let mut ev = Vec::new();
     let (mut i, mut j) = (0usize, 0usize);
     while i < a.offsets.len() && j < b.offsets.len() {
-        // Lossless early exits (M4a): a bin's count only grows by shared
-        // hashes, and at most one vote per remaining shared hash can land in
-        // any bin — once the winner is decided either way, stop merging.
-        if best >= needed {
-            return true;
-        }
-        let remaining = (a.offsets.len() - i).min(b.offsets.len() - j) as u32;
-        if best + remaining < needed {
-            return false;
-        }
-        let (ha, offs_a) = &a.offsets[i];
-        let (hb, offs_b) = &b.offsets[j];
-        match ha.cmp(hb) {
+        match a.offsets[i].0.cmp(&b.offsets[j].0) {
             std::cmp::Ordering::Less => i += 1,
             std::cmp::Ordering::Greater => j += 1,
             std::cmp::Ordering::Equal => {
-                hash_bins.clear();
-                for &oa in offs_a.iter().take(4) {
-                    for &ob in offs_b.iter().take(4) {
-                        let bin = (i64::from(oa) - i64::from(ob)) / 4;
-                        if !hash_bins.contains(&bin) {
-                            hash_bins.push(bin);
-                        }
-                    }
-                }
-                for &bin in &hash_bins {
-                    let v = bins.entry(bin).or_insert(0);
-                    *v += 1;
-                    best = best.max(*v);
-                }
+                ev.push(SharedSubtree {
+                    offs_a: &a.offsets[i].1,
+                    offs_b: &b.offsets[j].1,
+                    depths_a: &a.offsets[i].2,
+                    depths_b: &b.offsets[j].2,
+                });
                 i += 1;
                 j += 1;
             }
         }
     }
+    ev
+}
+
+/// Vote budget shared by every consistency criterion: `histogram_min_votes` or
+/// ⅛ of the smaller inventory, whichever is larger. A clone that survives the
+/// `max_divergence` gate shares a material fraction of the smaller unit's subtree
+/// inventory, so the bar scales with size — a fixed 5-vote bar on a 250-token unit
+/// (2% coverage) admits pairs AU is guaranteed to reject (D22).
+fn votes_needed(a: &RepData, b: &RepData, cfg: &Config) -> u32 {
+    let min_inventory = a.offsets.len().min(b.offsets.len()) as u32;
+    cfg.histogram_min_votes().max(min_inventory / 8)
+}
+
+/// Diagonal vote over shared subtrees: each subtree casts at most ONE vote per
+/// distinct delta bin (D22 — a repeated small idiom must not fake a diagonal by
+/// multiplicity); pass iff some bin reaches `needed`. The delta comes from `bin`.
+/// Generic over the coordinate type so offset (u32, quantized /4) and depth (u16,
+/// raw) consistency are the SAME mechanism on different axes.
+fn diagonal_passes<'a, T: Copy + 'a>(
+    ev: &[SharedSubtree<'a>],
+    needed: u32,
+    lists: impl Fn(&SharedSubtree<'a>) -> (&'a [T], &'a [T]),
+    bin: impl Fn(T, T) -> i64,
+) -> bool {
+    let mut bins: HashMap<i64, u32> = HashMap::new();
+    let mut best = 0u32;
+    let mut local: Vec<i64> = Vec::with_capacity(16);
+    for s in ev {
+        if best >= needed {
+            return true;
+        }
+        let (la, lb) = lists(s);
+        local.clear();
+        for &va in la.iter().take(4) {
+            for &vb in lb.iter().take(4) {
+                let b = bin(va, vb);
+                if !local.contains(&b) {
+                    local.push(b);
+                }
+            }
+        }
+        for &b in &local {
+            let v = bins.entry(b).or_insert(0);
+            *v += 1;
+            best = best.max(*v);
+        }
+    }
     best >= needed
+}
+
+/// Shazam-style offset-delta diagonal (spec §5.6): shared subtrees vote
+/// `(oa−ob)/4`; a genuine clone concentrates in one bin, coincidence scatters.
+/// Always on — the incumbent verify criterion.
+fn offset_consistency(ev: &[SharedSubtree], needed: u32) -> bool {
+    diagonal_passes(
+        ev,
+        needed,
+        |s| (s.offs_a, s.offs_b),
+        |oa, ob| (i64::from(oa) - i64::from(ob)) / 4,
+    )
+}
+
+/// H-tree-verify depth-delta diagonal (§0.5): shared subtrees vote `depth_a−
+/// depth_b`. A genuine clone places its shared subtrees at consistent RELATIVE
+/// depths; a coincidental landmark collision sits at inconsistent depths and
+/// scatters. Opt-in (`retrieval.tree_verify`) — a peer of `offset_consistency`,
+/// reading the same evidence, not a wrapper around it.
+fn depth_consistency(ev: &[SharedSubtree], needed: u32) -> bool {
+    diagonal_passes(
+        ev,
+        needed,
+        |s| (s.depths_a, s.depths_b),
+        |da, db| i64::from(da) - i64::from(db),
+    )
+}
+
+/// The pre-AU verify histogram: a cost-ordered cascade of consistency criteria
+/// over the ONE shared-subtree evidence pass. Each criterion is a peer predicate
+/// on the shared evidence, evaluated cheap→expensive and short-circuiting on the
+/// first reject. Offset-delta (the Shazam diagonal) is always on; depth-delta
+/// (H-tree-verify, §0.5) is opt-in via `retrieval.tree_verify`. Both read the
+/// same evidence, so enabling depth adds no second walk.
+fn histogram_passes(a: &RepData, b: &RepData, cfg: &Config) -> bool {
+    let ev = shared_subtree_evidence(a, b);
+    let needed = votes_needed(a, b, cfg);
+    // (enabled, criterion) in cost order. A flat, toggleable criteria set — not a
+    // decorator chain: coverage-gate, offset-hist, depth-hist and anti_unify are
+    // peers in one cheap→expensive reject cascade.
+    let criteria: [(bool, Criterion); 2] = [
+        (true, offset_consistency),
+        (cfg.retrieval.tree_verify, depth_consistency),
+    ];
+    criteria
+        .iter()
+        .filter(|(enabled, _)| *enabled)
+        .all(|(_, criterion)| criterion(&ev, needed))
 }
 
 fn build_groups(pairs: Vec<VerifiedPair>, tier: Tier, units: &[Unit]) -> Vec<NearGroup> {
