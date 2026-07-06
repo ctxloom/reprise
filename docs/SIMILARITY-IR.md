@@ -1,6 +1,9 @@
 ---
 title: Similarity IR — a purpose-built intermediate representation for reprise
-status: authoritative design; P1 implementation underway (2026-07-03)
+status: authoritative design; P1 landed through increment 9 — Rust/Python/Go frontends
+  + Branch switch/match↔if-chain convergence, IR-selectable via `normalizer = "ir"`;
+  transform-seam refactor (D-IR-12, docs/transform-seam.md) and ⚠ nodes (ANF §13,
+  try/catch D-IR-11) still pending (2026-07-04)
 sessions:
   - meek-zany-rash
 related:
@@ -179,6 +182,8 @@ profiles) and an interface seam (a frontend contract replacing the
   **(b) Typed IR** — replace stringly-typed `kind: Box<str>` with `enum Ir {
   Loop{..}, Branch{..}, … }`. Exhaustiveness-checked, self-documenting, but
   rewrites the back half. → **Recommendation: (a).**
+  **RESOLVED (2026-07-04): (a)** — same container; the IR path feeds
+  `fingerprint`/`seq`/`tree`/`au` unchanged (canonical `NormNode` matches on `kind`).
 
 - **D-IR-2 · Back half.** Keep `fingerprint/seq/tree/au/inline` unchanged (it is
   not where the duplication is). → **Recommendation: keep, out of scope.**
@@ -187,6 +192,10 @@ profiles) and an interface seam (a frontend contract replacing the
   normalization hooks outright, or *coexist* behind a flag during migration
   (parity-gated switchover)? → **Recommendation: coexist behind a build flag until
   parity is proven on all languages, then retire the hooks.**
+  **RESOLVED (2026-07-04, user): coexist via a non-boolean, plugin-extensible
+  `[normalize] normalizer` selector (NOT a build flag) — the IR is one plugin and more
+  may register later. Wired at `unit.rs`'s extraction seam (`normalizer = "ir"` →
+  `frontend::extract_ir_units`); default stays `"historical"`.**
 
 - **D-IR-4 · Node-set growth discipline.** Start minimal; a new canonical node
   (any ⚠) requires a driving benchmark case, per spec §12 (D11/D25). → **Recommendation:
@@ -198,8 +207,8 @@ profiles) and an interface seam (a frontend contract replacing the
 
 > **Full D-IR register:** D-IR-1…5 above; **D-IR-6/7** (ANF naming granularity;
 > e-graph threshold) in §13; **D-IR-8/11** (fallthrough & arm-sort; try/catch structure)
-> in §14; **D-IR-9**
-> (reversal strength — RESOLVED) and **D-IR-10** (log lifecycle — RESOLVED) in §15.
+> in §14; **D-IR-9** (reversal strength — RESOLVED), **D-IR-10** (log lifecycle — RESOLVED),
+> and **D-IR-12** (transform-seam enforcement — leaning detect-emit) in §15.
 > Open items are P1-gated (§8).
 
 ## 8. Validation method
@@ -450,6 +459,20 @@ if / else-if chains, `match`/`when`/`switch`, and ternary. Resolves the §5 ⚠ 
   handling into each frontend's lowering (§6), since patterns are the most
   language-divergent surface (Rust patterns, Python structural patterns, Kotlin `when`,
   Go type switches, TS discriminated unions).
+- **Value arms fold the subject into the guard — the mechanism that converges switch/match
+  with if-chains (landed, IR-selectable via `normalizer = "ir"`, 2026-07-04).** A
+  subject-as-separate-element form was tried first and *blocked* this convergence (a bare
+  `if subj == 1` has no subject element to line up against a switch's), so the subject
+  folds into each guard instead: a value arm `case 1:` → `subj == 1` — **byte-identical to
+  an `if subj == 1` condition** — a multi-value arm → `subj == a || subj == b`, and a
+  pattern arm stays `matches(subj, Pat)` (deliberately *not* an equality, so genuine
+  pattern-matches stay distinct from value dispatch). If-chains flatten to match:
+  `else if`/`elif` splice their arms into one ordered Branch rather than nesting, and Rust
+  `match` bodies are block-wrapped. **Verified across Rust/Python/Go:** a value switch/match
+  now converges with the equivalent if-chain in all three; pattern-matches stay distinct;
+  the dispatch-table FP is left to D30 fold-but-don't-report, as the design intends. (Bears
+  on **D-IR-11**: it argues against carrying `match`'s subject as a separate Branch element,
+  at least in the matching projection.)
 - **Fallthrough switches** (JS/TS/C without `break`) don't fit an arm list; lower the
   break-terminated case (the common one), leave true fallthrough `Native`-first.
 - **D30 goes language-agnostic (resolves ⚠ DispatchTable).** A dispatch table is not a
@@ -624,3 +647,66 @@ consumer needs it — the reporter for match-explanation / template un-lowering,
 calibration harness — the touched units are **re-normalized with logging on** (few units,
 cheap). Persisting an event log *is* the CQRS/ES infrastructure we decline (§15.1); not
 persisting it is that same decision from the other side.
+
+### 15.3 The transform seam — the event log made structural (design commitment, 2026-07-04)
+
+§15/§15.1 make the event stream the **computational spine**, but the P1 implementation followed
+the model for *lowering* and abandoned it for *canonicalization*. `frontend::normalize` applies the
+five shared passes as legacy `NormNode → NormNode` mutations with the log inert — `let tree =
+rewrite_iteration(tree); normalize_loop_exit; abstract_idents; canonicalize_order; strip_dead;` —
+then returns the lowering-only log. That chain **is** the pre-IR `apply_passes` pipeline in IR
+clothes. The cost: five of eleven `TransformKind`s are never recorded (`IterProtocol`/`LoopExit`/
+`CommSort`/`DeadStrip` + `abstract_idents`' name witnesses), and `canonicalize_order` sorts
+operands **without recording the order** — a live D-IR-9 losslessness break (the discriminator is
+*destroyed*, not relocated to a witness). Recording is optional because the passes are written in
+the legacy shape, so it was skipped.
+
+**The bar: a transform must be impossible without its event** — enforced by the type system, not
+review. The realization: **passes become pure detectors; one applier is the sole mutator.**
+- A pass is `fn detect(tree: &NormNode) -> Vec<Edit>` — an *immutable* tree in, `Edit`s out. With
+  no `&mut`, it **cannot mutate**; "sort without recording" does not compile.
+- `apply<S: EventSink>(tree, edits, &mut S) -> NormNode` is the only front-half canonicalization
+  mutator, and it performs each edit **and** records its event atomically. Transform-without-event
+  is unrepresentable.
+- Every view is a **projection** over `(genesis, stream)`: the aggressive canonical tree (the
+  matching form) is `apply`'s output; the display template, match-explanation, reversal, and
+  calibration attribution are folds / inverse-folds. §15.1, made real.
+
+**The sink is the read-model selector — this is how D-IR-10 discharges the always-on cost.** In
+bulk scan the only projection materialized is the aggressive tree, so it passes a **`NullSink`**
+(`record` is a no-op; generic `apply` monomorphizes it away) — zero recording cost, none of the
+current build-then-discard waste. A consumer that needs the stream (reporter, calibration)
+re-normalizes the handful of *touched* units with a recording sink (D-IR-10: the stream is a
+deterministic, re-derivable function of source). Losslessness is *on demand*, never *always
+materialized*. Witnesses stay cheap by default (indices / spans / source slices), owned data
+materialized only at record time, so a disabled sink costs nothing.
+
+**Lowering stays construct-and-record** — it *builds* the genesis tree rather than transforming a
+prior one, so dual-write is inherent there. The compile-time guarantee is scoped to
+canonicalization (the broken part); lowering is instead held to per-frontend **completeness**
+(every normalization it performs emits its event — Go, the newest frontend, currently records the
+least).
+
+**Migration is parity-neutral.** The log and witnesses are **hash-excluded** (§15 / §12.1), so
+completing the stream *cannot* change the canonical tree — every `u128` fingerprint and every
+finding stays byte-identical. The gate is therefore a pure refactor invariant: `pair_ab` shows
+**zero** canonical-tree diff (Rust/Python/Go, mutation-recall + wild corpus) before and after; the
+sole observable delta is the stream going partial → complete. Each pass converts independently
+under that invariant, so it interleaves safely with the live P1 frontend work, and the free
+`N⁻¹(N(x)) ≈ x` reversal round-trip (D-IR-9) becomes checkable the moment a pass is wired.
+
+**D-IR-12 · Enforcement level.** (a) a shared `apply` helper (discipline-enforced); (b) encapsulated
+mutation (privacy); (c) **detect-emit — passes are `&NormNode -> Vec<Edit>`, one `apply`
+mutates + records.** (a)/(b) leave silent mutation representable; only (c) makes it a compile error
+and yields the §15.2 replay-depth read-models for free. → **Leaning (c) for the five
+canonicalization passes; lowering stays construct-and-record.** P1.
+
+**Open sub-decision (sign-off) — genesis purity.** Lowering currently interleaves normalization
+(literal bucketing, paren-drop) into the genesis and records those events. A *pure* faithful genesis
+— all normalization as post-lowering events — would enable replay-depth *below* what lowering bakes
+in, but no consumer needs sub-lowering aggressiveness today. → **Leaning interleaved-now; pure
+genesis gated on a replay-depth read-model earning it** (the §15.2 trigger).
+
+**Implementation hand-off.** The concrete module shape (`ir::edit`), the per-pass detect→apply
+recipe, the parity-gated landing order (`canonicalize_order` first — the live data loss), and the
+gotchas are in [`docs/transform-seam.md`](transform-seam.md).

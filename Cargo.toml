@@ -48,3 +48,11 @@ mimalloc = "0.1"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+# The root crate is also the workspace root. Server surfaces live in additive
+# crates under crates/ (docs/SERVERS.md D-SRV-2) so the CLI's buildless,
+# tokio-free, single-static-binary profile is untouched — `cargo build`
+# (no --workspace) and `build-static` still build only the `reprise` binary.
+[workspace]
+resolver = "2"
+members = ["crates/reprise-server-core", "crates/reprise-mcp", "crates/reprise-lsp"]

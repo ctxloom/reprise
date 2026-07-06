@@ -165,6 +165,20 @@ fn mutate_comments(src: &str, ext: &str) -> String {
 
 // ---------- harness ----------
 
+/// Base config for a bench run. `REPRISE_NORMALIZER=ir` (or any known selector)
+/// runs the ENTIRE bench on that normalizer path — the standing IR-recall gate
+/// (`just bench-mutations-ir`). Unset keeps the historical default, so a plain
+/// `just bench-mutations` is byte-identical to before. This exists because the
+/// bench formerly hard-coded `Config::default()` (historical), so IR-path
+/// mutation recall was never measured (the §8 flip masking).
+fn bench_config() -> Config {
+    let mut cfg = Config::default();
+    if let Ok(n) = std::env::var("REPRISE_NORMALIZER") {
+        cfg.normalize.normalizer = n;
+    }
+    cfg
+}
+
 /// Returns true iff scanning {seed, mutant} yields a reportable group
 /// (exact-normalized or near-normalized; weak-similarity does not count as
 /// recall) whose members span both files.
@@ -174,7 +188,7 @@ fn converges(seed: &Seed, mutant_source: &str) -> bool {
     let mutant_path = dir.path().join(format!("mutant.{}", seed.ext));
     fs::write(&seed_path, &seed.source).unwrap();
     fs::write(&mutant_path, mutant_source).unwrap();
-    let report = reprise::scan(dir.path(), &Config::default()).unwrap();
+    let report = reprise::scan(dir.path(), &bench_config()).unwrap();
     report
         .groups
         .iter()
@@ -344,7 +358,7 @@ fn converges_inline(seed: &Seed, variant_source: &str, companions: &[String]) ->
     for (i, src) in companions.iter().enumerate() {
         fs::write(dir.path().join(format!("helper{i}.{}", seed.ext)), src).unwrap();
     }
-    let report = reprise::scan(dir.path(), &Config::default()).unwrap();
+    let report = reprise::scan(dir.path(), &bench_config()).unwrap();
     report
         .groups
         .iter()
@@ -424,7 +438,7 @@ fn cross_seed_control_produces_no_groups() {
         let fname = format!("{}.{}", seed.name.replace('/', "_"), seed.ext);
         fs::write(dir.path().join(fname), &seed.source).unwrap();
     }
-    let report = reprise::scan(dir.path(), &Config::default()).unwrap();
+    let report = reprise::scan(dir.path(), &bench_config()).unwrap();
     let mixed: Vec<_> = report
         .groups
         .iter()

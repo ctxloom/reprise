@@ -6,12 +6,35 @@ use reprise::report::ScanReport;
 use std::fs;
 use tempfile::TempDir;
 
-fn scan_snippets(ext: &str, sources: &[&str]) -> ScanReport {
+fn scan_with(ext: &str, sources: &[&str], cfg: &Config) -> ScanReport {
     let dir = TempDir::new().unwrap();
     for (i, src) in sources.iter().enumerate() {
         fs::write(dir.path().join(format!("m{i}.{ext}")), src).unwrap();
     }
-    reprise::scan(dir.path(), &Config::default()).unwrap()
+    reprise::scan(dir.path(), cfg).unwrap()
+}
+
+fn scan_snippets(ext: &str, sources: &[&str]) -> ScanReport {
+    scan_with(ext, sources, &Config::default())
+}
+
+/// Same as [`scan_snippets`] but on the IR normalizer path (`[normalize] normalizer = "ir"`) —
+/// the switch-over recall gate for the near/region tiers under the canonical IR.
+fn scan_snippets_ir(ext: &str, sources: &[&str]) -> ScanReport {
+    let mut cfg = Config::default();
+    cfg.normalize.normalizer = "ir".into();
+    scan_with(ext, sources, &cfg)
+}
+
+/// Same as [`scan_snippets`] but pinned to the still-supported historical normalizer
+/// (`[normalize] normalizer = "historical"`) — for contracts calibrated to the larger
+/// historical tree, where a fixed-size difference stays a smaller fraction of the whole than
+/// under the ~18%-more-compact IR default (so a near-miss stays a whole-unit near match rather
+/// than tightening to an exact-region residual).
+fn scan_snippets_historical(ext: &str, sources: &[&str]) -> ScanReport {
+    let mut cfg = Config::default();
+    cfg.normalize.normalizer = "historical".into();
+    scan_with(ext, sources, &cfg)
 }
 
 /// Strongest tier of any group joining files 0 and 1, if any.
@@ -102,8 +125,120 @@ fn rust_tail_recursion_converges_with_iteration() {
 
 #[test]
 fn tree_recursion_control_does_not_converge() {
-    // Designed-to-fail control (spec §7.1): non-linear recursion must NOT lower.
-    assert_no_pair(&scan_snippets("py", &[PY_ITER, PY_TREE]));
+    // Designed-to-fail control (spec §7.1): non-linear recursion must NOT lower. Pinned to the
+    // historical normalizer: under the IR default `PY_ITER`/`PY_TREE` share a genuine ~30-token
+    // `log.append` fragment that clears `min_seq_tokens` and reports as an ACCEPTED exact-region
+    // residual, so a whole-scan "does not converge" assertion would trip on it. The IR unit-level
+    // control is `tree_recursion_control_stays_distinct_ir` (the `fp_ir` convention).
+    assert_no_pair(&scan_snippets_historical("py", &[PY_ITER, PY_TREE]));
+}
+
+/// Fingerprint under the IR normalizer (`[normalize] normalizer = "ir"`).
+fn fp_ir(src: &str, lang: reprise::lang::Lang) -> u128 {
+    let mut cfg = Config::default();
+    cfg.normalize.normalizer = "ir".into();
+    let units = reprise::units_from_source(src, lang, &cfg);
+    assert_eq!(units.len(), 1, "expected exactly one unit in:\n{src}");
+    units[0].fingerprint
+}
+
+#[test]
+fn py_tail_recursion_converges_with_iteration_ir() {
+    // The same coupled `a, b = b, a%b` reassignment as `PY_TAIL`/`PY_ITER`, now converging
+    // EXACTLY (fingerprint-equal) on the IR path: tail-rec reassignment lowers to the same
+    // parallel `Assign` the iterative multi-assign has, and both decompose identically.
+    use reprise::lang::Lang;
+    assert_eq!(
+        fp_ir(PY_ITER, Lang::Python),
+        fp_ir(PY_TAIL, Lang::Python),
+        "Python tail recursion must converge with iteration on the IR path",
+    );
+}
+
+#[test]
+fn rust_tail_recursion_converges_with_iteration_ir() {
+    // Explicit `return a;` in the iterative form (not Rust's implicit tail expression `a`): the
+    // bare-tail-expression-vs-`Return` modeling gap is pre-existing and orthogonal to the
+    // multi-assign decomposition under test (same reason the Go convergence tests use `return`).
+    use reprise::lang::Lang;
+    let iter = "fn reduce_pair(mut a: u64, mut b: u64, log: &mut Vec<String>) -> u64 {\n    while b != 0 {\n        log.push(format!(\"step: {a} {b}\"));\n        (a, b) = (b, a % b);\n    }\n    return a;\n}\n";
+    let tail = "fn reduce_pair(a: u64, b: u64, log: &mut Vec<String>) -> u64 {\n    if b == 0 {\n        return a;\n    }\n    log.push(format!(\"step: {a} {b}\"));\n    return reduce_pair(b, a % b, log);\n}\n";
+    assert_eq!(
+        fp_ir(iter, Lang::Rust),
+        fp_ir(tail, Lang::Rust),
+        "Rust tail recursion must converge with iteration on the IR path",
+    );
+}
+
+#[test]
+fn tree_recursion_control_stays_distinct_ir() {
+    // Regression (IR path): `PY_TREE` (two self-calls, neither in tail position — non-linear
+    // recursion) must NOT collapse into the iterative `PY_ITER`'s shape. `lower_tail_recursion`
+    // now lowers ONLY a lone tail self-call, so tree/branchy recursion stays recursion and the
+    // two units keep distinct fingerprints (the algorithm, not the incidental shared guard+log
+    // fragment, is what the control tests). Genuine tail recursion still converges — see
+    // `py_tail_recursion_converges_with_iteration_ir`, which must stay green alongside this.
+    use reprise::lang::Lang;
+    assert_ne!(
+        fp_ir(PY_ITER, Lang::Python),
+        fp_ir(PY_TREE, Lang::Python),
+        "iterative gcd must not converge (as a unit) with the tree-recursive control on IR",
+    );
+}
+
+#[test]
+fn branchy_tail_recursion_stays_distinct_ir() {
+    // The lone-tail-call guard: TWO tail-position self-calls is branchy (non-linear) recursion —
+    // each call spawns its own continuation — so it must NOT lower to a single loop and thus must
+    // not converge with the iterative accumulator form.
+    use reprise::lang::Lang;
+    let iter = "def walk(n, acc):\n    while n > 0:\n        acc = acc + n\n        n = n - 1\n    return acc\n";
+    let branchy = "def walk(n, acc):\n    if n <= 0:\n        return acc\n    if n % 2 == 0:\n        return walk(n - 1, acc + n)\n    return walk(n - 2, acc + n)\n";
+    assert_ne!(
+        fp_ir(iter, Lang::Python),
+        fp_ir(branchy, Lang::Python),
+        "branchy (two-tail-call) recursion must not lower to a loop on IR",
+    );
+}
+
+#[test]
+fn tuple_index_loop_converges_with_tuple_foreach_ir() {
+    // Regression (IR path): the tuple foreach `for label, score in entries` and the tuple index
+    // loop `for i in range(len(entries)): label, score = entries[i]` converge EXACTLY on IR — the
+    // destructure targets abstract (declared locals), and the foreach's element temp matches the
+    // index form's `i = __next(...)` + `(label, score) = i` two-step shape.
+    use reprise::lang::Lang;
+    let foreach = "def f(entries):\n    out = []\n    for label, score in entries:\n        out.append(label + str(score))\n    return out\n";
+    let index = "def f(entries):\n    out = []\n    for i in range(len(entries)):\n        label, score = entries[i]\n        out.append(label + str(score))\n    return out\n";
+    assert_eq!(
+        fp_ir(foreach, Lang::Python),
+        fp_ir(index, Lang::Python),
+        "tuple foreach must converge with the tuple index loop on IR",
+    );
+}
+
+#[test]
+fn rust_tuple_index_loop_converges_with_tuple_foreach_ir() {
+    // The Rust while-counter form (`let (label, score) = &entries[i]; i += 1;`, the increment NOT
+    // last) rewrites to the same iteration-protocol loop as the tuple `for`; the sole residual is
+    // the `&` reference on the destructured element, so the pair lands in the near tier.
+    let foreach = "pub fn f(entries: &[(String, i64)]) -> i64 {\n    let mut t = 0;\n    for (label, score) in entries {\n        t += score;\n    }\n    t\n}\n";
+    let index = "pub fn f(entries: &[(String, i64)]) -> i64 {\n    let mut t = 0;\n    let mut i = 0;\n    while i < entries.len() {\n        let (label, score) = &entries[i];\n        i += 1;\n        t += score;\n    }\n    t\n}\n";
+    assert_pair(
+        &scan_snippets_ir("rs", &[foreach, index]),
+        &["exact-normalized", "near-normalized"],
+    );
+}
+
+#[test]
+fn unrolled_loop_converges_with_rolled_ir() {
+    // Regression (IR path): a folded `REPEAT` (the unrolled body) converges with the rolled loop's
+    // lowered form via the AU REPEAT-vs-loop-core special case — which needs the IR `Loop` kind
+    // recognized as the loop core (the historical profile only knows `while True`).
+    assert_pair(
+        &scan_snippets_ir("py", &[PY_ROLLED, PY_UNROLLED]),
+        &["exact-normalized", "near-normalized"],
+    );
 }
 
 // ---------- near-miss tier: anti-unification (spec §5.6) ----------
@@ -119,14 +254,28 @@ fn reordered_statements_converge_near() {
 fn single_subtree_substitution_converges_near() {
     let a = "def score_rows(rows, cutoff):\n    out = []\n    for row in rows:\n        weight = row.base * row.factor\n        if weight > cutoff:\n            out.append((row.id, weight))\n        else:\n            out.append((row.id, 0))\n        tally(row, weight)\n    return out\n";
     let b = "def score_rows(rows, cutoff):\n    out = []\n    for row in rows:\n        weight = row.base * row.factor + row.bonus / 2\n        if weight > cutoff:\n            out.append((row.id, weight))\n        else:\n            out.append((row.id, 0))\n        tally(row, weight)\n    return out\n";
-    assert_pair(&scan_snippets("py", &[a, b]), &["near-normalized"]);
+    // Pinned to the historical normalizer. The single differing subtree (`+ row.bonus / 2`) is a
+    // ~16-token hole; on the compact IR tree that pushes the whole-unit divergence to ~0.21, past
+    // `max_divergence` (0.18), so under the IR default the pair still converges but tightens to an
+    // exact-region finding over the shared loop body (recall preserved — not a regression). This
+    // asserts the historical whole-unit near-miss calibration; IR near-miss recall is covered by
+    // `reordered_statements_converge_near` (IR default) and the phase3 template-evidence tests.
+    assert_pair(
+        &scan_snippets_historical("py", &[a, b]),
+        &["near-normalized"],
+    );
 }
 
 #[test]
 fn near_group_carries_template_with_holes() {
     let a = "def score_rows(rows, cutoff):\n    out = []\n    for row in rows:\n        weight = row.base * row.factor\n        if weight > cutoff:\n            out.append((row.id, weight))\n        else:\n            out.append((row.id, 0))\n        tally(row, weight)\n    return out\n";
     let b = "def score_rows(rows, cutoff):\n    out = []\n    for row in rows:\n        weight = row.base * row.factor + row.bonus / 2\n        if weight > cutoff:\n            out.append((row.id, weight))\n        else:\n            out.append((row.id, 0))\n        tally(row, weight)\n    return out\n";
-    let report = scan_snippets("py", &[a, b]);
+    // Pinned to the historical normalizer for the same reason as
+    // `single_subtree_substitution_converges_near`: this fixture's whole-unit near match tightens
+    // to an exact-region (which carries no hole template) under the compact IR default. This keeps
+    // the historical near-miss template-hole rendering gated; IR template evidence is covered by
+    // the phase3 api-finding tests.
+    let report = scan_snippets_historical("py", &[a, b]);
     let group = report
         .groups
         .iter()

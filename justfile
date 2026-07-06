@@ -1,7 +1,7 @@
 default: test
 
 build:
-    cargo build
+    cargo build --workspace
 
 # ===== Version management (versionator) =====
 #
@@ -31,18 +31,32 @@ release-snapshot:
     goreleaser release --snapshot --clean --skip=publish
 
 test:
-    cargo test --all-targets
+    cargo test --workspace --all-targets
 
 lint:
-    cargo clippy --all-targets -- -D warnings
+    cargo clippy --workspace --all-targets -- -D warnings
     cargo fmt --check
 
 fmt:
     cargo fmt
 
-# Mutation-recall benchmark (spec §7.1) — the Phase-1/2 gate metric
+# Mutation-recall benchmark (spec §7.1) — the Phase-1/2 gate metric. Runs on the
+# IR normalizer, the default since the §8 switchover.
 bench-mutations:
     cargo test --test mutation_recall -- --nocapture
+
+# Same benchmark, IR normalizer pinned explicitly (`[normalize] normalizer =
+# "ir"`). Redundant with `bench-mutations` now that IR is the default, but kept
+# as an explicit, self-documenting gate. The bench reads REPRISE_NORMALIZER to
+# select the normalizer, so IR-path mutation recall is measured repeatably.
+bench-mutations-ir:
+    REPRISE_NORMALIZER=ir cargo test --test mutation_recall -- --nocapture
+
+# Same benchmark on the still-supported historical normalizer path
+# (`[normalize] normalizer = "historical"`) — keeps the historical path gated now
+# that it is no longer the default, so its recall can't silently regress.
+bench-mutations-historical:
+    REPRISE_NORMALIZER=historical cargo test --test mutation_recall -- --nocapture
 
 # Dogfood: the tool scans its own repo (spec §3)
 scan-self:

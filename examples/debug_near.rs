@@ -52,7 +52,8 @@ fn main() {
         shared as f64 / union as f64,
         cfg.thresholds.candidate_sim
     );
-    let outcome = reprise::au::anti_unify(&ua.tree, &ub.tree, lang.profile());
+    let ir = cfg.normalize.normalizer == "ir" && reprise::frontend::has_ir_frontend(lang);
+    let outcome = reprise::au::anti_unify(&ua.tree, &ub.tree, lang.profile(), ir);
     println!(
         "AU: divergence={:.3} (max {}), holes={} (max {}), factorable={}",
         outcome.divergence,

@@ -394,16 +394,34 @@ pub fn run(
             .filter(|e| e.members.len() >= 2 && iu_tracked(e))
         {
             let region = e.tier == "exact-region";
+            // Span-overlap alone cannot tell "the same duplicate moved or was
+            // renamed" from "this member was deleted and an unrelated function
+            // shifted into its old line range" — the latter mis-maps the
+            // deleted member onto that function, scores it untouched, and fires
+            // a false inconsistent-update when a group is fully consolidated
+            // (the ideal dedup). For the exact tiers every member carries the
+            // group fingerprint, so require a fingerprint match to accept a
+            // span-overlap map; a genuinely deleted member then matches neither
+            // name nor fingerprint, stays unmapped, and routes to the
+            // "unmapped ⇒ a file edit is a touch" branch below. Fuzzy tiers
+            // (near/inline) do not share an exact fingerprint, so they keep the
+            // loose span-overlap.
+            let fp_guarded = region || e.tier == "exact-normalized";
             let mut touched: Vec<Member> = Vec::new();
             let mut untouched: Vec<Member> = Vec::new();
             let mut touched_accepts = true;
             for bm in &e.members {
                 // Map the snapshot onto the current tree: same file, matching
-                // name first, overlapping span second.
+                // name first, overlapping span (identity-checked) second.
                 let unit = units_by_file.get(&bm.file).and_then(|us| {
                     us.iter()
                         .find(|u| u.name == bm.name && bm.name != "<anon>" && !bm.name.is_empty())
-                        .or_else(|| us.iter().find(|u| spans_overlap(u.line_span, bm.line_span)))
+                        .or_else(|| {
+                            us.iter().find(|u| {
+                                spans_overlap(u.line_span, bm.line_span)
+                                    && (!fp_guarded || u.fingerprint == e.fingerprint)
+                            })
+                        })
                 });
                 let (is_touched, line_span) = if region {
                     // Regions: span-precise — the diff must intersect the run

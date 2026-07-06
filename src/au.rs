@@ -35,6 +35,12 @@ pub struct AuOutcome {
 
 struct Ctx<'a> {
     profile: &'a dyn LanguageProfile,
+    /// The units under comparison were extracted by the IR normalizer (canonical-IR kinds
+    /// `Loop`/`Block`/`Binop`/…), not the historical grammar. The three structural predicates
+    /// AU consults — loop core, list kind, binary shape — are answered on IR kinds instead of
+    /// the per-grammar `LanguageProfile` (whose kinds never appear in an IR tree). Historical
+    /// units keep the exact `LanguageProfile` answers, so their AU output is byte-identical.
+    ir: bool,
     holes: HashMap<(u128, u128), (u32, Hole)>,
     next_hole: u32,
     /// Memo of input-subtree hashes keyed by node ADDRESS: exact merkle +
@@ -71,11 +77,54 @@ impl Ctx<'_> {
     fn is_machinery(&mut self, node: &NormNode) -> bool {
         self.tokens(node) <= 12 && is_synthetic(node)
     }
+
+    /// The lowered loop core — the IR `Loop` node, or the historical `while True` core.
+    fn is_loop_core(&self, node: &NormNode) -> bool {
+        if self.ir {
+            node.kind.as_ref() == crate::ir::kind::LOOP
+        } else {
+            self.profile.is_loop_core(node)
+        }
+    }
+
+    /// A variable-length child list AU aligns with graded Smith-Waterman: IR statement `Block`s,
+    /// `Branch` arm-lists, and folded `REPEAT` runs (mirrors [`crate::ir::FoldRules`]).
+    fn is_list_kind(&self, kind: &str) -> bool {
+        if self.ir {
+            kind == crate::ir::kind::BLOCK || kind == crate::ir::kind::BRANCH || kind == "REPEAT"
+        } else {
+            self.profile.is_list_kind(kind)
+        }
+    }
+
+    /// `(left, op, right)` fields of a rebuildable binary kind — the IR `Binop` shape, or the
+    /// per-grammar binary kinds.
+    #[allow(clippy::type_complexity)]
+    fn binary_fields(
+        &self,
+        kind: &str,
+    ) -> Option<(
+        Option<&'static str>,
+        Option<&'static str>,
+        Option<&'static str>,
+    )> {
+        if self.ir {
+            (kind == crate::ir::kind::BINOP).then_some((Some("left"), Some("op"), Some("right")))
+        } else {
+            self.profile.binary_fields(kind)
+        }
+    }
 }
 
-pub fn anti_unify(a: &NormNode, b: &NormNode, profile: &dyn LanguageProfile) -> AuOutcome {
+pub fn anti_unify(
+    a: &NormNode,
+    b: &NormNode,
+    profile: &dyn LanguageProfile,
+    ir: bool,
+) -> AuOutcome {
     let mut ctx = Ctx {
         profile,
+        ir,
         holes: HashMap::new(),
         next_hole: 0,
         memo: HashMap::new(),
@@ -127,14 +176,14 @@ fn au(a: &NormNode, b: &NormNode, ctx: &mut Ctx) -> NormNode {
     // the guard/bind machinery becomes holes (spec §5.3 canonicalization).
     let (ua, ub) = (unwrap_stmt(a), unwrap_stmt(b));
     if ua.kind.as_ref() == "REPEAT"
-        && ctx.profile.is_loop_core(ub)
+        && ctx.is_loop_core(ub)
         && let Some(body) = crate::lang::child_field(ub, "body")
     {
         let children = au_list(&ua.children, &body.children, ctx);
         return NormNode::new("REPEAT", None, a.span, children);
     }
     if ub.kind.as_ref() == "REPEAT"
-        && ctx.profile.is_loop_core(ua)
+        && ctx.is_loop_core(ua)
         && let Some(body) = crate::lang::child_field(ua, "body")
     {
         let children = au_list(&body.children, &ub.children, ctx);
@@ -149,7 +198,7 @@ fn au(a: &NormNode, b: &NormNode, ctx: &mut Ctx) -> NormNode {
     // a matching operator aligns the flattened operand chains, because order
     // canonicalization may have sorted divergent operands differently.
     let is_operator_slot = |n: &NormNode| n.children.is_empty() && n.label.is_none(); // incl. word ops (and/or)
-    if ctx.profile.binary_fields(&a.kind).is_some()
+    if ctx.binary_fields(&a.kind).is_some()
         && a.children.len() == 3
         && b.children.len() == 3
         && is_operator_slot(&a.children[1])
@@ -170,7 +219,7 @@ fn au(a: &NormNode, b: &NormNode, ctx: &mut Ctx) -> NormNode {
             return node;
         }
     }
-    let children = if ctx.profile.is_list_kind(&a.kind) || a.children.len() != b.children.len() {
+    let children = if ctx.is_list_kind(&a.kind) || a.children.len() != b.children.len() {
         au_list(&a.children, &b.children, ctx)
     } else {
         a.children
@@ -281,8 +330,8 @@ fn similarity(a: &NormNode, b: &NormNode, ctx: &mut Ctx) -> f64 {
         // Folded REPEAT and the rolled loop core must PAIR in alignment so the
         // au() special case can compare template against loop body (§5.3).
         let (ua, ub) = (unwrap_stmt(a), unwrap_stmt(b));
-        let repeat_loop = (ua.kind.as_ref() == "REPEAT" && ctx.profile.is_loop_core(ub))
-            || (ub.kind.as_ref() == "REPEAT" && ctx.profile.is_loop_core(ua));
+        let repeat_loop = (ua.kind.as_ref() == "REPEAT" && ctx.is_loop_core(ub))
+            || (ub.kind.as_ref() == "REPEAT" && ctx.is_loop_core(ua));
         return if repeat_loop { 0.6 } else { 0.0 };
     }
     let (ea, ha) = ctx.node_info(a);

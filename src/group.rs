@@ -17,7 +17,7 @@ pub fn build_exact_groups(units: &[Unit], cfg: &Config) -> (Vec<(Group, Vec<usiz
         if unit.variant.is_some() {
             continue;
         }
-        if unit.token_count < cfg.thresholds.min_unit_tokens {
+        if unit.token_count < cfg.min_unit_floor() {
             below_floor += 1;
             continue;
         }
@@ -73,7 +73,7 @@ pub fn build_exact_groups(units: &[Unit], cfg: &Config) -> (Vec<(Group, Vec<usiz
 pub fn build_inline_exact_groups(units: &[Unit], cfg: &Config) -> Vec<(Group, Vec<usize>)> {
     let mut buckets: BTreeMap<(Lang, u128), Vec<usize>> = BTreeMap::new();
     for (idx, unit) in units.iter().enumerate() {
-        if unit.token_count < cfg.thresholds.min_unit_tokens {
+        if unit.token_count < cfg.min_unit_floor() {
             continue;
         }
         buckets

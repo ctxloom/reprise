@@ -82,7 +82,8 @@ fn near_groups_for_lang(
     exact_pairs: &HashSet<(usize, usize)>,
 ) -> Vec<NearGroup> {
     let profile = lang.profile();
-    let floor = cfg.thresholds.min_unit_tokens;
+    let ir = crate::unit::is_ir(lang, cfg);
+    let floor = cfg.min_unit_floor();
     let debug_timing = std::env::var_os("REPRISE_TIMING").is_some();
     let mut t = std::time::Instant::now();
     let mut mark = |label: &str| {
@@ -222,7 +223,7 @@ fn near_groups_for_lang(
             return Verify::HistogramRejected;
         }
         let (ua, ub) = (reps[i].unit_idx, reps[j].unit_idx);
-        let outcome = au::anti_unify(&units[ua].tree, &units[ub].tree, profile);
+        let outcome = au::anti_unify(&units[ua].tree, &units[ub].tree, profile, ir);
         if outcome.divergence > cfg.thresholds.max_divergence {
             return Verify::DivergenceRejected;
         }
@@ -465,7 +466,7 @@ fn size_gate_passes(ta: u32, tb: u32, cfg: &Config) -> bool {
 /// for the same reason.
 fn offset_histogram_passes(a: &RepData, b: &RepData, cfg: &Config) -> bool {
     let min_inventory = a.offsets.len().min(b.offsets.len()) as u32;
-    let needed = cfg.thresholds.histogram_min_votes.max(min_inventory / 8);
+    let needed = cfg.histogram_min_votes().max(min_inventory / 8);
     let mut bins: HashMap<i64, u32> = HashMap::new();
     let mut best = 0u32;
     let mut hash_bins: Vec<i64> = Vec::with_capacity(16);

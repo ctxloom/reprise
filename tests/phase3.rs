@@ -18,6 +18,17 @@ fn scan_snippets(ext: &str, sources: &[&str]) -> ScanReport {
     scan_snippets_cfg(ext, sources, &Config::default())
 }
 
+fn ir_cfg() -> Config {
+    let mut cfg = Config::default();
+    cfg.normalize.normalizer = "ir".into();
+    cfg
+}
+
+/// Scan under the IR normalizer (`[normalize] normalizer = "ir"`).
+fn scan_snippets_ir(ext: &str, sources: &[&str]) -> ScanReport {
+    scan_snippets_cfg(ext, sources, &ir_cfg())
+}
+
 /// Groups at the given tier joining files m0 and m1.
 fn pair_groups<'a>(report: &'a ScanReport, tier: &str) -> Vec<&'a reprise::report::Group> {
     report
@@ -265,6 +276,184 @@ fn scan_with_variants_is_deterministic() {
     assert_eq!(sig(&report_a), sig(&report_b));
 }
 
+// ---------- inliner on the IR path (spec §5.4, normalizer = "ir") ----------
+
+#[test]
+fn inline_variant_converges_with_hand_inlined_copy_ir() {
+    // The §7.2 recall-parity gap: the IR path emitted ZERO inline-assisted findings.
+    // The same caller/hand-inlined pair must now converge under `normalizer = "ir"`.
+    let report = scan_snippets_ir("rs", &[RS_CALLER_AND_HELPER, RS_HAND_INLINED]);
+    assert!(
+        report.stats.inline_variants >= 1,
+        "no IR inline variant produced: {:?}",
+        report.stats
+    );
+    let groups = pair_groups(&report, "inline-assisted");
+    assert!(
+        !groups.is_empty(),
+        "no IR inline-assisted group joining caller and hand-inlined copy: {:#?}",
+        report.groups
+    );
+    let chain = groups[0]
+        .inline_chain
+        .as_ref()
+        .expect("inline-assisted group missing its inline chain");
+    assert!(
+        chain.iter().any(|c| c.contains("adjust_price")),
+        "chain does not name the expanded callee: {chain:?}"
+    );
+}
+
+/// A multi-statement helper bound into an expression position (`let v = helper(x)`) —
+/// the IR expression-block splice must reshape the callee's trailing `Return` into the
+/// block's tail value so it converges with the hand-inlined block.
+const RS_EXTRACT_HELPER: &str = r#"
+fn score_all(xs: &[i64]) -> i64 {
+    let mut total = 0;
+    for x in xs {
+        let v = weigh(*x);
+        total += v;
+    }
+    total
+}
+
+fn weigh(x: i64) -> i64 {
+    let base = x * 3;
+    let adj = base + 7;
+    adj - x
+}
+"#;
+
+const RS_EXTRACT_INLINED: &str = r#"
+fn score_all_flat(xs: &[i64]) -> i64 {
+    let mut total = 0;
+    for x in xs {
+        let v = {
+            let base = *x * 3;
+            let adj = base + 7;
+            adj - *x
+        };
+        total += v;
+    }
+    total
+}
+"#;
+
+#[test]
+fn multistatement_expression_helper_converges_ir() {
+    let report = scan_snippets_ir("rs", &[RS_EXTRACT_HELPER, RS_EXTRACT_INLINED]);
+    assert!(
+        report.stats.inline_variants >= 1,
+        "no IR inline variant for the extract-helper case: {:?}",
+        report.stats
+    );
+    assert!(
+        !pair_groups(&report, "inline-assisted").is_empty(),
+        "multi-statement expression-block inline did not converge on the IR path: {:#?}",
+        report.groups
+    );
+}
+
+#[test]
+fn wrapper_variant_is_tautological_and_suppressed_ir() {
+    // D3 tautology / wrapper guard must fire on the IR path too: a pure wrapper's
+    // inlined variant IS the callee body, so it produces no finding.
+    let src = r#"
+fn wrap(x: i64, y: i64) -> i64 {
+    combine(x, y)
+}
+
+fn combine(a: i64, b: i64) -> i64 {
+    let mut acc = a * 3 + b;
+    if acc > 100 {
+        acc = acc - a;
+    }
+    while acc > 7 {
+        acc = acc / 2 + b % 5;
+    }
+    acc + 1
+}
+"#;
+    let report = scan_snippets_ir("rs", &[src]);
+    assert_eq!(
+        report.stats.inline_variants, 0,
+        "IR pure-wrapper variant should be dropped as tautological: {:?}",
+        report.stats
+    );
+    assert!(
+        !report
+            .groups
+            .iter()
+            .any(|g| g.tier.to_string() == "inline-assisted"),
+        "IR tautological wrapper produced a finding: {:#?}",
+        report.groups
+    );
+}
+
+#[test]
+fn python_multistatement_helper_at_expression_site_is_skipped_ir() {
+    // D17 holds on the IR path: Python has no expression block, so a multi-statement
+    // helper at an expression site is skipped rather than spliced.
+    let src = r#"
+def caller(xs):
+    out = []
+    for x in xs:
+        y = messy_helper(x)
+        out.append(y * 2)
+    return out
+
+
+def messy_helper(v):
+    t = 0
+    for k in range(4):
+        t = t + v * k
+    return t
+"#;
+    let report = scan_snippets_ir("py", &[src]);
+    assert_eq!(report.stats.inline_variants, 0, "{:?}", report.stats);
+}
+
+#[test]
+fn mutual_recursion_pair_is_tagged_as_scc_ir() {
+    let src = r#"
+fn even_steps(n: u64, acc: u64) -> u64 {
+    if n == 0 {
+        return acc;
+    }
+    odd_steps(n - 1, acc + 2)
+}
+
+fn odd_steps(n: u64, acc: u64) -> u64 {
+    if n == 0 {
+        return acc + 1;
+    }
+    even_steps(n - 1, acc * 2)
+}
+"#;
+    let report = scan_snippets_ir("rs", &[src]);
+    assert_eq!(report.stats.scc_units, 2, "{:?}", report.stats);
+    assert!(
+        report.stats.inline_variants >= 2,
+        "IR SCC members should produce merged variants: {:?}",
+        report.stats
+    );
+}
+
+#[test]
+fn self_recursive_calls_are_never_inlined_ir() {
+    let src = r#"
+fn countdown(n: i64, acc: i64) -> i64 {
+    if n <= 0 {
+        return acc;
+    }
+    countdown(n - 1, acc + n)
+}
+"#;
+    let report = scan_snippets_ir("rs", &[src]);
+    assert_eq!(report.stats.inline_variants, 0, "{:?}", report.stats);
+    assert_eq!(report.stats.scc_units, 0, "size-1 SCC must not be tagged");
+}
+
 // ---------- api-profile tier (spec §5.7) ----------
 
 const RS_API_A: &str = r#"
@@ -325,6 +514,71 @@ fn api_profile_pairs_structurally_different_reimplementations() {
         evidence.contains("loop"),
         "no context rendering: {evidence}"
     );
+}
+
+#[test]
+fn api_profile_pairs_structurally_different_reimplementations_ir() {
+    // Same corpus on the IR normalizer: `extract_calls` must read `Call`/`External`/
+    // canonical control-context off the lowered tree and emit the same *kind* of
+    // signature (rare-callee multiset + context). The `for`-loop's tail
+    // `finalize_registry(..)` fuses into the loop's exit arm as a `Return`, so the
+    // three rare callees still surface, both units still pair, and context renders.
+    let report = scan_snippets_ir("rs", &[RS_API_A, RS_API_B]);
+    assert_eq!(report.stats.api_signatures, 2, "{:?}", report.stats);
+    assert!(
+        pair_groups(&report, "near-normalized").is_empty()
+            && pair_groups(&report, "exact-normalized").is_empty(),
+        "corpus is supposed to be structurally divergent"
+    );
+    assert_eq!(report.api_groups.len(), 1, "{:#?}", report.api_groups);
+    let g = &report.api_groups[0];
+    assert_eq!(g.tier.to_string(), "api-profile");
+    assert_eq!(g.members.len(), 2);
+    let evidence = g.template.as_ref().expect("api finding needs evidence");
+    for name in ["open_widget", "flush_widget", "finalize_registry"] {
+        assert!(
+            evidence.contains(name),
+            "evidence missing {name}: {evidence}"
+        );
+    }
+    assert!(
+        evidence.contains("loop"),
+        "no context rendering: {evidence}"
+    );
+}
+
+#[test]
+fn api_profile_requires_min_distinct_rare_callees_ir() {
+    // Below `api_min_distinct_rare` (two distinct callees) → no signature on IR either.
+    let a = r#"
+fn poll_one(ids: &[u64]) -> u64 {
+    let mut n = 0;
+    for id in ids {
+        let w = open_widget(*id);
+        if w > 4 {
+            n += w * 3;
+        }
+    }
+    finalize_registry(n)
+}
+"#;
+    let b = r#"
+fn poll_two(ids: &[u64], cap: u64) -> u64 {
+    let mut n = 7;
+    for id in ids {
+        let w = open_widget(id + 1);
+        if w < cap {
+            n += w + 2;
+        } else {
+            n -= 1;
+        }
+    }
+    finalize_registry(n * 2)
+}
+"#;
+    let report = scan_snippets_ir("rs", &[a, b]);
+    assert_eq!(report.stats.api_signatures, 0);
+    assert!(report.api_groups.is_empty(), "{:#?}", report.api_groups);
 }
 
 #[test]

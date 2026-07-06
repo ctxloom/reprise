@@ -16,11 +16,15 @@ fn fp(src: &str, lang: Lang) -> u128 {
 
 /// Strongest tier of any group joining files `aa` and `bb`, if any.
 fn pair_tier(sources: &[(&str, &str)]) -> Option<String> {
+    pair_tier_cfg(sources, &Config::default())
+}
+
+fn pair_tier_cfg(sources: &[(&str, &str)], cfg: &Config) -> Option<String> {
     let dir = TempDir::new().unwrap();
     for (name, src) in sources {
         fs::write(dir.path().join(name), src).unwrap();
     }
-    let report = reprise::scan(dir.path(), &Config::default()).unwrap();
+    let report = reprise::scan(dir.path(), cfg).unwrap();
     report
         .groups
         .iter()
@@ -112,6 +116,21 @@ fn ts_tail_recursion_converges_with_iteration() {
         tier.as_deref()
             .is_some_and(|t| matches!(t, "exact-normalized" | "near-normalized" | "exact-region")),
         "tail recursion must converge with iteration; got {tier:?}"
+    );
+}
+
+#[test]
+fn ts_tail_recursion_converges_with_iteration_ir() {
+    // TypeScript has no IR frontend yet, so `normalizer = "ir"` falls back to the historical
+    // normalizer (§9 capability gate) — the recursion↔iteration convergence holds on the
+    // IR-selected path too.
+    let mut cfg = Config::default();
+    cfg.normalize.normalizer = "ir".into();
+    let tier = pair_tier_cfg(&[("aa.ts", TS_ITER), ("bb.ts", TS_TAIL)], &cfg);
+    assert!(
+        tier.as_deref()
+            .is_some_and(|t| matches!(t, "exact-normalized" | "near-normalized" | "exact-region")),
+        "tail recursion must converge with iteration on the IR path; got {tier:?}"
     );
 }
 

@@ -41,9 +41,18 @@ The single most important precision knob is `min_unit_tokens` — the
 *normalized tokens*: one element of the pre-order serialization of the normalized
 tree (D1).
 
+> **D47 — MEASURED NO-GO (2026-07-05; docs/substantiality-metric.md §0).** These token-size floors
+> (`min_unit_tokens`/`_ir`, `min_seq_tokens`, `histogram_min_votes`/`_ir`, `fold_min_repeats`) are a
+> *representation-dependent* size proxy — the ~18% IR compaction is why they grew per-normalizer `_ir`
+> twins. A replacement by a landmark-density + IDF substantiality score was proposed **and measured** — it
+> **fails**: landmark count is a size proxy (r=0.994 with token count → not representation-invariant), and
+> structural rarity cannot see the substantive-vs-trivial-small distinction (which is *semantic*, not
+> structural). **The floors and the `_ir` twins stay as the knob.**
+
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `min_unit_tokens` | int | `40` | Units below this many normalized tokens are discarded (aggressive normalization makes small functions converge — true-but-useless). |
+| `min_unit_tokens` | int | `40` | Units below this many normalized tokens are discarded (aggressive normalization makes small functions converge — true-but-useless). Applies to the historical normalizer. |
+| `min_unit_tokens_ir` | int | `33` | Same floor for `[normalize] normalizer = "ir"`. The IR canonical trees measured ~18% more compact than the historical grammar trees, so the same real clone scores fewer tokens on the IR path; `40` would filter reportable IR units historical keeps. `33` is the compaction-scaled floor (`40 × 0.815`), recalibrated to restore IR-path recall parity at zero measured precision cost. `Config::min_unit_floor()` selects between the two by the active normalizer; a non-IR language under `normalizer = "ir"` falls back to the historical normalizer and is gated marginally looser. |
 | `min_seq_tokens` | int | `30` | Sequence-tier maximal-repeat floor: sub-unit exact runs shorter than this are not reported. |
 | `bag_min_subtree_tokens` | int | `6` | Subtree-hash-bag floor: subtrees smaller than this don't enter the retrieval bag. |
 | `candidate_sim` | float | `0.70` | Bag-Jaccard retrieval threshold (estimated) for near-miss candidate pairs. |

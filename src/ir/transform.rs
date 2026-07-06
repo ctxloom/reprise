@@ -33,10 +33,33 @@ pub enum TransformKind {
     AnfName,
     /// A common arm-tail effect hoisted out of a `Branch` (§14).
     BranchHoist,
+    /// Augmented assignment desugared: `a op= b` → `a = a op b` (sound identity —
+    /// converges with the explicit form while `+=`/`-=` stay distinct via the binop).
+    AugAssign,
     /// Dead syntax removed (`pass`, empty `else`, redundant trailing `continue`).
     DeadStrip,
+    /// Ordered comparison oriented to `<`/`<=` (`a > b` → `b < a`) — bijective given the
+    /// operand swap, recorded as an `Order` witness so reversal restores the orientation.
+    CmpOrient,
+    /// A logical negation pushed inward (`!(a<b)`→`a>=b`, De Morgan, `!!x`→`x`) — bijective
+    /// given the locus (reversal re-wraps the `!`), so it carries no discriminator witness.
+    NotPush,
+    /// A nested `if a { if b { … } }` merged into one `if a && b { … }` (§13 rung 2) — the
+    /// merged nesting depth rides in the witness so reversal re-nests the guards.
+    GuardMerge,
+    /// A redundant `else` after a diverging then-arm dropped, its body hoisted to siblings
+    /// (`if c { return } else { Y }` → `if c { return }; Y`) — the hoisted body is the witness.
+    DeadElse,
+    /// A parallel multi-target assignment (`a, b = X, Y`) decomposed into a minimal sequence
+    /// of single assignments, a temp inserted only to break a read-after-write cycle — so it
+    /// converges with the equivalent adjacent single assigns and with tail-rec reassignment.
+    /// The original multi-assign rides in the witness so reversal restores it.
+    MultiAssign,
     /// A literal abstracted to its typed bucket — lossy; the value rides in the witness.
     LitBucket,
+    /// Identifiers relabelled to positional locals / `External` (§5.2.4) — the whole-tree
+    /// abstraction; the position→original-name map rides in the witness.
+    AbstractIdents,
 }
 
 impl TransformKind {
@@ -51,8 +74,15 @@ impl TransformKind {
             TransformKind::LoopExit => "loop-exit",
             TransformKind::AnfName => "anf-name",
             TransformKind::BranchHoist => "branch-hoist",
+            TransformKind::AugAssign => "aug-assign",
             TransformKind::DeadStrip => "dead-strip",
+            TransformKind::CmpOrient => "cmp-orient",
+            TransformKind::NotPush => "not-push",
+            TransformKind::GuardMerge => "guard-merge",
+            TransformKind::DeadElse => "dead-else",
+            TransformKind::MultiAssign => "multi-assign",
             TransformKind::LitBucket => "lit-bucket",
+            TransformKind::AbstractIdents => "abstract-idents",
         }
     }
 }
@@ -87,6 +117,10 @@ pub struct TransformEvent {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TransformLog {
     events: Vec<TransformEvent>,
+    /// A disabled log is the null sink (D-IR-10): [`record`](Self::record) early-
+    /// returns and nothing is materialized. Because the log is hash-excluded, this
+    /// never changes the canonical tree — it only skips the (discarded) stream.
+    disabled: bool,
 }
 
 impl TransformLog {
@@ -94,8 +128,28 @@ impl TransformLog {
         Self::default()
     }
 
-    /// Append a transform event (the only mutation — the log is append-only).
+    /// The null sink for the bulk-scan path (`docs/transform-seam.md` §1): recording
+    /// is a no-op that allocates nothing, so completing the (hash-excluded) event
+    /// stream costs nothing and cannot move the tree.
+    pub fn disabled() -> Self {
+        Self {
+            events: Vec::new(),
+            disabled: true,
+        }
+    }
+
+    /// Whether events are being recorded (a [`disabled`](Self::disabled) log is not) —
+    /// let callers skip materializing a witness they would only discard.
+    pub fn enabled(&self) -> bool {
+        !self.disabled
+    }
+
+    /// Append a transform event (the only mutation — the log is append-only). A
+    /// disabled sink drops it.
     pub fn record(&mut self, kind: TransformKind, locus: (u32, u32), witness: Witness) {
+        if self.disabled {
+            return;
+        }
         self.events.push(TransformEvent {
             kind,
             locus,

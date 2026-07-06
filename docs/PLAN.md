@@ -1,6 +1,7 @@
 ---
 sessions:
   - tidal-moral-chive
+  - pulpy-wooly-list
 ---
 
 # Implementation Plan: Semantic-ish Duplicate Detection for LLM-Generated Code
@@ -114,7 +115,7 @@ Persistence: an on-disk index (sled, or flat rkyv/bincode files keyed by content
 - Tree-sitter is error-tolerant: files with ERROR nodes are still processed; units containing ERROR nodes are fingerprinted but flagged `parse_degraded: true` in findings. Do not silently drop them — LLM output under review is frequently mid-broken, and that's a primary use case.
 - Extract as comparison units: (a) every function-like node; (b) the **normalized token stream** of each file, concatenated corpus-wide with unit separators, feeding the sequence tier (§5.6). **There is no window enumeration** — Rev 9 deleted it. Sub-function duplication is found two ways instead: exact contiguous runs by suffix-array maximal-repeat discovery over the token stream (complete and non-quadratic), and gapped/noisy regions by offset-histogram localization (§5.6). Inliner-produced region duplication (§5.4) is covered by the same two mechanisms applied to inlined variants' token streams.
 - **Test-code policy:** units recognized as tests (via `LanguageProfile`: `#[test]`/`@Test`/pytest conventions, `test_`/`_test` naming, `tests/` paths) are legitimately repetitive (arrange-act-assert, table-driven cases) and would otherwise dominate the report. Policy per config `tests.mode`: `separate` (default — own report section, never fails CI), `exclude`, or `normal`. Test-vs-test findings follow the policy; test-vs-production findings are always reported normally (production code duplicated into a test fixture is a real finding).
-- Apply a size floor **after normalization** (§5.2): units below `min_unit_tokens` (default 40 normalized tokens) are discarded, and sequence-tier repeats below `min_seq_tokens` (default 30) are not reported. Rationale: aggressive normalization makes all small functions (getters, trivial loops) converge — true-but-useless positives. This floor is the single most important precision knob; make it prominent in config and report which findings sit near it.
+- Apply a size floor **after normalization** (§5.2): units below `min_unit_tokens` (default 40 normalized tokens) are discarded, and sequence-tier repeats below `min_seq_tokens` (default 30) are not reported. Rationale: aggressive normalization makes all small functions (getters, trivial loops) converge — true-but-useless positives. This floor is the single most important precision knob; make it prominent in config and report which findings sit near it. → **(D47 — measured NO-GO, docs/substantiality-metric.md §0):** a landmark-density + IDF substantiality *replacement* for this floor was proposed and measured; it **fails** (landmark count is a size proxy, r=0.994 with token count; the substantive-vs-trivial-small distinction is semantic, not structural). The token floor stays the knob.
 
 ### 5.2 Normalization (P3)
 

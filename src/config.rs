@@ -188,13 +188,29 @@ impl Default for ScanCfg {
 #[serde(default)]
 pub struct Thresholds {
     /// Post-normalization unit size floor — the single most important
-    /// precision knob (spec §5.1).
+    /// precision knob (spec §5.1). Calibrated for the historical normalizer;
+    /// the IR path uses `min_unit_tokens_ir` (its trees are more compact).
     pub min_unit_tokens: u32,
+    /// Same floor for the `"ir"` normalizer. The IR canonical trees measured
+    /// ~18% more compact than the historical grammar trees, so a real clone
+    /// scores fewer tokens on the IR path and the shared 40 floor would filter
+    /// reportable IR units historical keeps (§8 flip blocker). Set to the
+    /// compaction-scaled value (40 × 0.815 ≈ 33): restores wild-net recall
+    /// parity at zero measured precision cost. See `Config::min_unit_floor`.
+    pub min_unit_tokens_ir: u32,
     pub min_seq_tokens: u32,
     pub bag_min_subtree_tokens: u32,
     pub candidate_sim: f64,
     pub hole_hash_min_cover: f64,
     pub histogram_min_votes: u32,
+    /// Same near-tier offset-histogram vote floor for the `"ir"` normalizer. The IR canonical
+    /// trees are ~18% more compact (see `min_unit_tokens_ir`), so the SAME small near-clone
+    /// offers proportionally fewer shared subtrees to vote a diagonal — the shared 5-vote bar
+    /// over-filters a real IR-path pair historical keeps (§8 flip blocker: wild w6 lands at
+    /// exactly 4 shared aligned subtrees). Set to the compaction-scaled value (5 × 0.815 ≈ 4):
+    /// restores wild-net recall parity at a negligible precision cost (a near-tier pre-filter;
+    /// AU's own divergence/hole gates still apply). See `Config::histogram_min_votes`.
+    pub histogram_min_votes_ir: u32,
     pub max_divergence: f64,
     pub max_holes: u32,
     pub fold_min_repeats: u32,
@@ -204,11 +220,13 @@ impl Default for Thresholds {
     fn default() -> Self {
         Thresholds {
             min_unit_tokens: 40,
+            min_unit_tokens_ir: 33,
             min_seq_tokens: 30,
             bag_min_subtree_tokens: 6,
             candidate_sim: 0.70,
             hole_hash_min_cover: 0.5,
             histogram_min_votes: 5,
+            histogram_min_votes_ir: 4,
             // Spec §9 guessed 0.15; set empirically per §7.4(c) — see
             // CALIBRATION.md (whole-expression AU holes on realistic
             // subtree-substitution clones land at ~0.17).
@@ -225,12 +243,25 @@ pub struct NormalizeCfg {
     /// Literals whose identity is structural (spec §5.2.5). String literals are
     /// compared by their inner content, numeric literals by their text.
     pub literal_keep: Vec<String>,
+    /// Which normalizer produces the canonical tree fed to matching. A **non-boolean,
+    /// plugin-extensible** selector (not a two-way flag) — further normalizer plugins
+    /// may register later. Known values: `"ir"` (the `src/frontend` + `src/ir` canonical
+    /// IR — D-IR-1a/D-IR-3, feature-complete across Rust/Python/Go; **the default** as of
+    /// the §8 switchover) and `"historical"` (the per-language `src/lang` profiles, still
+    /// fully supported and selectable). The IR trees are ~18% more compact, which is why
+    /// the size floor is per-normalizer: the IR path uses `[thresholds] min_unit_tokens_ir`
+    /// (33, the compaction-scaled floor — see `Config::min_unit_floor`), recalibrated so
+    /// IR-path recall reaches parity with historical without a precision cost. A language
+    /// without an IR frontend (TS, Kotlin) falls back to `"historical"` even when `"ir"`
+    /// is selected (a per-language capability gate, §9).
+    pub normalizer: String,
 }
 
 impl Default for NormalizeCfg {
     fn default() -> Self {
         NormalizeCfg {
             literal_keep: vec!["0".into(), "1".into(), "-1".into(), "".into()],
+            normalizer: "ir".into(),
         }
     }
 }
@@ -274,6 +305,48 @@ impl Config {
             Ok(config)
         } else {
             Ok(Config::default())
+        }
+    }
+
+    /// Effective post-normalization unit-size floor for the active normalizer.
+    /// The IR path (`normalizer = "ir"`) uses its own, lower floor because its
+    /// canonical trees are ~18% more compact than the historical grammar trees
+    /// (measured mean 84.9 vs 104.2 tokens/unit on the self+wild corpus), so the
+    /// SAME real clone scores fewer tokens on the IR path — e.g. serde's
+    /// `visit_str`/`visit_borrowed_str` near-clone is 61 tokens historical but 33
+    /// IR. A shared 40 floor would filter reportable IR units historical keeps
+    /// (the §8 switch-over recall blocker). Historical keeps 40, so the default
+    /// path is byte-for-byte unchanged. This is a report/filter parameter, NOT a
+    /// canonical-form input (it does not enter the fingerprint or cache key).
+    /// A non-IR language under `normalizer = "ir"` falls back to the historical
+    /// normalizer (§9), so its units are uncompacted and this floor is marginally
+    /// looser for them — an accepted edge of the capability-gap fallback.
+    pub fn min_unit_floor(&self) -> u32 {
+        if self.normalize.normalizer == "ir" {
+            self.thresholds.min_unit_tokens_ir
+        } else {
+            self.thresholds.min_unit_tokens
+        }
+    }
+
+    /// Effective near-tier offset-histogram vote floor for the active normalizer. The IR path
+    /// (`normalizer = "ir"`) uses its own, lower floor because its canonical trees are ~18%
+    /// more compact than the historical grammar trees (see `min_unit_floor`): the SAME small
+    /// near-clone offers proportionally fewer shared subtrees (≥3 tokens) to vote a common
+    /// Δoffset diagonal, so the historical 5-vote bar rejects a real IR-path pair before AU —
+    /// e.g. flask's `max_content_length`/`max_form_memory_size` near-clone lands at exactly 4
+    /// shared aligned subtrees on the IR path (the §8 switch-over recall blocker), yet AU then
+    /// accepts it at divergence 0.06. Historical keeps 5, so the default path is unchanged.
+    /// This is a report/filter parameter — a near-tier pre-filter — NOT a canonical-form input
+    /// (it does not enter the fingerprint or cache key), and AU's divergence/hole gates still
+    /// bound precision. A non-IR language under `normalizer = "ir"` falls back to the historical
+    /// normalizer (§9), but this floor is matching-time (post-extraction), so its trees still
+    /// use the historical size — an accepted edge of the capability-gap fallback.
+    pub fn histogram_min_votes(&self) -> u32 {
+        if self.normalize.normalizer == "ir" {
+            self.thresholds.histogram_min_votes_ir
+        } else {
+            self.thresholds.histogram_min_votes
         }
     }
 

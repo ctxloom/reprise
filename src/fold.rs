@@ -11,6 +11,24 @@ use crate::fingerprint::{HashMode, merkle_mode};
 use crate::lang::LanguageProfile;
 use crate::tree::{Bucket, Label, NormNode};
 
+/// The two classifications folding needs — which node kinds hold a foldable sibling run,
+/// and which are dispatch arms (fold but don't report, D30). Supplied by a
+/// `LanguageProfile` for the historical path and by canonical-IR predicates for the IR
+/// path, so the fold algorithm itself is written once.
+pub trait FoldRules {
+    fn is_list_kind(&self, kind: &str) -> bool;
+    fn is_dispatch_arm(&self, kind: &str) -> bool;
+}
+
+impl FoldRules for &dyn LanguageProfile {
+    fn is_list_kind(&self, kind: &str) -> bool {
+        LanguageProfile::is_list_kind(*self, kind)
+    }
+    fn is_dispatch_arm(&self, kind: &str) -> bool {
+        LanguageProfile::is_dispatch_arm(*self, kind)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct RepeatFinding {
     pub byte_span: (u32, u32),
@@ -29,13 +47,24 @@ pub fn fold_repeats(
     min_repeats: usize,
     findings: &mut Vec<RepeatFinding>,
 ) -> NormNode {
+    fold_repeats_with(node, &profile, min_repeats, findings)
+}
+
+/// Fold sibling-run repeats using an explicit [`FoldRules`] — the historical path passes a
+/// `LanguageProfile`; the IR path passes canonical-kind rules ([`crate::ir::fold_rules`]).
+pub fn fold_repeats_with(
+    node: NormNode,
+    rules: &dyn FoldRules,
+    min_repeats: usize,
+    findings: &mut Vec<RepeatFinding>,
+) -> NormNode {
     let mut node = node;
     node.children = node
         .children
         .into_iter()
-        .map(|c| fold_repeats(c, profile, min_repeats, findings))
+        .map(|c| fold_repeats_with(c, rules, min_repeats, findings))
         .collect();
-    if !profile.is_list_kind(&node.kind) || node.children.len() < min_repeats {
+    if !rules.is_list_kind(&node.kind) || node.children.len() < min_repeats {
         return node;
     }
 
@@ -74,7 +103,7 @@ pub fn fold_repeats(
                 // Dispatch tables (all template nodes are match/case arms)
                 // fold but are not FINDINGS — an enum→value table is
                 // idiomatic, not actionable duplication (D30).
-                if !template.iter().all(|t| profile.is_dispatch_arm(&t.kind)) {
+                if !template.iter().all(|t| rules.is_dispatch_arm(&t.kind)) {
                     findings.push(RepeatFinding {
                         byte_span: (start, end),
                         count: reps as u32,

@@ -13,13 +13,35 @@
 //! is gated behind a build flag per D-IR-3 and lands in a later increment. This
 //! module is the P1 foundation: the vocabulary, the event log, and provenance.
 
+pub mod edit;
 pub mod kind;
 pub mod pass;
 pub mod provenance;
 pub mod render;
 pub mod transform;
 
-pub use pass::{abstract_idents, canonicalize_order, strip_dead};
+pub use edit::{Edit, apply};
+pub use pass::{
+    abstract_idents, boolean_normalize, decompose_multi_assign, detect_abstract_idents,
+    detect_boolean_normalize, detect_comm_sort, detect_dead, detect_guard_canonicalize,
+    detect_iter_protocol, detect_loop_exit, detect_multi_assign, guard_canonicalize,
+    normalize_loop_exit, rewrite_iteration, strip_dead,
+};
 pub use provenance::Provenance;
 pub use render::to_sexpr;
 pub use transform::{TransformEvent, TransformKind, TransformLog, Witness};
+
+/// Sibling-run folding rules (spec §5.3, D30) on the **canonical** IR, so the shared
+/// `fold::fold_repeats_with` algorithm runs on IR trees too: statement `Block`s and
+/// `Branch` arm-lists hold foldable runs, and every `Arm` is a dispatch arm (a repeated
+/// arm folds for convergence but is not reported — an enum→value table is idiomatic).
+pub struct FoldRules;
+
+impl crate::fold::FoldRules for FoldRules {
+    fn is_list_kind(&self, k: &str) -> bool {
+        k == kind::BLOCK || k == kind::BRANCH || k == "REPEAT"
+    }
+    fn is_dispatch_arm(&self, k: &str) -> bool {
+        k == kind::ARM
+    }
+}

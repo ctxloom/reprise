@@ -31,7 +31,12 @@ fn wild_root() -> PathBuf {
 
 #[test]
 fn every_wild_pair_converges_at_its_labeled_tier() {
+    // Pinned to the still-supported historical normalizer: the WILD table carries the
+    // historical tier labels. IR wild recall parity is the separate gate
+    // `wild_pairs_converge_under_the_ir_normalizer` (the only IR loss is w7, an exact-region run
+    // held out by `min_seq_tokens`, Decision 4).
     let mut cfg = Config::default();
+    cfg.normalize.normalizer = "historical".into();
     cfg.cache.enabled = false; // don't litter fixture dirs with .reprise/
     for (dir, tier, members) in WILD {
         let root = wild_root().join(dir);
@@ -56,6 +61,55 @@ fn every_wild_pair_converges_at_its_labeled_tier() {
             report.groups
         );
     }
+}
+
+/// The IR path (`[normalize] normalizer = "ir"`) must keep converging the hand-labeled wild
+/// pairs — the recall-parity gate for flipping the default normalizer (§8). The IR canonical
+/// trees are ~18% more compact, so the size/vote floors are per-normalizer
+/// (`min_unit_tokens_ir`, `histogram_min_votes_ir`); with those, every wild pair historical
+/// finds also converges on IR EXCEPT w7 — an exact-region run that lands at exactly 25 IR
+/// tokens, below the unrecalibrated `min_seq_tokens` floor (a reported precision/recall fork,
+/// deliberately NOT applied: the compaction-scaled seq floor of 25 costs measurable
+/// precision). w6 is the Gap-B recovery (`histogram_min_votes_ir`); w8 stays a non-finding.
+#[test]
+fn wild_pairs_converge_under_the_ir_normalizer() {
+    let mut cfg = Config::default();
+    cfg.cache.enabled = false;
+    cfg.normalize.normalizer = "ir".into();
+    // (fixture, converges under IR). w7: the residual `min_seq_tokens` fork. w8: non-finding.
+    let ir_expect: &[(&str, bool)] = &[
+        ("w1_gin_marshalxml", true),
+        ("w2_ripgrep_bytecount", true),
+        ("w3_ripgrep_sort", true),
+        ("w4_serde_end", true),
+        ("w5_serde_tagorcontent", true),
+        ("w6_flask_maxprops", true),
+        ("w7_click_chunkpump", false),
+        ("w8_ripgrep_convert", false),
+        ("w9_ripgrep_cpufeatures", true),
+    ];
+    for (dir, converges) in ir_expect {
+        let root = wild_root().join(dir);
+        let report = reprise::scan(&root, &cfg)
+            .unwrap_or_else(|e| panic!("IR scan of wild fixture {dir} failed: {e}"));
+        assert_eq!(
+            !report.groups.is_empty(),
+            *converges,
+            "wild fixture {dir} under IR: expected converges={converges}, groups: {:#?}",
+            report.groups
+        );
+    }
+    // Gap B lock-in: flask's `max_content_length`/`max_form_memory_size` near-clone offers only
+    // 4 shared aligned subtrees on the compact IR tree — below the historical 5-vote histogram
+    // floor, but recovered by `histogram_min_votes_ir` (AU then accepts it at divergence ~0.06).
+    let w6 = reprise::scan(&wild_root().join("w6_flask_maxprops"), &cfg).unwrap();
+    assert!(
+        w6.groups
+            .iter()
+            .any(|g| g.tier.to_string() == "near-normalized" && g.members.len() >= 2),
+        "w6 must converge at near-normalized on the IR path: {:#?}",
+        w6.groups
+    );
 }
 
 /// The fixture table and the on-disk corpus must not drift apart silently.

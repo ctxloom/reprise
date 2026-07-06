@@ -15,11 +15,15 @@ fn fp(src: &str, lang: Lang) -> u128 {
 }
 
 fn pair_tier(sources: &[(&str, &str)]) -> Option<String> {
+    pair_tier_cfg(sources, &Config::default())
+}
+
+fn pair_tier_cfg(sources: &[(&str, &str)], cfg: &Config) -> Option<String> {
     let dir = TempDir::new().unwrap();
     for (name, src) in sources {
         fs::write(dir.path().join(name), src).unwrap();
     }
-    let report = reprise::scan(dir.path(), &Config::default()).unwrap();
+    let report = reprise::scan(dir.path(), cfg).unwrap();
     report
         .groups
         .iter()
@@ -109,6 +113,21 @@ fn kt_tail_recursion_converges_with_iteration() {
         tier.as_deref()
             .is_some_and(|t| matches!(t, "exact-normalized" | "near-normalized" | "exact-region")),
         "tail recursion must converge with iteration; got {tier:?}"
+    );
+}
+
+#[test]
+fn kt_tail_recursion_converges_with_iteration_ir() {
+    // Under `normalizer = "ir"` Kotlin has no IR frontend yet, so it falls back to the
+    // historical normalizer (§9 per-language capability gate) — the recursion↔iteration
+    // convergence still holds on the IR-selected path.
+    let mut cfg = Config::default();
+    cfg.normalize.normalizer = "ir".into();
+    let tier = pair_tier_cfg(&[("aa.kt", KT_ITER), ("bb.kt", KT_TAIL)], &cfg);
+    assert!(
+        tier.as_deref()
+            .is_some_and(|t| matches!(t, "exact-normalized" | "near-normalized" | "exact-region")),
+        "tail recursion must converge with iteration on the IR path; got {tier:?}"
     );
 }
 

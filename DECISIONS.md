@@ -1002,3 +1002,84 @@ is beginning on branch `similarity-ir`. What is decided vs. what P1 measures:
 - **Rollout.** P1 = IR + Rust/Python frontends behind a flag, parity-gated; P2 =
   TS/Go/Kotlin; P3 = retire the `LanguageProfile` normalization hooks (bumps
   `FINGERPRINT_SCHEME`/`EXTRACTION_VERSION`, D19/D30).
+
+## D46 — LSP & MCP server surfaces promoted in-scope; the "CLI + CI only" non-goal reversed (2026-07-03)
+
+The spec (docs/PLAN.md §non-goals) said "a daemon/server/IDE plugin — CLI + CI only"
+and "do not build a daemon." That is **reversed here**: two server surfaces move in-scope,
+designed in the authoritative **`docs/SERVERS.md`** (the D-SRV-1…7 register lives there).
+The reversal is deliberate, not accretion — the agent thesis pulls **MCP** in (reprise's
+founding use case is agents reimplementing helpers; MCP lets the agent consult reprise
+mid-write), and multi-editor reach + the live drift guardrail pull **LSP** in.
+
+- **One substrate, two projections.** Neither server is a source of truth: both project the
+  existing serde report model (`ScanReport`/`CheckReport`). The SARIF emitter already does
+  the exact LSP projection (one finding → N `relatedLocations`, structural-hash
+  `partialFingerprints`), so the model work is largely done. `scan()`/`check::run()` are
+  already printing-free, exit-free lib calls — v1 needs near-zero core change.
+- **Resolved (D-SRV register in docs/SERVERS.md).** Separate workspace crates
+  (`reprise-mcp`/`reprise-lsp`/thin `reprise-server-core`); the core lib + static CLI stay
+  **sync and tokio-free** (server deps `rmcp`/`tower-lsp` never enter the CLI binary). v1 is
+  **stateless-per-request** — hold the warm D19 cache, re-run scan/check debounced (warm
+  real-repo scans are sub-second, so a full re-scan is viable). LSP analyses on `didSave`.
+  `find_similar` (MCP, on-thesis) is **append-and-rescan** over existing primitives
+  (`units_from_source` + `au::anti_unify`), not new matching machinery. Build order: MCP and
+  LSP **in parallel** after a shared-core M1.
+- **Deferred, latency-gated (§6).** A held in-memory index + incremental single-file
+  re-match — the only part that collides hard with the old non-goal — is built **only if a
+  real repo trips a written latency trigger**. It also unlocks dirty-buffer
+  live-as-you-type and the affordable live `inconsistent-update` guardrail (the standout LSP
+  feature). Per the D-IR-4 driving-case discipline: no daemon-with-index until measurement
+  demands it.
+- **Relationship to D45 (the IR effort, same branch).** Orthogonal by construction. The
+  servers depend on the **stable lib API** (`scan`/`check::run`/the report model) and the
+  **preserved back half** (`au`/`group`/`fingerprint`) — both of which D45 §3 keeps
+  unchanged. The IR rewrites the *front half* (`LanguageProfile` lowering) *behind* those
+  API signatures, so server code is insulated. The one avoidable collision — factoring
+  `scan()`'s extract half into a corpus-units accessor (M1) — is **deferred/coordinated with
+  the IR work**; v1 `find_similar` uses `units_from_source` as-is instead. Server warm caches
+  key on `FINGERPRINT_SCHEME`/`EXTRACTION_VERSION`, so the IR's scheme bump invalidates them
+  automatically (D19) — no special transition handling. **Numbering note:** if the IR agent's
+  next entry also claims D46, reconcile at commit (agents don't cut releases/commits here).
+
+## D47 — Substantiality via landmark-density + IDF, not token size (novel direction; 2026-07-05)
+
+The precision floors (`min_unit_tokens` 40, `min_seq_tokens` 30, `histogram_min_votes` 5,
+`fold_min_repeats`) all gate on a **raw count** as a proxy for "enough distinctive structure to trust a
+match." Two faults the D45 IR work made unavoidable: **(1) representation-dependent** — IR trees are ~18%
+more compact, so every floor grew a per-normalizer twin (`min_unit_tokens_ir=33`, `histogram_min_votes_ir=4`,
+each = original × 0.815); the knobs multiply with every representation (a third frontend / grammar bump
+re-opens the calibration). **(2) crude** — raw count can't separate a substantive 25-token unit (w7's
+chunked-I/O loop) from a trivial 25-token idiom (plumbing), forcing the Decision-4 (w7 / `min_seq_tokens`)
+recall-vs-precision either-or that has no answer in the size domain.
+
+**Decision (direction; not yet implemented).** Replace the size floors with a representation-invariant
+substantiality score `f(distinct_landmark_count, idf_content)`, computed from quantities reprise **already
+builds for retrieval** — the Shazam landmark constellation (§5.5.4; peaks = rare low-DF subtrees at
+structural offsets, `matchtree.rs:143-176`) is a rarity-weighted structural-richness signal with
+boilerplate excluded by construction. Because a unit's rare-peak count does not scale with raw token count,
+`K` calibrates **once** for all normalizers (retiring the `_ir` twins), and it separates substantive-small
+from trivial-small directly (recovers w7 while rejecting its ~134 plumbing look-alikes — the recall *and*
+precision size floors make mutually exclusive). Subsumes the `elder-wow` IDF-substantiality item; the
+landmark layer already shares the §5.7 IDF machinery (`api.rs:102`).
+
+**Non-optional companion — the gate justifies itself.** Ships with diagnostics that report its **marginal
+usefulness every scan**: units it decides differently than the token floor (recoveries / rejections vs the
+size gate), the TP/FP split of that marginal set, and the score's TP-vs-FP separation — modeled on the
+§7.4b retrieval-rivalry measurement (drop-the-loser), so a future representation change that quietly makes
+it useless surfaces in the readout instead of hiding.
+
+Full design + plan + caveats (corpus-relative rarity; match-time locus): **docs/substantiality-metric.md**.
+Post-flip effort (the D45 default-normalizer flip lands first). Numbering: reconcile D46/D47 at commit.
+
+**MEASURED NO-GO (2026-07-05, `fond-mute` measure-before-implement).** The score was prototyped against the
+exact landmark/IDF machinery over realistic corpora on a 9-pass/9-fail labeled set. It **fails**:
+**landmark_count is a size proxy** (r=0.994 with token_count → same AUC 0.654 as the baseline, same ~0.79
+IR/historical shift → NOT representation-invariant), **structural IDF saturates** (nearly every ≥6-token
+subtree is unique → idf≈max), and **the premise is empirically false** — plumbing runs have *as many* rare
+peaks as (and IDF ≥) genuine small clones (`is_self_call` has `max_df=139` — it *contains* the corpus's
+single commonest subtree). Root cause: substantive-vs-trivial-small is a **semantic/authorial** judgment,
+not a structural-rarity property the landmark/IDF layer can observe. **DECISION: keep the per-normalizer
+token floors (`min_unit_tokens_ir`, `histogram_min_votes_ir`) as-is; do NOT swap. w7 stays a Decision-4
+hold-out; `elder-wow` is NOT subsumed.** A different axis (shared-fragment corpus-recurrence df, or callee
+semantics) would be a new design. Full data: docs/substantiality-metric.md §0.

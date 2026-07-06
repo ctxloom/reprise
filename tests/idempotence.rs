@@ -99,8 +99,14 @@ fn spans_survive_normalization() {
 #[test]
 fn units_meet_phase1_floor() {
     // Guard for the benchmark itself: seeds must clear `min_unit_tokens`,
-    // otherwise mutation recall silently tests nothing (DECISIONS.md D6).
-    let cfg = Config::default();
+    // otherwise mutation recall silently tests nothing (DECISIONS.md D6). Pinned to the
+    // historical normalizer: it asserts the historical floor (40) against historical-path
+    // token counts. The IR default uses a lower, compaction-scaled floor
+    // (`min_unit_tokens_ir` = 33) and more compact counts (e.g. `reduce_pair` is 36 IR
+    // tokens — above the IR floor but below 40); the IR seed-floor guard rides on
+    // `just bench-mutations-ir`.
+    let mut cfg = Config::default();
+    cfg.normalize.normalizer = "historical".into();
     for (src, lang) in seed_sources() {
         let units = reprise::units_from_source(&src, lang, &cfg);
         assert_eq!(units.len(), 1);

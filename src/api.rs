@@ -10,10 +10,11 @@
 //! what §7.4(d) hand-labels — reported in their own section, never failing CI.
 
 use crate::config::Config;
+use crate::ir::kind;
 use crate::lang::{Lang, LanguageProfile, child_field};
 use crate::report::{Group, Tier};
 use crate::tree::{Label, NormNode};
-use crate::unit::Unit;
+use crate::unit::{self, Unit};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Signature element: callee name + control context.
@@ -62,13 +63,13 @@ fn api_groups_for_lang(
     excluded_pairs: &HashSet<(usize, usize)>,
     signatures_emitted: &mut usize,
 ) -> Vec<Group> {
-    let profile = lang.profile();
+    let shapes = Shapes::for_lang(lang, cfg);
     // Eligible population: plain units at or above the size floor.
     let eligible: Vec<usize> = (0..units.len())
         .filter(|&i| {
             units[i].lang == lang
                 && units[i].variant.is_none()
-                && units[i].token_count >= cfg.thresholds.min_unit_tokens
+                && units[i].token_count >= cfg.min_unit_floor()
         })
         .collect();
     let n = eligible.len();
@@ -85,8 +86,8 @@ fn api_groups_for_lang(
             let tree = &units[i].tree;
             // The unit body's final statement/expression is a tail position,
             // like returns: `return f(x)` and block-tail `f(x)` must agree.
-            let tail_node = child_field(tree, "body").and_then(|b| b.children.last());
-            extract_calls(tree, profile, Flags::default(), tail_node, &mut elems);
+            let tail_node = shapes.tail_node(tree);
+            extract_calls(tree, shapes, Flags::default(), tail_node, &mut elems);
             (i, elems)
         })
         .collect();
@@ -284,32 +285,110 @@ fn is_return_kind(kind: &str) -> bool {
     matches!(kind, "return_expression" | "return_statement")
 }
 
+/// The tree-shape primitives `extract_calls` reads through, so one extraction serves
+/// both the historical per-grammar trees and the canonical IR (`normalizer = "ir"`),
+/// mirroring [`crate::inline::Shapes`]. The `Historical` arm reproduces the per-language
+/// [`LanguageProfile`] hooks byte-for-byte; the `Ir` arm returns the canonical constants
+/// (`docs/SIMILARITY-IR.md`) — the call/loop/branch/return kinds, and the `callee` field.
+/// The discriminating signal (rare-callee names) is identical either way: a free callee
+/// lowers to `Call{ callee: Var@callee External(name) }`, and the IR keeps external names
+/// verbatim (only bound locals are abstracted), so [`callee_name`]'s `External` walk reads
+/// the same function names off both forms.
+#[derive(Clone, Copy)]
+enum Shapes {
+    Historical(&'static dyn LanguageProfile),
+    Ir,
+}
+
+impl Shapes {
+    /// Pick the shape family a unit was extracted with — IR when the active normalizer is
+    /// `"ir"` and `lang` has a frontend, else the historical profile (also the TS/Kotlin
+    /// fallback under `normalizer = "ir"`, §9 P2) — mirroring the inline tier's selector so
+    /// mixed scans resolve per-unit.
+    fn for_lang(lang: Lang, cfg: &Config) -> Shapes {
+        if unit::is_ir(lang, cfg) {
+            Shapes::Ir
+        } else {
+            Shapes::Historical(lang.profile())
+        }
+    }
+
+    fn call_kind(&self) -> &'static str {
+        match self {
+            Shapes::Historical(p) => p.call_kind(),
+            Shapes::Ir => kind::CALL,
+        }
+    }
+
+    /// The callee subtree of a call: historical `function` field, IR `callee` field.
+    fn callee<'a>(&self, node: &'a NormNode) -> Option<&'a NormNode> {
+        match self {
+            Shapes::Historical(_) => child_field(node, "function"),
+            Shapes::Ir => child_field(node, "callee"),
+        }
+    }
+
+    fn is_loop(&self, node: &NormNode) -> bool {
+        match self {
+            Shapes::Historical(p) => p.is_loop_core(node),
+            Shapes::Ir => node.kind.as_ref() == kind::LOOP,
+        }
+    }
+
+    fn is_branch(&self, node: &NormNode) -> bool {
+        match self {
+            Shapes::Historical(_) => is_branchy(&node.kind),
+            Shapes::Ir => node.kind.as_ref() == kind::BRANCH,
+        }
+    }
+
+    fn is_return(&self, node: &NormNode) -> bool {
+        match self {
+            Shapes::Historical(_) => is_return_kind(&node.kind),
+            Shapes::Ir => node.kind.as_ref() == kind::RETURN,
+        }
+    }
+
+    /// The block-tail node whose call shares tail context with `return`s. On the historical
+    /// trees this is the body's last child (a bare block-tail `f(x)`). On the IR the frontend
+    /// has already pushed every tail expression into an explicit `Return` (return-position
+    /// lowering), so `is_return` alone carries tail context; the pointer heuristic is then not
+    /// only redundant but wrong — the last body node is often a trailing `Loop` (a `for`'s tail
+    /// return fuses into its exit arm), which would leak `tail` onto the whole loop body.
+    fn tail_node<'a>(&self, tree: &'a NormNode) -> Option<&'a NormNode> {
+        match self {
+            Shapes::Historical(_) => child_field(tree, "body").and_then(|b| b.children.last()),
+            Shapes::Ir => None,
+        }
+    }
+}
+
 fn extract_calls(
     node: &NormNode,
-    profile: &dyn LanguageProfile,
+    shapes: Shapes,
     flags: Flags,
     tail_node: Option<&NormNode>,
     out: &mut BTreeMap<Elem, u32>,
 ) {
     let mut here = flags;
-    if profile.is_loop_core(node) {
+    if shapes.is_loop(node) {
         here.loop_depth = (here.loop_depth + 1).min(MAX_LOOP_DEPTH);
     }
-    if is_branchy(&node.kind) {
+    if shapes.is_branch(node) {
         here.in_branch = true;
     }
-    if is_return_kind(&node.kind) || tail_node.is_some_and(|t| std::ptr::eq(t, node)) {
+    if shapes.is_return(node) || tail_node.is_some_and(|t| std::ptr::eq(t, node)) {
         here.tail = true;
     }
-    if node.kind.as_ref() == profile.call_kind()
-        && let Some(f) = child_field(node, "function")
+    if node.kind.as_ref() == shapes.call_kind()
+        && let Some(f) = shapes.callee(node)
         && let Some(name) = callee_name(f)
     {
         *out.entry((name, here.loop_depth, here.in_branch, here.tail))
             .or_insert(0) += 1;
     }
     for child in &node.children {
-        extract_calls(child, profile, here, tail_node, out);
+        extract_calls(child, shapes, here, tail_node, out);
     }
 }
 

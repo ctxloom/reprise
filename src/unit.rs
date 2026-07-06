@@ -9,7 +9,7 @@ use crate::fingerprint;
 use crate::fold::{self, RepeatFinding};
 use crate::lang::Lang;
 use crate::normalize::{self, RawUnit};
-use crate::tree::NormNode;
+use crate::tree::{Label, NormNode};
 use std::path::{Path, PathBuf};
 
 /// Tag on an inline-expanded variant unit (spec §5.4).
@@ -120,6 +120,13 @@ fn accepts_drift(lines: &[&str], first_line: u32) -> bool {
 }
 
 pub fn extract_file_units_keep_raw(path: &Path, src: &str, lang: Lang, cfg: &Config) -> FileUnits {
+    // Normalizer selector (non-boolean, plugin-extensible — D-IR-3): the "ir" plugin
+    // lowers directly to the canonical IR (D-IR-1a) and skips the historical passes.
+    // A language without an IR frontend yet (TS, Kotlin) falls back to the historical
+    // normalizer so those files still scan (per-language capability gate, §9 P2).
+    if cfg.normalize.normalizer == "ir" && crate::frontend::has_ir_frontend(lang) {
+        return extract_ir_file_units(path, src, lang, cfg);
+    }
     let mut out = FileUnits {
         units: Vec::new(),
         repeats: Vec::new(),
@@ -161,6 +168,76 @@ pub fn extract_file_units_keep_raw(path: &Path, src: &str, lang: Lang, cfg: &Con
     out
 }
 
+/// The IR-normalizer extraction path (D-IR-1a): each function is lowered directly to
+/// canonical IR, sibling-run folded (spec §5.3 / D30, on the canonical kinds via
+/// [`crate::ir::FoldRules`]), fingerprinted, and flowed through the same matching back
+/// half as the historical path. (Inline variants remain deferred — back-half, §3.)
+fn extract_ir_file_units(path: &Path, src: &str, lang: Lang, cfg: &Config) -> FileUnits {
+    let mut out = FileUnits {
+        units: Vec::new(),
+        repeats: Vec::new(),
+        raw_trees: Vec::new(),
+        suppressed: 0,
+    };
+    let lines: Vec<&str> = src.lines().collect();
+    for u in crate::frontend::extract_ir_units(src, lang, path) {
+        if is_suppressed(&lines, u.line_span.0) {
+            out.suppressed += 1;
+            continue;
+        }
+        let accept_drift = accepts_drift(&lines, u.line_span.0);
+        // Fold repeat runs (mutates the tree → must precede the fingerprint, like the
+        // historical path) and collect the internal-repeat findings.
+        let mut found = Vec::new();
+        let tree = fold::fold_repeats_with(
+            u.tree,
+            &crate::ir::FoldRules,
+            cfg.thresholds.fold_min_repeats as usize,
+            &mut found,
+        );
+        let fingerprint = fingerprint::merkle(&tree);
+        let token_count = tree.token_count();
+        for f in found {
+            // Report a run only when the duplicated mass clears the sequence floor.
+            if f.template_tokens * f.count >= cfg.thresholds.min_seq_tokens {
+                out.repeats.push(InternalRepeat {
+                    file: path.to_path_buf(),
+                    lang,
+                    unit_name: u.name.clone(),
+                    line_span: (
+                        byte_to_line(src, f.byte_span.0),
+                        byte_to_line(src, f.byte_span.1),
+                    ),
+                    count: f.count,
+                    template_tokens: f.template_tokens,
+                    unit_fp: fingerprint,
+                    template_hash: f.template_hash,
+                });
+            }
+        }
+        // Retain the pre-abstraction lowered tree (not the canonical `tree`): the
+        // inline phase (spec §5.4) splices callee bodies by name and re-runs the
+        // passes on the result, exactly as the historical path keeps pre-`apply_passes`
+        // raw trees. (Historical raw trees hold the same pre-normalization form.)
+        out.raw_trees.push(u.raw);
+        out.units.push(Unit {
+            file: path.to_path_buf(),
+            lang,
+            name: u.name,
+            byte_span: u.byte_span,
+            line_span: u.line_span,
+            token_count,
+            parse_degraded: u.parse_degraded,
+            is_test: u.is_test,
+            accept_drift,
+            fingerprint,
+            tree,
+            variant: None,
+        });
+    }
+    out
+}
+
 pub fn extract_file_units(
     path: &Path,
     src: &str,
@@ -181,6 +258,68 @@ fn pass_and_fold(tree: NormNode, lang: Lang, cfg: &Config) -> (NormNode, Vec<Rep
         &mut found,
     );
     (tree, found)
+}
+
+/// Whether extraction for `lang` used the IR normalizer (else the historical path,
+/// including the TS/Kotlin fallback under `normalizer = "ir"`, §9 P2).
+pub(crate) fn is_ir(lang: Lang, cfg: &Config) -> bool {
+    cfg.normalize.normalizer == "ir" && crate::frontend::has_ir_frontend(lang)
+}
+
+/// The IR analog of [`pass_and_fold`] for a spliced inline variant: re-run recursion
+/// lowering (an inlined mutual-recursion partner is now direct self-recursion — spec
+/// §5.4), then the canonical IR passes and the IR sibling-run fold.
+fn ir_pass_and_fold(
+    expanded: NormNode,
+    root_name: &str,
+    cfg: &Config,
+) -> (NormNode, Vec<RepeatFinding>) {
+    let expanded = ir_relower_recursion(expanded, root_name);
+    let tree = crate::frontend::run_passes(
+        expanded,
+        &mut crate::ir::transform::TransformLog::disabled(),
+    );
+    let mut found: Vec<RepeatFinding> = Vec::new();
+    let tree = fold::fold_repeats_with(
+        tree,
+        &crate::ir::FoldRules,
+        cfg.thresholds.fold_min_repeats as usize,
+        &mut found,
+    );
+    (tree, found)
+}
+
+/// Re-run tail-recursion lowering on a spliced IR unit (mirrors the historical
+/// `apply_passes` recursion pass). The frontend runs it inside `lower_function`, so a
+/// variant that became self-recursive by inlining its SCC partner needs it re-applied
+/// on the lowered body before the passes. Needs the unit's own name + simple param
+/// names — both still present as `Raw` labels on the lowered tree.
+fn ir_relower_recursion(mut unit: NormNode, name: &str) -> NormNode {
+    let mut params: Vec<Box<str>> = Vec::new();
+    for c in &unit.children {
+        if c.field.as_deref() == Some("param") {
+            match &c.label {
+                Some(Label::Raw(t)) => params.push(t.clone()),
+                _ => return unit, // a non-simple param: the frontend would not lower either
+            }
+        }
+    }
+    let Some(idx) = unit
+        .children
+        .iter()
+        .position(|c| c.field.as_deref() == Some("body"))
+    else {
+        return unit;
+    };
+    let body = unit.children.remove(idx);
+    let body = crate::ir::pass::lower_tail_recursion(
+        name,
+        &params,
+        body,
+        &mut crate::ir::transform::TransformLog::disabled(),
+    );
+    unit.children.insert(idx, body);
+    unit
 }
 
 fn unit_from_tree(
@@ -217,7 +356,14 @@ pub fn finish_variant(
     expanded: NormNode,
     cfg: &Config,
 ) -> Option<Unit> {
-    let (tree, _found) = pass_and_fold(expanded, base.lang, cfg);
+    // IR-path variants re-run the canonical IR passes (`frontend::run_passes`) rather
+    // than the historical `apply_passes`, so a spliced variant converges with the
+    // frontend's own canonical form for the equivalent hand-inlined function.
+    let (tree, _found) = if is_ir(base.lang, cfg) {
+        ir_pass_and_fold(expanded, &base.name, cfg)
+    } else {
+        pass_and_fold(expanded, base.lang, cfg)
+    };
     let fingerprint = fingerprint::merkle(&tree);
     if fingerprint == base.fingerprint {
         return None;
@@ -270,4 +416,71 @@ pub fn byte_to_line(src: &str, byte: u32) -> u32 {
         .filter(|&&b| b == b'\n')
         .count() as u32
         + 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ir_cfg() -> Config {
+        let mut cfg = Config::default();
+        cfg.normalize.normalizer = "ir".into();
+        cfg
+    }
+
+    #[test]
+    fn ir_normalizer_is_the_default() {
+        // The canonical IR is the default since the §8 switchover: each function lowers to the
+        // `Unit` canonical root (the `Unit` kind is IR-only).
+        let cfg = Config::default();
+        assert_eq!(cfg.normalize.normalizer, "ir");
+        let units = units_from_source("fn add(a: i32) -> i32 { return a + 1; }", Lang::Rust, &cfg);
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].tree.kind.as_ref(), "Unit");
+    }
+
+    #[test]
+    fn historical_normalizer_is_still_selectable() {
+        // The per-grammar historical normalizer stays fully supported: selecting it keeps the
+        // per-grammar tree (the `Unit` canonical root is IR-only), unchanged from before the flip.
+        let mut cfg = Config::default();
+        cfg.normalize.normalizer = "historical".into();
+        let units = units_from_source("fn add(a: i32) -> i32 { return a + 1; }", Lang::Rust, &cfg);
+        assert_eq!(units.len(), 1);
+        assert_ne!(units[0].tree.kind.as_ref(), "Unit");
+    }
+
+    #[test]
+    fn ir_normalizer_selector_produces_canonical_units() {
+        // `normalizer = "ir"` lowers to the canonical `Unit` root (not `function_item`).
+        let units = units_from_source(
+            "fn add(a: i32) -> i32 { return a + 1; }",
+            Lang::Rust,
+            &ir_cfg(),
+        );
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].tree.kind.as_ref(), "Unit");
+    }
+
+    #[test]
+    fn ir_path_folds_internal_repeats() {
+        fn has_repeat(n: &NormNode) -> bool {
+            n.kind.as_ref() == "REPEAT" || n.children.iter().any(has_repeat)
+        }
+        let cfg = ir_cfg();
+        // A run of ≥3 identical statements folds to a REPEAT (proves fold is wired on the
+        // IR path) — the convergence that makes rolled duplication detectable.
+        let folded = "fn f(a: i32) { g(a); g(a); g(a); g(a); }";
+        let fu =
+            extract_file_units_keep_raw(std::path::Path::new("m.rs"), folded, Lang::Rust, &cfg);
+        assert!(has_repeat(&fu.units[0].tree), "run did not fold to REPEAT");
+
+        // A run of substantial statements also clears the reporting floor → a finding.
+        let big = "fn f(a: i32, xs: &[i32]) { let t = a + xs[a] * 7 + xs[a]; let t = a + xs[a] * 7 + xs[a]; let t = a + xs[a] * 7 + xs[a]; let t = a + xs[a] * 7 + xs[a]; }";
+        let fb = extract_file_units_keep_raw(std::path::Path::new("m.rs"), big, Lang::Rust, &cfg);
+        assert!(
+            !fb.repeats.is_empty(),
+            "no internal-repeat finding above the floor"
+        );
+    }
 }

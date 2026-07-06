@@ -186,6 +186,11 @@ pub struct UnitSummary {
     pub file: PathBuf,
     pub name: String,
     pub line_span: (u32, u32),
+    /// Canonical hex u128 of the unit's exact structural hash (matches
+    /// `Group::fingerprint` for the exact-normalized tier). Lets check mode's
+    /// span-overlap fallback tell "same duplicate that moved/renamed" from
+    /// "deleted; an unrelated function now occupies those lines".
+    pub fingerprint: String,
     /// `reprise:accept-drift` (D41): IU on this unit reports as info.
     pub accept_drift: bool,
 }

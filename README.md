@@ -144,15 +144,56 @@ ref = "v1.4.0"   # or a commit sha — check uses this when --base is omitted
 the pin (an ordinary, reviewable one-line diff). Rolling gates just pass
 `--base origin/main` explicitly, as CI does.
 
-Two source pragmas (a comment on the unit's first line or directly above it)
-put acceptance decisions where they belong — in reviewed source, not derived
-files:
+### Ignoring units and accepting drift
 
-- `reprise:ignore` — suppress the unit from **all** tiers.
-- `reprise:accept-drift` — the unit stays fully covered, but a one-sided edit
-  to it reports `inconsistent-update` as information instead of failing: the
-  reviewed way to say "this copy is allowed to diverge." Suppression counts
-  appear in scan stats so neither can silently accumulate.
+Two source pragmas put acceptance decisions where they belong — in reviewed
+source, not a derived file. A pragma is any **comment containing the marker as a
+substring**, so you can append a reason:
+
+```python
+# reprise:ignore — hand-tuned parallel impl, kept separate on purpose
+def fast_path(records):
+    ...
+```
+
+**Placement (both pragmas).** The marker is recognized on the unit's **first
+line** (a trailing comment on the `def`/`fn`/… line) or on a **line above it**.
+The upward scan skips single-line attributes and decorators — Rust `#[…]`,
+Python/TypeScript `@decorator`, Kotlin `@Annotation` — so the pragma can sit
+above them:
+
+```rust
+// reprise:ignore
+#[inline]
+fn shim(x: u32) -> u32 { ... }
+```
+
+(Multi-line attribute arguments between the pragma and the declaration are not
+skipped — keep the pragma adjacent to the unit in that case.)
+
+**`reprise:ignore` — drop the unit entirely.** The unit is removed from **every
+tier**: it is never normalized, matched, or reported, and it cannot be a member
+of anyone else's group either (it simply isn't in the corpus). Use it for code
+that is duplicated *on purpose* and should never be flagged — a generated shim, a
+deliberately parallel implementation.
+
+**`reprise:accept-drift` — keep coverage, waive the gate.** The unit stays
+**fully covered** — indexed, matched, and reported like any other. The pragma
+changes only the `check` gate: when a change edits some members of a duplicate
+group but not others (an `inconsistent-update`), the finding **reports as
+information instead of failing CI** — but only when *every touched member* of the
+group carries `accept-drift`. Touch a member that is **not** marked and the
+finding fails as usual. It is the reviewed, source-located way to say "this copy
+is allowed to diverge" (D41), and needs no separate accept file to drift out of
+sync with the git-ref baseline.
+
+Neither pragma hides silently: the **suppressed count** is printed in the scan
+summary (`… 0 suppressed …`), so ignores can't accumulate unnoticed.
+
+For coarser exclusions — whole paths, generated files, or test code — use
+`reprise.toml` (`scan.exclude` globs, generated-file detection, `tests.mode`);
+pre-existing duplication is exempted automatically by the git-ref baseline (the
+two-scan `check`). See [`docs/CONFIG.md`](docs/CONFIG.md).
 
 ### `reprise check <path> --base <ref>` — the drift workflow (flagship)
 

@@ -60,6 +60,40 @@ pub fn checksum_stream(data: &[u8], salt: u8) -> u8 {
 }
 "#;
 
+/// A second unrelated function, distinct from `UNRELATED` and from the family.
+/// It sits below the dup group in the consolidation corpus and shifts up into
+/// a deleted member's old line range after the group is collapsed.
+const SECOND_UNRELATED: &str = r#"
+pub fn merge_windows(spans: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    let mut sorted = spans.to_vec();
+    sorted.sort_unstable();
+    let mut merged: Vec<(u32, u32)> = Vec::new();
+    for (lo, hi) in sorted {
+        match merged.last_mut() {
+            Some(prev) if lo <= prev.1 => prev.1 = prev.1.max(hi),
+            _ => merged.push((lo, hi)),
+        }
+    }
+    merged
+}
+"#;
+
+/// The single generic helper the family is consolidated INTO — the ideal
+/// dedup. Its structure (and fingerprint) is unrelated to the family it
+/// replaces, so it forms no exact group with anything.
+const GENERIC_HELPER: &str = r#"
+pub fn only_new_keys<K: Eq + std::hash::Hash + Clone, V: Clone>(
+    current: &[(K, V)],
+    seen: &std::collections::HashSet<K>,
+) -> Vec<(K, V)> {
+    current
+        .iter()
+        .filter(|(k, _)| !seen.contains(k))
+        .cloned()
+        .collect()
+}
+"#;
+
 fn git(dir: &Path, args: &[&str]) {
     let out = Command::new("git")
         .arg("-C")
@@ -293,6 +327,54 @@ fn drift_scenario_emits_inconsistent_update_naming_untouched_members() {
     assert!(text.contains("inconsistent-update"), "{text}");
     assert!(text.contains("base state"), "{text}");
     assert!(text.contains("process_batch_1"), "{text}");
+}
+
+/// Regression (false positive): consolidating a baselined exact-normalized dup
+/// group into ONE generic helper — deleting the siblings — is the ideal dedup,
+/// not a half-finished edit. The deleted members' names are gone, so they fall
+/// to the span-overlap fallback; unless that fallback is identity-aware, each
+/// deleted member mis-maps onto whatever unrelated function shifted into its
+/// old line range, is scored "untouched", and fires a false inconsistent-update
+/// ("touched 1 of 3, 2 not updated"). A complete, correct dedup must not gate
+/// CI.
+#[test]
+fn consolidating_a_dup_group_into_one_helper_does_not_fire_inconsistent_update() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    // One file: the 3-member exact-normalized family, then two unrelated
+    // functions that shift up into the family's old line ranges after the
+    // group collapses.
+    let baseline_src = format!(
+        "{}{}{}{}{}",
+        family_member(0),
+        family_member(1),
+        family_member(2),
+        UNRELATED,
+        SECOND_UNRELATED,
+    );
+    fs::write(root.join("dup.rs"), &baseline_src).unwrap();
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "t@example.com"]);
+    git(root, &["config", "user.name", "t"]);
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "baseline"]);
+
+    // The ideal dedup: replace all three siblings with one generic helper and
+    // keep the unrelated functions (byte-identical, so they only shift).
+    let consolidated = format!("{}{}{}", GENERIC_HELPER, UNRELATED, SECOND_UNRELATED);
+    fs::write(root.join("dup.rs"), &consolidated).unwrap();
+
+    let cfg = Config::default();
+    let report = reprise::check::run(root, &cfg, "HEAD", None).unwrap();
+    assert!(
+        !report
+            .findings
+            .iter()
+            .any(|f| f.kind == "inconsistent-update"),
+        "full consolidation must not fire inconsistent-update: {:#?}",
+        report.findings
+    );
+    assert!(!report.failed(), "{:#?}", report.findings);
 }
 
 #[test]

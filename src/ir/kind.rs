@@ -7,8 +7,13 @@
 //! same way `FINGERPRINT_SCHEME`/`EXTRACTION_VERSION` do (D19/D30), because the
 //! vocabulary *is* the canonical form.
 
-/// Bumps on any change to the canonical vocabulary (feeds the cache key, D19/D30).
-pub const SCHEME_VERSION: u32 = 1;
+/// Bumps on any change to the canonical vocabulary **or lowering** (feeds the cache key,
+/// D19/D30) — a warm cache must never serve a tree from an older canonical form. Bumped
+/// for the P1 parity build-out: Go frontend, Branch guard-folding + flatten, keep-list,
+/// aug-assign/desugars, iteration-protocol + loop-exit passes, fold, destructure binds.
+/// Bumped to 3 for the relational-boolean-normalization batch — Family B desugars Go
+/// `i++`/`i--` and `+=`/`-=`/… through the `AugAssign` path (moves the Go canonical tree).
+pub const SCHEME_VERSION: u32 = 3;
 
 // ---- structural ----
 pub const UNIT: &str = "Unit";

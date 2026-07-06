@@ -13,11 +13,228 @@
 //! self-recursion → Rev 5 lowering → loop core).
 
 use crate::config::Config;
+use crate::ir::kind;
 use crate::lang::{Lang, LanguageProfile, child_field};
 use crate::tree::{Label, NormNode};
 use crate::unit::Unit;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+
+/// The tree-shape primitives the inliner reads through, so one algorithm serves
+/// both the historical per-grammar trees and the canonical IR (`normalizer = "ir"`).
+/// The `Historical` arm reproduces the per-language [`LanguageProfile`] hooks
+/// byte-for-byte; the `Ir` arm returns the canonical constants
+/// (`docs/SIMILARITY-IR.md`), language-neutral except the expression-block
+/// distinction (only Rust has one — DECISIONS.md D17).
+#[derive(Clone, Copy)]
+pub enum Shapes {
+    Historical(&'static dyn LanguageProfile),
+    Ir(Lang),
+}
+
+impl Shapes {
+    /// Pick the shape family a unit was extracted with: IR when the active normalizer
+    /// is `"ir"` and `lang` has a frontend, else the historical profile (which also
+    /// covers the TS/Kotlin fallback under `normalizer = "ir"`, §9 P2).
+    pub fn for_lang(lang: Lang, cfg: &Config) -> Shapes {
+        if cfg.normalize.normalizer == "ir" && crate::frontend::has_ir_frontend(lang) {
+            Shapes::Ir(lang)
+        } else {
+            Shapes::Historical(lang.profile())
+        }
+    }
+
+    fn call_kind(&self) -> &'static str {
+        match self {
+            Shapes::Historical(p) => p.call_kind(),
+            Shapes::Ir(_) => kind::CALL,
+        }
+    }
+
+    fn block_kind(&self) -> &'static str {
+        match self {
+            Shapes::Historical(_) => "block",
+            Shapes::Ir(_) => kind::BLOCK,
+        }
+    }
+
+    fn params(&self, root: &NormNode) -> Option<Vec<Box<str>>> {
+        match self {
+            Shapes::Historical(p) => p.inline_params(root),
+            // The unit's `Var@param` children carry the simple `Raw` names; a
+            // non-simple param (should not occur post-lowering) bails, as historical.
+            Shapes::Ir(_) => {
+                let mut out = Vec::new();
+                for c in &root.children {
+                    if c.field.as_deref() != Some("param") {
+                        continue;
+                    }
+                    match &c.label {
+                        Some(Label::Raw(t)) if c.kind.as_ref() == kind::VAR => out.push(t.clone()),
+                        _ => return None,
+                    }
+                }
+                Some(out)
+            }
+        }
+    }
+
+    /// `(callee name, positional arg subtrees)` for a plain-identifier call with
+    /// positionally mappable arguments; None otherwise (methods, keyword args).
+    fn call_parts<'a>(&self, node: &'a NormNode) -> Option<(Box<str>, Vec<&'a NormNode>)> {
+        if node.kind.as_ref() != self.call_kind() {
+            return None;
+        }
+        match self {
+            Shapes::Historical(_) => {
+                let f = child_field(node, "function")?;
+                if f.kind.as_ref() != "identifier" {
+                    return None;
+                }
+                let Some(Label::Raw(name)) = &f.label else {
+                    return None;
+                };
+                let args = child_field(node, "arguments")?;
+                if args
+                    .children
+                    .iter()
+                    .any(|a| a.kind.as_ref() == "keyword_argument")
+                {
+                    return None;
+                }
+                Some((name.clone(), args.children.iter().collect()))
+            }
+            Shapes::Ir(_) => {
+                let f = child_field(node, "callee")?;
+                if f.kind.as_ref() != kind::VAR {
+                    return None;
+                }
+                // A `Raw` callee is a plain call to a resolvable function; an `External`
+                // callee (a method via `Field`, or a builtin) is never inlinable.
+                let Some(Label::Raw(name)) = &f.label else {
+                    return None;
+                };
+                let args: Vec<&NormNode> = node
+                    .children
+                    .iter()
+                    .filter(|c| c.field.as_deref() == Some("arg"))
+                    .collect();
+                // Python keyword args lower to a `NativeStmt` tagged `keyword_argument`;
+                // they are not positionally mappable (mirrors the historical guard).
+                if args.iter().any(|a| {
+                    matches!(&a.label, Some(Label::External(t)) if t.as_ref() == "keyword_argument")
+                }) {
+                    return None;
+                }
+                Some((name.clone(), args))
+            }
+        }
+    }
+
+    /// The call node of a `f(...);` statement site (result discarded), else None.
+    fn call_at_stmt<'a>(&self, child: &'a NormNode) -> Option<&'a NormNode> {
+        match self {
+            Shapes::Historical(_) => (child.kind.as_ref() == "expression_statement"
+                && child.children.len() == 1)
+                .then(|| &child.children[0]),
+            // In the IR a bare expression IS the statement — a `Call` at block level.
+            Shapes::Ir(_) => (child.kind.as_ref() == kind::CALL).then_some(child),
+        }
+    }
+
+    fn return_value<'a>(&self, stmt: &'a NormNode) -> Option<&'a NormNode> {
+        match self {
+            Shapes::Historical(p) => p.return_value(stmt),
+            Shapes::Ir(_) => (stmt.kind.as_ref() == kind::RETURN && stmt.children.len() == 1)
+                .then(|| &stmt.children[0]),
+        }
+    }
+
+    fn make_return(&self, value: NormNode) -> NormNode {
+        match self {
+            Shapes::Historical(p) => p.make_return(value),
+            Shapes::Ir(_) => {
+                let span = value.span;
+                let mut v = value;
+                v.field = Some("value".into());
+                NormNode::new(kind::RETURN, None, span, vec![v])
+            }
+        }
+    }
+
+    fn make_expr_stmt(&self, expr: NormNode) -> NormNode {
+        match self {
+            Shapes::Historical(p) => p.make_expr_stmt(expr),
+            Shapes::Ir(_) => {
+                let mut e = expr;
+                e.field = None; // the bare expression is the statement
+                e
+            }
+        }
+    }
+
+    fn make_expr_block(&self, span: (u32, u32), children: Vec<NormNode>) -> Option<NormNode> {
+        match self {
+            Shapes::Historical(p) => p.make_expr_block(span, children),
+            // Only Rust has an expression block (D17); Python/Go skip the site. The
+            // caller (`ir_place_expr`) has already reshaped the block's tail value.
+            Shapes::Ir(Lang::Rust) => Some(NormNode::new(kind::BLOCK, None, span, children)),
+            Shapes::Ir(_) => None,
+        }
+    }
+
+    /// A statement-shaped node (vs a bare trailing expression to be reshaped).
+    fn is_statement_like(&self, node: &NormNode) -> bool {
+        match self {
+            Shapes::Historical(_) => is_statement_like(node),
+            Shapes::Ir(_) => matches!(
+                node.kind.as_ref(),
+                kind::ASSIGN
+                    | kind::RETURN
+                    | kind::BREAK
+                    | kind::CONTINUE
+                    | kind::LOOP
+                    | kind::BRANCH
+                    | kind::ITER
+                    | kind::NATIVE_STMT
+            ),
+        }
+    }
+
+    /// The trailing value to reshape at a statement splice tail — a bare expression,
+    /// or (IR only) a `Return`'s value; None for a real statement. Historical keeps its
+    /// `pop_if(!is_statement_like)` semantics byte-for-byte.
+    fn tail_value(&self, last: &NormNode) -> Option<NormNode> {
+        match self {
+            Shapes::Historical(_) => (!is_statement_like(last)).then(|| last.clone()),
+            Shapes::Ir(_) => {
+                if let Some(v) = self.return_value(last) {
+                    Some(v.clone())
+                } else if !self.is_statement_like(last) {
+                    Some(last.clone())
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    fn is_identifier(&self, kind: &str) -> bool {
+        match self {
+            Shapes::Historical(p) => p.is_identifier(kind),
+            Shapes::Ir(_) => kind == crate::ir::kind::VAR,
+        }
+    }
+
+    fn always_external(&self, kind: &str, field: Option<&str>, parent_kind: &str) -> bool {
+        match self {
+            Shapes::Historical(p) => p.always_external(kind, field, parent_kind),
+            // IR external names already carry `Label::External`, so a `Raw` match is
+            // always a genuine local — nothing is structurally always-external here.
+            Shapes::Ir(_) => false,
+        }
+    }
+}
 
 pub struct Def<'t> {
     pub unit_idx: usize,
@@ -67,8 +284,8 @@ impl<'t> DefTable<'t> {
                 if unit.name == "<anon>" {
                     return None;
                 }
-                let profile = unit.lang.profile();
-                let params = profile.inline_params(&raw_trees[i])?;
+                let shapes = Shapes::for_lang(unit.lang, cfg);
+                let params = shapes.params(&raw_trees[i])?;
                 let body = child_field(&raw_trees[i], "body")?;
                 Some(Def {
                     unit_idx: i,
@@ -107,7 +324,7 @@ impl<'t> DefTable<'t> {
             .par_iter()
             .map(|def| {
                 let mut calls = Vec::new();
-                collect_calls(def.body, def.lang.profile(), &mut calls);
+                collect_calls(def.body, Shapes::for_lang(def.lang, cfg), &mut calls);
                 let mut edges: Vec<usize> = calls
                     .iter()
                     .filter_map(|(name, arity)| {
@@ -178,40 +395,13 @@ impl<'t> DefTable<'t> {
     }
 }
 
-fn collect_calls(node: &NormNode, profile: &dyn LanguageProfile, out: &mut Vec<(Box<str>, usize)>) {
-    if let Some((name, args)) = plain_call_parts(node, profile) {
-        out.push((name, args.children.len()));
+fn collect_calls(node: &NormNode, shapes: Shapes, out: &mut Vec<(Box<str>, usize)>) {
+    if let Some((name, args)) = shapes.call_parts(node) {
+        out.push((name, args.len()));
     }
     for child in &node.children {
-        collect_calls(child, profile, out);
+        collect_calls(child, shapes, out);
     }
-}
-
-/// `(callee name, arguments node)` when `node` is a plain-identifier call with
-/// positionally mappable arguments (Python keyword arguments disqualify).
-fn plain_call_parts<'a>(
-    node: &'a NormNode,
-    profile: &dyn LanguageProfile,
-) -> Option<(Box<str>, &'a NormNode)> {
-    if node.kind.as_ref() != profile.call_kind() {
-        return None;
-    }
-    let f = child_field(node, "function")?;
-    if f.kind.as_ref() != "identifier" {
-        return None;
-    }
-    let Some(Label::Raw(name)) = &f.label else {
-        return None;
-    };
-    let args = child_field(node, "arguments")?;
-    if args
-        .children
-        .iter()
-        .any(|a| a.kind.as_ref() == "keyword_argument")
-    {
-        return None;
-    }
-    Some((name.clone(), args))
 }
 
 /// Iterative Tarjan; returns SCC id per node.
@@ -294,7 +484,7 @@ impl Expansion {
 struct Ctx<'a> {
     table: &'a DefTable<'a>,
     cfg: &'a Config,
-    profile: &'a dyn LanguageProfile,
+    shapes: Shapes,
     lang: Lang,
     file: &'a Path,
     unit_idx: usize,
@@ -325,7 +515,7 @@ pub fn expand_unit(
     cfg: &Config,
 ) -> Expansion {
     let lang = units[unit_idx].lang;
-    let profile = lang.profile();
+    let shapes = Shapes::for_lang(lang, cfg);
     // Pure delegation bodies (a single top-level statement, i.e. a thin
     // wrapper around one call) get no inline variant: expanding one folds the
     // helper back in, so freshly-extracted helpers' wrappers would re-match
@@ -343,13 +533,13 @@ pub fn expand_unit(
     let mut ctx = Ctx {
         table,
         cfg,
-        profile,
+        shapes,
         lang,
         file: &units[unit_idx].file,
         unit_idx,
         root_name: units[unit_idx].name.as_str().into(),
         scc_partners,
-        has_expr_block: profile.make_expr_block((0, 0), Vec::new()).is_some(),
+        has_expr_block: shapes.make_expr_block((0, 0), Vec::new()).is_some(),
         stack: Vec::new(),
         chain: Vec::new(),
         expanded_units: Vec::new(),
@@ -369,7 +559,7 @@ pub fn expand_unit(
 }
 
 fn walk(mut node: NormNode, ctx: &mut Ctx) -> NormNode {
-    if node.kind.as_ref() == "block" {
+    if node.kind.as_ref() == ctx.shapes.block_kind() {
         let children = std::mem::take(&mut node.children);
         let n = children.len();
         let mut out = Vec::with_capacity(n);
@@ -383,7 +573,7 @@ fn walk(mut node: NormNode, ctx: &mut Ctx) -> NormNode {
         return node;
     }
     node.children = node.children.into_iter().map(|c| walk(c, ctx)).collect();
-    if node.kind.as_ref() == ctx.profile.call_kind() {
+    if node.kind.as_ref() == ctx.shapes.call_kind() {
         return try_expr_inline(node, ctx);
     }
     node
@@ -410,16 +600,15 @@ fn try_statement_site(
 ) -> Result<Vec<NormNode>, NormNode> {
     // `return f(...)` — splice the body; the callee's returns become the
     // caller's returns (exact for a tail call, tolerated elsewhere).
-    if let Some(call) = ctx.profile.return_value(&child)
+    if let Some(call) = ctx.shapes.return_value(&child)
         && let Some((def_idx, args)) = resolve_policy(call, ctx)
     {
         let body = splice_body(def_idx, args, ctx);
         return Ok(finish_tail(body, TailMode::Return, ctx));
     }
     // `f(...);` — result unused.
-    if child.kind.as_ref() == "expression_statement"
-        && child.children.len() == 1
-        && let Some((def_idx, args)) = resolve_policy(&child.children[0], ctx)
+    if let Some(call) = ctx.shapes.call_at_stmt(&child)
+        && let Some((def_idx, args)) = resolve_policy(call, ctx)
     {
         let body = splice_body(def_idx, args, ctx);
         return Ok(finish_tail(body, TailMode::Discard, ctx));
@@ -428,7 +617,7 @@ fn try_statement_site(
     // body's statements splice flat and its trailing expression becomes the
     // new block tail (what an LLM writes when inlining by hand).
     if is_last
-        && child.kind.as_ref() == ctx.profile.call_kind()
+        && child.kind.as_ref() == ctx.shapes.call_kind()
         && let Some((def_idx, args)) = resolve_policy(&child, ctx)
     {
         let body = splice_body(def_idx, args, ctx);
@@ -452,10 +641,13 @@ fn try_expr_inline(node: NormNode, ctx: &mut Ctx) -> NormNode {
     let field = node.field.clone();
     let span = node.span;
     let stmts = splice_body(def_idx, args, ctx);
+    if let Shapes::Ir(_) = ctx.shapes {
+        return ir_place_expr(stmts, field, span, node, ctx);
+    }
     if stmts.len() == 1 {
         let only = &stmts[0];
         // `return X` one-liner (Python idiom) → X.
-        if let Some(v) = ctx.profile.return_value(only) {
+        if let Some(v) = ctx.shapes.return_value(only) {
             let mut v = v.clone();
             v.field = field;
             return v;
@@ -468,13 +660,13 @@ fn try_expr_inline(node: NormNode, ctx: &mut Ctx) -> NormNode {
         } else {
             only
         };
-        if !is_statement_like(inner) {
+        if !ctx.shapes.is_statement_like(inner) {
             let mut v = inner.clone();
             v.field = field;
             return v;
         }
     }
-    match ctx.profile.make_expr_block(span, stmts) {
+    match ctx.shapes.make_expr_block(span, stmts) {
         Some(mut block) => {
             block.field = field;
             block
@@ -486,17 +678,80 @@ fn try_expr_inline(node: NormNode, ctx: &mut Ctx) -> NormNode {
     }
 }
 
+/// Place a spliced IR callee body at an expression site. The body was lowered in
+/// *return position* (the Rust frontend pushes tail `Return`s into branch arms /
+/// nested blocks), so de-return the tail first ([`de_return_tail`]) to match the
+/// hand-written expression form: a single value substitutes in directly (`if`/`match`
+/// are expressions in the IR, so no `Block` wrapper), and a multi-statement body lands
+/// in an expression block (Rust only — Python/Go leave the call, D17).
+fn ir_place_expr(
+    mut stmts: Vec<NormNode>,
+    field: Option<Box<str>>,
+    span: (u32, u32),
+    node: NormNode,
+    ctx: &Ctx,
+) -> NormNode {
+    de_return_tail(&mut stmts);
+    if stmts.len() == 1 {
+        let mut v = stmts.pop().unwrap();
+        v.field = field;
+        return v;
+    }
+    match ctx.shapes.make_expr_block(span, stmts) {
+        Some(mut block) => {
+            block.field = field;
+            block
+        }
+        None => node,
+    }
+}
+
+/// Reverse the Rust frontend's return-position lowering on a spliced body's TAIL, so an
+/// inlined value-returning function matches the hand-written expression form: a tail
+/// `Return v` becomes bare `v`, and a tail `Branch`/`Block` recurses into its own tails
+/// (`if c { return a } else { return b }` → `if c { a } else { b }`). Statement splice
+/// sites keep their `Return`s (a `return f(x)` site wants them), so this runs only for
+/// the expression path.
+fn de_return_tail(stmts: &mut [NormNode]) {
+    if let Some(last) = stmts.last_mut() {
+        de_return_node(last);
+    }
+}
+
+fn de_return_node(node: &mut NormNode) {
+    let k = node.kind.as_ref();
+    if k == kind::RETURN && node.children.len() == 1 {
+        let field = node.field.clone();
+        let mut v = node.children.remove(0);
+        v.field = field;
+        *node = v;
+    } else if k == kind::BRANCH {
+        for arm in &mut node.children {
+            if let Some(body) = arm
+                .children
+                .iter_mut()
+                .find(|c| c.field.as_deref() == Some("body"))
+                && body.kind.as_ref() == kind::BLOCK
+            {
+                de_return_tail(&mut body.children);
+            }
+        }
+    } else if k == kind::BLOCK {
+        de_return_tail(&mut node.children);
+    }
+}
+
 /// Resolve a call node against the table and the §5.4 policy knobs. Counts
 /// ambiguity skips; enforces the self-recursion and cycle guards, depth, and
 /// the callee size cap (bypassed for SCC partners — the SCC round).
 fn resolve_policy(node: &NormNode, ctx: &mut Ctx) -> Option<(usize, Vec<NormNode>)> {
-    let (name, args) = plain_call_parts(node, ctx.profile)?;
+    let (name, args) = ctx.shapes.call_parts(node)?;
     if name == ctx.root_name {
         return None; // never inline direct self-recursion (Rev 5 owns it)
     }
     let def_idx = match ctx
         .table
-        .resolve(ctx.lang, &name, args.children.len(), ctx.file, ctx.cfg)
+        .resolve(ctx.lang, &name, args.len(), ctx.file, ctx.cfg)
     {
         Resolution::Hit(d) => d,
         Resolution::Ambiguous => {
@@ -517,7 +772,7 @@ fn resolve_policy(node: &NormNode, ctx: &mut Ctx) -> Option<(usize, Vec<NormNode
             return None;
         }
     }
-    Some((def_idx, args.children.clone()))
+    Some((def_idx, args.into_iter().cloned().collect()))
 }
 
 /// Substitute argument subtrees for parameter names in a copy of the callee
@@ -531,7 +786,7 @@ fn splice_body(def_idx: usize, args: Vec<NormNode>, ctx: &mut Ctx) -> Vec<NormNo
         .map(|p| p.as_ref())
         .zip(args.iter())
         .collect();
-    let body = substitute(def.body.clone(), &map, ctx.profile, "");
+    let body = substitute(def.body.clone(), &map, ctx.shapes, "");
     let name = def.name.to_string();
     let unit_idx = def.unit_idx;
     let is_partner = ctx.scc_partners.contains(&def_idx);
@@ -549,14 +804,17 @@ fn splice_body(def_idx: usize, args: Vec<NormNode>, ctx: &mut Ctx) -> Vec<NormNo
     body.children
 }
 
-/// Re-shape a spliced body's trailing bare expression per site kind.
+/// Re-shape a spliced body's trailing value per site kind. The trailing value is a
+/// bare expression (historical) or a `Return`'s value (IR, whose value-returning
+/// bodies end in an explicit `Return`) — see [`Shapes::tail_value`].
 fn finish_tail(mut stmts: Vec<NormNode>, mode: TailMode, ctx: &Ctx) -> Vec<NormNode> {
-    if let Some(last) = stmts.pop_if(|last| !is_statement_like(last)) {
-        match mode {
-            TailMode::Return => stmts.push(ctx.profile.make_return(last)),
-            TailMode::Discard => stmts.push(ctx.profile.make_expr_stmt(last)),
-            TailMode::Keep => stmts.push(last),
-        }
+    if let Some(last) = stmts.last().and_then(|l| ctx.shapes.tail_value(l)) {
+        stmts.pop();
+        stmts.push(match mode {
+            TailMode::Return => ctx.shapes.make_return(last),
+            TailMode::Discard => ctx.shapes.make_expr_stmt(last),
+            TailMode::Keep => last,
+        });
     }
     stmts
 }
@@ -575,11 +833,11 @@ fn is_statement_like(node: &NormNode) -> bool {
 fn substitute(
     mut node: NormNode,
     map: &HashMap<&str, &NormNode>,
-    profile: &dyn LanguageProfile,
+    shapes: Shapes,
     parent_kind: &str,
 ) -> NormNode {
-    if profile.is_identifier(&node.kind)
-        && !profile.always_external(&node.kind, node.field.as_deref(), parent_kind)
+    if shapes.is_identifier(&node.kind)
+        && !shapes.always_external(&node.kind, node.field.as_deref(), parent_kind)
         && let Some(Label::Raw(text)) = &node.label
         && let Some(rep) = map.get(text.as_ref())
     {
@@ -591,7 +849,7 @@ fn substitute(
     node.children = node
         .children
         .into_iter()
-        .map(|c| substitute(c, map, profile, &kind))
+        .map(|c| substitute(c, map, shapes, &kind))
         .collect();
     node
 }

@@ -36,7 +36,12 @@ pub const GRAMMAR_VERSIONS: &[&str] = &[
 ///
 /// v3: TS `const f = () => …` / `= function () {…}` are now extracted as units
 /// (`binding_unit`, D43), so TS files' FileUnits changed with no other key move.
-pub const EXTRACTION_VERSION: u32 = 3;
+///
+/// v4: the IR extraction path now produces inline-expanded variant units (spec §5.4)
+/// and stores the pre-abstraction lowered tree in `raw_trees` (was the canonical
+/// tree), so IR `FileUnits` changed while the plain-unit canonical form (and thus
+/// `ir::kind::SCHEME_VERSION`) stayed put — a one-time global cache regen.
+pub const EXTRACTION_VERSION: u32 = 4;
 
 /// Cache key for one source file (D8: the version-keying IS the filename).
 pub fn key(rel_path: &str, content: &str, cfg: &Config) -> u128 {
@@ -54,6 +59,12 @@ pub fn key(rel_path: &str, content: &str, cfg: &Config) -> u128 {
         buf.push(0);
     }
     // Extraction-relevant config: anything that changes FileUnits content.
+    // The normalizer selector (D-IR-3) picks an entirely different canonical form, so it
+    // MUST key the cache — else a warm "historical" cache would serve an "ir" scan (and
+    // vice-versa). The IR vocabulary version rides along so a canonical-form change busts it.
+    buf.extend_from_slice(cfg.normalize.normalizer.as_bytes());
+    buf.push(1);
+    buf.extend_from_slice(&crate::ir::kind::SCHEME_VERSION.to_le_bytes());
     for lit in &cfg.normalize.literal_keep {
         buf.extend_from_slice(lit.as_bytes());
         buf.push(1);
@@ -102,5 +113,25 @@ pub fn store(root: &Path, key: u128, value: &FileUnits) {
     let tmp = dir.join(format!("{key:032x}.tmp"));
     if std::fs::write(&tmp, bytes).is_ok() {
         let _ = std::fs::rename(&tmp, entry_path(root, key));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::key;
+    use crate::config::Config;
+
+    #[test]
+    fn key_distinguishes_the_normalizer_selector() {
+        // Same file, different normalizer ⇒ different canonical form ⇒ different key,
+        // so a warm "historical" cache can never serve an "ir" scan (or vice-versa).
+        let src = "fn f(a: i32) -> i32 { a + 1 }";
+        let mut hist = Config::default();
+        hist.normalize.normalizer = "historical".into();
+        let mut ir = Config::default();
+        ir.normalize.normalizer = "ir".into();
+        assert_ne!(key("f.rs", src, &hist), key("f.rs", src, &ir));
+        // ...and identical config still keys identically (a warm cache actually hits).
+        assert_eq!(key("f.rs", src, &ir), key("f.rs", src, &ir));
     }
 }
