@@ -1,6 +1,6 @@
 //! P4: sibling-run folding / re-roll (spec §5.3).
 //!
-//! Runs of ≥ `fold_min_repeats` consecutive sibling groups (period 1..=4)
+//! Runs of ≥ `fold_min_repeats` consecutive sibling groups (period 1..=`MAX_PERIOD`, i.e. 1..=8)
 //! that are identical under MaskedAll hashing (locals AND literals masked)
 //! collapse into a `REPEAT` node whose children are the first period's
 //! subtrees. The repeat count is deliberately NOT part of the structural

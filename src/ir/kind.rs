@@ -22,7 +22,10 @@
 /// iteration rewrite's liveness check became function-scoped (a counter used after its
 /// enclosing block no longer wrongly rewrites), and cycle-break temps are minted disjoint from
 /// existing `__mt{n}` names — each shifting its construct's canonical output (merkle fingerprint).
-pub const SCHEME_VERSION: u32 = 5;
+/// Bumped to 6 for the Go `for true {}` convergence — a bare `true` condition is now recognized as
+/// the infinite-loop core (no break-guard, mirroring `while true`), so `for true {}` lowers
+/// identically to `for {}` and their canonical output (merkle fingerprint) converges.
+pub const SCHEME_VERSION: u32 = 6;
 
 // ---- structural ----
 pub const UNIT: &str = "Unit";

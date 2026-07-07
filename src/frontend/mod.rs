@@ -330,10 +330,6 @@ pub fn run_passes(tree: NormNode, lang: Lang, log: &mut TransformLog) -> NormNod
     // iteration as the range form — rewritten here to the identical canonical foreach shape, so
     // Go counter ≡ Go range ≡ Rust foreach ≡ Rust while-index. Disjoint from `detect_iter_protocol`
     // (a counter loop has no `__next` bind; a range loop has no init sibling), so it runs adjacent.
-    // The C-style counter loop (block-level `i=0` + `while i<len(coll)` + `i=i+1`) is the same
-    // iteration as the range form — rewritten here to the identical canonical foreach shape, so
-    // Go counter ≡ Go range ≡ Rust foreach ≡ Rust while-index. Disjoint from `detect_iter_protocol`
-    // (a counter loop has no `__next` bind; a range loop has no init sibling), so it runs adjacent.
     let counter = crate::ir::pass::detect_counter_iter(&tree);
     let tree = crate::ir::edit::apply(tree, &counter, log);
     let loop_exit = crate::ir::pass::detect_loop_exit(&tree);
@@ -933,6 +929,32 @@ pub(crate) fn or_chain(guards: Vec<NormNode>, span: (u32, u32)) -> Option<NormNo
     Some(acc)
 }
 
+/// A `match`/`case` arm guard — single-sourced across frontends (§14). `_` (wildcard) → `None`
+/// (the else arm); a **literal** pattern → `subject == literal` (converges with an if-chain);
+/// anything else → `matches(subject, pattern)`. The only genuine per-language quirks — the
+/// wildcard test and the literal-pattern grammar kinds — are computed by each frontend and passed
+/// in as `is_wildcard` / `literal`; the 3-arm orchestration lives here once.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn case_guard(
+    fe: &dyn Frontend,
+    subject: Option<&NormNode>,
+    pat: Node,
+    is_wildcard: bool,
+    literal: Option<Node>,
+    span: (u32, u32),
+    src: &str,
+    log: &mut TransformLog,
+) -> Option<NormNode> {
+    if is_wildcard {
+        return None;
+    }
+    match (subject, literal) {
+        (Some(subj), Some(lit)) => Some(eq_guard(subj, fe.lower_node(lit, None, src, log)?, span)),
+        (Some(subj), None) => Some(matches_guard(subj, lower_pattern(fe, pat, src, log)?, span)),
+        (None, _) => lower_pattern(fe, pat, src, log),
+    }
+}
+
 /// Lower a `match`/`case` pattern into an arm guard, marking its bound identifiers as
 /// declared locals (`@target`) so a renamed capture (`Some(x)` vs `Some(y)`) still
 /// converges — mirrors the historical `collect_pattern_idents` (which likewise skips
@@ -1033,8 +1055,8 @@ pub(crate) fn lower_while(
 }
 
 /// The condition is the boolean-true keyword (`true` / Python `True`) — a `while` over it
-/// is the infinite-loop core, so no break-guard is synthesized.
-fn is_true_literal(node: Node, src: &str) -> bool {
+/// (or a Go `for true {}`) is the infinite-loop core, so no break-guard is synthesized.
+pub(crate) fn is_true_literal(node: Node, src: &str) -> bool {
     matches!(text(node, src).trim(), "true" | "True")
 }
 

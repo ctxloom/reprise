@@ -55,6 +55,28 @@ fn go_while_form_stays_distinct_from_do_while() {
     );
 }
 
+// ---------- `for true {}` ↔ `for {}` (infinite-loop core) ----------
+
+#[test]
+fn go_for_true_converges_with_bare_infinite_loop_ir() {
+    // `for true { s }` is the same infinite loop as `for { s }`: no break-guard is
+    // synthesized (mirrors `while true` / `loop {}`), so they converge.
+    let a =
+        "package main\nfunc spin() int {\n\ts := 0\n\tfor true {\n\t\ts += 1\n\t}\n\treturn s\n}\n";
+    let b = "package main\nfunc spin() int {\n\ts := 0\n\tfor {\n\t\ts += 1\n\t}\n\treturn s\n}\n";
+    assert_eq!(fp_ir(a, Lang::Go), fp_ir(b, Lang::Go));
+}
+
+#[test]
+fn go_for_condition_stays_distinct_from_bare_infinite_loop_ir() {
+    // Distinctness control: a real condition `for c { s }` carries a break-guard, so it
+    // must NOT converge with the bare infinite loop `for { s }`.
+    let a = "package main\nfunc spin(k int) int {\n\ts := 0\n\tfor k > 0 {\n\t\ts += 1\n\t}\n\treturn s\n}\n";
+    let b =
+        "package main\nfunc spin(k int) int {\n\ts := 0\n\tfor {\n\t\ts += 1\n\t}\n\treturn s\n}\n";
+    assert_ne!(fp_ir(a, Lang::Go), fp_ir(b, Lang::Go));
+}
+
 // ---------- three-clause for ↔ while+init ----------
 
 #[test]

@@ -4,9 +4,8 @@
 
 use super::Lowering as L;
 use super::{
-    Frontend, bind_pattern_idents, block_wrap, eq_guard, lower_assign, lower_pattern, lower_source,
-    lower_unit, make_arm, make_branch, make_index, make_lambda, make_multi_assign, matches_guard,
-    native, push_else_arm,
+    Frontend, bind_pattern_idents, block_wrap, case_guard, lower_assign, lower_source, lower_unit,
+    make_arm, make_branch, make_index, make_lambda, make_multi_assign, native, push_else_arm,
 };
 use crate::ir::kind;
 use crate::ir::transform::TransformLog;
@@ -406,31 +405,22 @@ fn lower_match(
                     }
                 })
                 .map(|b| block_wrap(b, span));
-            let guard = pat.and_then(|p| case_guard(fe, subject.as_ref(), p, span, src, log));
+            let guard = pat.and_then(|p| {
+                case_guard(
+                    fe,
+                    subject.as_ref(),
+                    p,
+                    is_wildcard(p, src),
+                    literal_pattern_value(p),
+                    span,
+                    src,
+                    log,
+                )
+            });
             arms.push(make_arm(guard, arm_body, span));
         }
     }
     make_branch(arms, field, span)
-}
-
-/// A Rust match-arm guard: `_` → none (else); a literal pattern → `subject == literal`
-/// (converges with an if-chain); anything else → `matches(subject, pattern)`.
-fn case_guard(
-    fe: &Rust,
-    subject: Option<&NormNode>,
-    pat: Node,
-    span: (u32, u32),
-    src: &str,
-    log: &mut TransformLog,
-) -> Option<NormNode> {
-    if is_wildcard(pat, src) {
-        return None;
-    }
-    match (subject, literal_pattern_value(pat)) {
-        (Some(subj), Some(lit)) => Some(eq_guard(subj, fe.lower_node(lit, None, src, log)?, span)),
-        (Some(subj), None) => Some(matches_guard(subj, lower_pattern(fe, pat, src, log)?, span)),
-        (None, _) => lower_pattern(fe, pat, src, log),
-    }
 }
 
 /// A `_` (catch-all) pattern → the trivial-guard arm.

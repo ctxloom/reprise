@@ -12,8 +12,9 @@
 
 use super::Lowering as L;
 use super::{
-    Frontend, block, break_guard, call_ext, eq_guard, lower_aug_assign, lower_body, lower_source,
-    lower_unit, make_arm, make_branch, make_index, matches_guard, native, or_chain, push_else_arm,
+    Frontend, block, break_guard, call_ext, eq_guard, is_true_literal, lower_aug_assign,
+    lower_body, lower_source, lower_unit, make_arm, make_branch, make_index, matches_guard, native,
+    or_chain, push_else_arm,
 };
 use crate::ir::kind;
 use crate::ir::transform::{TransformKind, TransformLog, Witness};
@@ -267,6 +268,9 @@ fn lower_for_stmt(
                 }
                 "for"
             }
+            // `for true {…}` is already the infinite-loop core (mirrors `lower_while`'s
+            // `while true`): skip the break-guard so it converges with `for {…}`.
+            _ if is_true_literal(c, src) => "infinite",
             // A bare expression clause is the condition of a `for cond {…}` (while-form).
             _ => {
                 if let Some(cn) = fe.lower_node(c, None, src, log) {

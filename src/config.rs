@@ -432,6 +432,15 @@ impl Config {
             &self.report.sarif_fingerprint,
             &["structural", "line"],
         )?;
+        // `fold_min_repeats` is a run-length floor AND the divisor in fold.rs's period loop
+        // (`(n - i) / min_repeats`). Zero divides by zero and panics mid-scan, so reject it at
+        // load: a repeat is at least two occurrences, so the meaningful floor is >= 1.
+        if self.thresholds.fold_min_repeats == 0 {
+            anyhow::bail!(
+                "reprise.toml [thresholds] fold_min_repeats: must be >= 1 (got 0); \
+                 it is the minimum run length AND the fold-period divisor"
+            );
+        }
         Ok(())
     }
 }
@@ -529,6 +538,29 @@ mod tests {
                 cfg.validate().is_ok(),
                 "should accept sarif_fingerprint={v}"
             );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_fold_min_repeats_zero() {
+        // `fold_min_repeats = 0` is the divisor in fold.rs's period loop — it must fail at
+        // LOAD, not panic 'attempt to divide by zero' mid-scan.
+        let toml = "[thresholds]\nfold_min_repeats = 0\n";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("fold_min_repeats"),
+            "error names the key: {err}"
+        );
+        assert!(err.contains(">= 1"), "error states the bound: {err}");
+    }
+
+    #[test]
+    fn validate_accepts_positive_fold_min_repeats() {
+        for n in [1u32, 2, 3, 8] {
+            let toml = format!("[thresholds]\nfold_min_repeats = {n}\n");
+            let cfg: Config = toml::from_str(&toml).unwrap();
+            assert!(cfg.validate().is_ok(), "should accept fold_min_repeats={n}");
         }
     }
 
