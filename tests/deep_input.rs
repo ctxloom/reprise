@@ -12,7 +12,7 @@
 //! extraction on a thread with rayon's default 2 MiB worker stack, prove the *guarded* path
 //! fits the production stack.
 
-use reprise::config::Config;
+use reprise::config::{Config, Normalizer};
 use reprise::lang::Lang;
 use std::fs;
 use tempfile::TempDir;
@@ -84,7 +84,7 @@ fn deep_operator_chain_completes_and_is_flagged_historical() {
     let src = deep_rust_chain(DEEP);
     let units = on_worker_stack(move || {
         let mut cfg = Config::default();
-        cfg.normalize.normalizer = "historical".into();
+        cfg.normalize.normalizer = Normalizer::Historical;
         reprise::units_from_source(&src, Lang::Rust, &cfg)
     });
     assert_eq!(units.len(), 1);

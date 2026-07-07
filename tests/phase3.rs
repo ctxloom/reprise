@@ -1,7 +1,7 @@
 //! Phase-3 integration contract: best-effort inliner + SCC chain (spec §5.4)
 //! and the api-profile tier (spec §5.7), all at `scan` level.
 
-use reprise::config::Config;
+use reprise::config::{Config, Normalizer};
 use reprise::report::ScanReport;
 use std::fs;
 use tempfile::TempDir;
@@ -20,7 +20,7 @@ fn scan_snippets(ext: &str, sources: &[&str]) -> ScanReport {
 
 fn ir_cfg() -> Config {
     let mut cfg = Config::default();
-    cfg.normalize.normalizer = "ir".into();
+    cfg.normalize.normalizer = Normalizer::Ir;
     cfg
 }
 

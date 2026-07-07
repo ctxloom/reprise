@@ -2,7 +2,7 @@
 //! (Type-1/Type-2, loop-form, index-loop, arrow desugaring) is asserted at the
 //! fingerprint level; recursion↔iteration and test policy at `scan` level.
 
-use reprise::config::Config;
+use reprise::config::{Config, Normalizer};
 use reprise::lang::Lang;
 
 mod common;
@@ -129,7 +129,7 @@ fn ts_tail_recursion_converges_with_iteration_ir() {
     // normalizer (§9 capability gate) — the recursion↔iteration convergence holds on the
     // IR-selected path too.
     let mut cfg = Config::default();
-    cfg.normalize.normalizer = "ir".into();
+    cfg.normalize.normalizer = Normalizer::Ir;
     let tier = pair_tier_cfg(&[("aa.ts", TS_ITER), ("bb.ts", TS_TAIL)], &cfg);
     assert!(
         tier.as_deref()

@@ -11,7 +11,7 @@
 //!   t2-rename      — word-boundary rename of all unit-local identifiers
 //!   t2-literals    — non-keep-list literal value changes
 
-use reprise::config::Config;
+use reprise::config::{Config, Normalizer};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
@@ -174,7 +174,9 @@ fn mutate_comments(src: &str, ext: &str) -> String {
 fn bench_config() -> Config {
     let mut cfg = Config::default();
     if let Ok(n) = std::env::var("REPRISE_NORMALIZER") {
-        cfg.normalize.normalizer = n;
+        cfg.normalize.normalizer = n
+            .parse::<Normalizer>()
+            .expect("REPRISE_NORMALIZER must be one of: ir, historical");
     }
     cfg
 }

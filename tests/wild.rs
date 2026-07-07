@@ -6,7 +6,7 @@
 //! must stay silent. Unlike the mutation benchmark this cannot be gamed by
 //! rules that merely invert our own generators.
 
-use reprise::config::Config;
+use reprise::config::{Config, Normalizer};
 use std::path::PathBuf;
 
 const WILD: &[(&str, &str, usize)] = &[
@@ -36,7 +36,7 @@ fn every_wild_pair_converges_at_its_labeled_tier() {
     // `wild_pairs_converge_under_the_ir_normalizer` (the only IR loss is w7, an exact-region run
     // held out by `min_seq_tokens`, Decision 4).
     let mut cfg = Config::default();
-    cfg.normalize.normalizer = "historical".into();
+    cfg.normalize.normalizer = Normalizer::Historical;
     cfg.cache.enabled = false; // don't litter fixture dirs with .reprise/
     for (dir, tier, members) in WILD {
         let root = wild_root().join(dir);
@@ -75,7 +75,7 @@ fn every_wild_pair_converges_at_its_labeled_tier() {
 fn wild_pairs_converge_under_the_ir_normalizer() {
     let mut cfg = Config::default();
     cfg.cache.enabled = false;
-    cfg.normalize.normalizer = "ir".into();
+    cfg.normalize.normalizer = Normalizer::Ir;
     // (fixture, expected IR result): `None` = must NOT converge; `Some((tier, members))` = a group
     // at `tier` with at least `members` must exist. This is a stronger gate than a bare
     // converges/doesn't bool — it also pins the tier and member floor, catching a tier *downgrade*

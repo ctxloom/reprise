@@ -5,7 +5,7 @@
 //! compiles the whole module).
 #![allow(dead_code)]
 
-use reprise::config::Config;
+use reprise::config::{Config, Normalizer};
 use reprise::lang::Lang;
 use std::fs;
 use std::path::Path;
@@ -18,7 +18,7 @@ use tempfile::TempDir;
 /// this is the same fingerprint `Config::default()` would produce.
 pub fn fp(src: &str, lang: Lang) -> u128 {
     let mut cfg = Config::default();
-    cfg.normalize.normalizer = "historical".into();
+    cfg.normalize.normalizer = Normalizer::Historical;
     let units = reprise::units_from_source(src, lang, &cfg);
     assert_eq!(units.len(), 1, "expected exactly one unit in:\n{src}");
     units[0].fingerprint
@@ -27,7 +27,7 @@ pub fn fp(src: &str, lang: Lang) -> u128 {
 /// Fingerprint under the IR normalizer (`[normalize] normalizer = "ir"`).
 pub fn fp_ir(src: &str, lang: Lang) -> u128 {
     let mut cfg = Config::default();
-    cfg.normalize.normalizer = "ir".into();
+    cfg.normalize.normalizer = Normalizer::Ir;
     let units = reprise::units_from_source(src, lang, &cfg);
     assert_eq!(units.len(), 1, "expected exactly one unit in:\n{src}");
     units[0].fingerprint

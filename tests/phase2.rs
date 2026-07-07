@@ -1,7 +1,7 @@
 //! Phase-2 integration contract (spec §5.2 desugaring, §5.3 folding, §5.6
 //! sequence + near-miss tiers, §5.1 test policy), all at `scan` level.
 
-use reprise::config::Config;
+use reprise::config::{Config, Normalizer};
 use reprise::report::ScanReport;
 use std::fs;
 use tempfile::TempDir;
@@ -22,7 +22,7 @@ fn scan_snippets(ext: &str, sources: &[&str]) -> ScanReport {
 /// the switch-over recall gate for the near/region tiers under the canonical IR.
 fn scan_snippets_ir(ext: &str, sources: &[&str]) -> ScanReport {
     let mut cfg = Config::default();
-    cfg.normalize.normalizer = "ir".into();
+    cfg.normalize.normalizer = Normalizer::Ir;
     scan_with(ext, sources, &cfg)
 }
 
@@ -33,7 +33,7 @@ fn scan_snippets_ir(ext: &str, sources: &[&str]) -> ScanReport {
 /// than tightening to an exact-region residual).
 fn scan_snippets_historical(ext: &str, sources: &[&str]) -> ScanReport {
     let mut cfg = Config::default();
-    cfg.normalize.normalizer = "historical".into();
+    cfg.normalize.normalizer = Normalizer::Historical;
     scan_with(ext, sources, &cfg)
 }
 
@@ -136,7 +136,7 @@ fn tree_recursion_control_does_not_converge() {
 /// Fingerprint under the IR normalizer (`[normalize] normalizer = "ir"`).
 fn fp_ir(src: &str, lang: reprise::lang::Lang) -> u128 {
     let mut cfg = Config::default();
-    cfg.normalize.normalizer = "ir".into();
+    cfg.normalize.normalizer = Normalizer::Ir;
     let units = reprise::units_from_source(src, lang, &cfg);
     assert_eq!(units.len(), 1, "expected exactly one unit in:\n{src}");
     units[0].fingerprint

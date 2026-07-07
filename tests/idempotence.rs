@@ -2,7 +2,7 @@
 //! (`normalize(normalize(t)) == normalize(t)`), and source spans survive.
 //! Runs over the mutation-benchmark seeds plus inline snippets.
 
-use reprise::config::Config;
+use reprise::config::{Config, Normalizer};
 use reprise::frontend::{extract_ir_units, has_ir_frontend, run_passes};
 use reprise::ir::TransformLog;
 use reprise::lang::Lang;
@@ -243,7 +243,7 @@ fn units_meet_phase1_floor() {
     // tokens — above the IR floor but below 40); the IR seed-floor guard rides on
     // `just bench-mutations-ir`.
     let mut cfg = Config::default();
-    cfg.normalize.normalizer = "historical".into();
+    cfg.normalize.normalizer = Normalizer::Historical;
     for (src, lang) in seed_sources() {
         let units = reprise::units_from_source(&src, lang, &cfg);
         assert_eq!(units.len(), 1);

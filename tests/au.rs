@@ -8,7 +8,7 @@
 //! and token-count computed for a DIFFERENT node. The corruption is
 //! allocator-nondeterministic (tcache address reuse), hence the loop below.
 
-use reprise::config::Config;
+use reprise::config::{Config, Normalizer};
 use reprise::lang::Lang;
 
 /// Two 3-operand commutative (`+`) chains in a single unit — the exact trigger:
@@ -24,7 +24,8 @@ fn two_commutative_chains_anti_unify_is_sound_and_stable() {
     let cfg = Config::default();
     let ua = reprise::units_from_source(A, Lang::Python, &cfg).remove(0);
     let ub = reprise::units_from_source(B, Lang::Python, &cfg).remove(0);
-    let ir = cfg.normalize.normalizer == "ir" && reprise::frontend::has_ir_frontend(Lang::Python);
+    let ir = cfg.normalize.normalizer == Normalizer::Ir
+        && reprise::frontend::has_ir_frontend(Lang::Python);
     let profile = Lang::Python.profile();
 
     // Ground truth (sound memo == no memo): one param-list gap hole plus one

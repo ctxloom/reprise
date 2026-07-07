@@ -81,7 +81,8 @@ pub fn find_similar_json(path: &str, snippet: &str, lang: &str) -> anyhow::Resul
     // colliding with the concurrent IR rework (task inner-envy). No cache reuse
     // here; the held index (docs/SERVERS.md §6, M5) is the answer if this is slow.
     let profile = lang.profile();
-    let ir = cfg.normalize.normalizer == "ir" && reprise::frontend::has_ir_frontend(lang);
+    let ir = cfg.normalize.normalizer == reprise::config::Normalizer::Ir
+        && reprise::frontend::has_ir_frontend(lang);
     let mut matches: Vec<SimMatch> = Vec::new();
     for (file, flang) in reprise::walk::collect_files(root, &cfg)? {
         if flang != lang {

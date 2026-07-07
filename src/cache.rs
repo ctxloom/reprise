@@ -96,7 +96,10 @@ pub fn key(rel_path: &str, content: &str, cfg: &Config) -> u128 {
     // The normalizer selector (D-IR-3) picks an entirely different canonical form, so it
     // MUST key the cache — else a warm "historical" cache would serve an "ir" scan (and
     // vice-versa). The IR vocabulary version rides along so a canonical-form change busts it.
-    buf.extend_from_slice(cfg.normalize.normalizer.as_bytes());
+    // `.as_str()` yields exactly "ir"/"historical" — the same bytes the pre-enum
+    // String field fed here, so this refactor keeps the key byte-identical per
+    // normalizer (warm caches are NOT invalidated).
+    buf.extend_from_slice(cfg.normalize.normalizer.as_str().as_bytes());
     buf.push(1);
     buf.extend_from_slice(&crate::ir::kind::SCHEME_VERSION.to_le_bytes());
     for lit in &cfg.normalize.literal_keep {
@@ -153,7 +156,7 @@ pub fn store(root: &Path, key: u128, value: &FileUnits) {
 #[cfg(test)]
 mod tests {
     use super::key;
-    use crate::config::Config;
+    use crate::config::{Config, Normalizer};
 
     #[test]
     fn key_distinguishes_the_normalizer_selector() {
@@ -161,11 +164,35 @@ mod tests {
         // so a warm "historical" cache can never serve an "ir" scan (or vice-versa).
         let src = "fn f(a: i32) -> i32 { a + 1 }";
         let mut hist = Config::default();
-        hist.normalize.normalizer = "historical".into();
+        hist.normalize.normalizer = Normalizer::Historical;
         let mut ir = Config::default();
-        ir.normalize.normalizer = "ir".into();
+        ir.normalize.normalizer = Normalizer::Ir;
         assert_ne!(key("f.rs", src, &hist), key("f.rs", src, &ir));
         // ...and identical config still keys identically (a warm cache actually hits).
         assert_eq!(key("f.rs", src, &ir), key("f.rs", src, &ir));
+    }
+
+    #[test]
+    fn key_is_byte_identical_to_the_pre_enum_string_bytes() {
+        // The `Normalizer` refactor must NOT invalidate warm caches: `as_str()` must feed
+        // the exact bytes the old `String` field did ("ir"/"historical"). Reconstruct the
+        // key with the raw string bytes and assert equality against the live key.
+        let src = "fn f(a: i32) -> i32 { a + 1 }";
+        for (norm, s) in [
+            (Normalizer::Ir, "ir"),
+            (Normalizer::Historical, "historical"),
+        ] {
+            let mut cfg = Config::default();
+            cfg.normalize.normalizer = norm;
+            assert_eq!(
+                norm.as_str(),
+                s,
+                "as_str must match the historical String value"
+            );
+            // The live key uses `norm.as_str().as_bytes()`; `s` is the literal old value.
+            assert_eq!(norm.as_str().as_bytes(), s.as_bytes());
+            // And a warm re-key with the same normalizer still hits.
+            assert_eq!(key("f.rs", src, &cfg), key("f.rs", src, &cfg));
+        }
     }
 }

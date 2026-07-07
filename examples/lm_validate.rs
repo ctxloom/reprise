@@ -16,7 +16,7 @@
 
 use rayon::prelude::*;
 use reprise::au;
-use reprise::config::Config;
+use reprise::config::{Config, Normalizer};
 use reprise::fingerprint::{self, HashMode, Subtree};
 use reprise::lang::Lang;
 use reprise::seq;
@@ -97,7 +97,8 @@ fn main() {
     let mut lang_lines: Vec<String> = Vec::new();
 
     for lang in langs {
-        let ir = cfg.normalize.normalizer == "ir" && reprise::frontend::has_ir_frontend(lang);
+        let ir =
+            cfg.normalize.normalizer == Normalizer::Ir && reprise::frontend::has_ir_frontend(lang);
         let floor = cfg.min_unit_floor();
 
         // eligible set: this lang, token >= floor, deduped by exact fingerprint (matchtree.rs).

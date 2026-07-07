@@ -2,7 +2,7 @@
 //! (DECISIONS.md D23). Exact-tier convergence at the fingerprint level;
 //! recursion↔iteration and @Test recognition at extraction / `scan` level.
 
-use reprise::config::Config;
+use reprise::config::{Config, Normalizer};
 use reprise::lang::Lang;
 
 mod common;
@@ -124,7 +124,7 @@ fn kt_tail_recursion_converges_with_iteration_ir() {
     // historical normalizer (§9 per-language capability gate) — the recursion↔iteration
     // convergence still holds on the IR-selected path.
     let mut cfg = Config::default();
-    cfg.normalize.normalizer = "ir".into();
+    cfg.normalize.normalizer = Normalizer::Ir;
     let tier = pair_tier_cfg(&[("aa.kt", KT_ITER), ("bb.kt", KT_TAIL)], &cfg);
     assert!(
         tier.as_deref()

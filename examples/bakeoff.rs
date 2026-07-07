@@ -29,7 +29,7 @@
 
 use rayon::prelude::*;
 use reprise::au;
-use reprise::config::Config;
+use reprise::config::{Config, Normalizer};
 use reprise::lang::Lang;
 use reprise::matchtree::{self, RepData, RetrievalStats, Retriever};
 use reprise::unit::{self, Unit};
@@ -61,7 +61,7 @@ fn build_lang_corpus(units: &[Unit], lang: Lang, cfg: &Config) -> Option<LangCor
     if reps.len() < 2 {
         return None;
     }
-    let ir = cfg.normalize.normalizer == "ir" && reprise::frontend::has_ir_frontend(lang);
+    let ir = cfg.normalize.normalizer == Normalizer::Ir && reprise::frontend::has_ir_frontend(lang);
     Some(LangCorpus { lang, ir, reps })
 }
 

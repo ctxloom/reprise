@@ -1,7 +1,7 @@
 //! Dev utility: explain why a pair of units does or doesn't converge.
 //! Usage: cargo run --example debug_near -- a.py b.py
 
-use reprise::config::Config;
+use reprise::config::{Config, Normalizer};
 use reprise::fingerprint::{self, HashMode};
 use reprise::lang::Lang;
 
@@ -52,7 +52,7 @@ fn main() {
         shared as f64 / union as f64,
         cfg.thresholds.candidate_sim
     );
-    let ir = cfg.normalize.normalizer == "ir" && reprise::frontend::has_ir_frontend(lang);
+    let ir = cfg.normalize.normalizer == Normalizer::Ir && reprise::frontend::has_ir_frontend(lang);
     let outcome = reprise::au::anti_unify(&ua.tree, &ub.tree, lang.profile(), ir);
     println!(
         "AU: divergence={:.3} (max {}), holes={} (max {}), factorable={}",

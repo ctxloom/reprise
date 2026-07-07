@@ -289,31 +289,76 @@ impl Default for Thresholds {
     }
 }
 
+/// Which normalizer produces the canonical tree fed to matching (spec §5.2, D-IR-3).
+///
+/// A **bounded, validated** selector: unlike the plugin-open `retrieval.retriever`
+/// String, an unknown value fails at config-load deserialization (serde
+/// `unknown variant ...`), so a typo can never silently fall through to the
+/// historical path. The two known selectors are `Ir` (`"ir"`) — the `src/frontend` +
+/// `src/ir` canonical IR (D-IR-1a/D-IR-3, feature-complete across Rust/Python/Go; **the
+/// default** as of the §8 switchover) — and `Historical` (`"historical"`) — the
+/// per-language `src/lang` profiles, still fully supported and selectable.
+///
+/// The IR trees are ~18% more compact, which is why the size floor is per-normalizer:
+/// the IR path uses `[thresholds] min_unit_tokens_ir` (33, the compaction-scaled floor —
+/// see `Config::min_unit_floor`), recalibrated so IR-path recall reaches parity with
+/// historical without a precision cost. A language without an IR frontend (TS, Kotlin)
+/// falls back to the historical path even when `Ir` is selected (a per-language
+/// capability gate, §9 — see `unit::is_ir`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Normalizer {
+    #[default]
+    Ir,
+    Historical,
+}
+
+impl Normalizer {
+    /// The exact config string for this normalizer (`"ir"` / `"historical"`).
+    /// Load-bearing: `cache::key` feeds these bytes into the extraction cache key,
+    /// so they MUST stay byte-identical to the pre-enum String values or warm
+    /// caches would be invalidated.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Normalizer::Ir => "ir",
+            Normalizer::Historical => "historical",
+        }
+    }
+}
+
+impl std::str::FromStr for Normalizer {
+    type Err = String;
+
+    /// Parse a plain string (e.g. an env var) into a `Normalizer`, rejecting
+    /// unknowns — the same bounded set serde's `Deserialize` accepts.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "ir" => Ok(Normalizer::Ir),
+            "historical" => Ok(Normalizer::Historical),
+            other => Err(format!(
+                "unknown normalizer {other:?} (expected one of: ir, historical)"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct NormalizeCfg {
     /// Literals whose identity is structural (spec §5.2.5). String literals are
     /// compared by their inner content, numeric literals by their text.
     pub literal_keep: Vec<String>,
-    /// Which normalizer produces the canonical tree fed to matching. A **non-boolean,
-    /// plugin-extensible** selector (not a two-way flag) — further normalizer plugins
-    /// may register later. Known values: `"ir"` (the `src/frontend` + `src/ir` canonical
-    /// IR — D-IR-1a/D-IR-3, feature-complete across Rust/Python/Go; **the default** as of
-    /// the §8 switchover) and `"historical"` (the per-language `src/lang` profiles, still
-    /// fully supported and selectable). The IR trees are ~18% more compact, which is why
-    /// the size floor is per-normalizer: the IR path uses `[thresholds] min_unit_tokens_ir`
-    /// (33, the compaction-scaled floor — see `Config::min_unit_floor`), recalibrated so
-    /// IR-path recall reaches parity with historical without a precision cost. A language
-    /// without an IR frontend (TS, Kotlin) falls back to `"historical"` even when `"ir"`
-    /// is selected (a per-language capability gate, §9).
-    pub normalizer: String,
+    /// Which normalizer produces the canonical tree fed to matching. See [`Normalizer`]:
+    /// a bounded, load-validated selector — an unknown value (e.g. a typo `"irr"`) fails
+    /// at deserialize time rather than silently selecting the historical path.
+    pub normalizer: Normalizer,
 }
 
 impl Default for NormalizeCfg {
     fn default() -> Self {
         NormalizeCfg {
             literal_keep: vec!["0".into(), "1".into(), "-1".into(), "".into()],
-            normalizer: "ir".into(),
+            normalizer: Normalizer::Ir,
         }
     }
 }
@@ -374,7 +419,7 @@ impl Config {
     /// normalizer (§9), so its units are uncompacted and this floor is marginally
     /// looser for them — an accepted edge of the capability-gap fallback.
     pub fn min_unit_floor(&self) -> u32 {
-        if self.normalize.normalizer == "ir" {
+        if self.normalize.normalizer == Normalizer::Ir {
             self.thresholds.min_unit_tokens_ir
         } else {
             self.thresholds.min_unit_tokens
@@ -395,7 +440,7 @@ impl Config {
     /// normalizer (§9), but this floor is matching-time (post-extraction), so its trees still
     /// use the historical size — an accepted edge of the capability-gap fallback.
     pub fn histogram_min_votes(&self) -> u32 {
-        if self.normalize.normalizer == "ir" {
+        if self.normalize.normalizer == Normalizer::Ir {
             self.thresholds.histogram_min_votes_ir
         } else {
             self.thresholds.histogram_min_votes
@@ -418,10 +463,11 @@ impl Config {
         // catch-all's intent). `sarif_fingerprint`'s consumer is `!= "line"`, so
         // a typo silently reads as `structural`; its set is the documented pair.
         //
-        // NOT validated here: `retrieval.retriever` and `normalize.normalizer`
-        // are deliberately string-keyed, plugin-extensible selectors ("any value
-        // resolves to Landmark for now"; "further normalizers may register") — no
-        // bounded valid set to check against, so validating them would be a guess.
+        // NOT validated here: `retrieval.retriever` is a deliberately string-keyed,
+        // plugin-extensible selector ("any value resolves to Landmark for now") — no
+        // bounded valid set to check against, so validating it would be a guess.
+        // (`normalize.normalizer` IS bounded — the `Normalizer` enum — so serde
+        // rejects an unknown value at deserialize time, before `validate` runs.)
         validate_enum(
             "[tests] mode",
             &self.tests.mode,
@@ -461,7 +507,38 @@ fn validate_enum(key: &str, value: &str, allowed: &[&str]) -> anyhow::Result<()>
 
 #[cfg(test)]
 mod tests {
-    use super::Config;
+    use super::{Config, Normalizer};
+
+    #[test]
+    fn rejects_unknown_normalizer_at_load() {
+        // A typo like `"irr"` must fail at DESERIALIZE (load) time — not load clean
+        // and silently select the historical path. `Normalizer` is a bounded enum,
+        // so serde errors with `unknown variant`, naming the bad value.
+        let toml = "[normalize]\nnormalizer = \"irr\"\n";
+        let err = toml::from_str::<Config>(toml).unwrap_err().to_string();
+        assert!(err.contains("irr"), "error names the bad value: {err}");
+    }
+
+    #[test]
+    fn accepts_both_known_normalizers_at_load() {
+        // Both bounded values deserialize to the right variant.
+        for (v, want) in [
+            ("ir", Normalizer::Ir),
+            ("historical", Normalizer::Historical),
+        ] {
+            let toml = format!("[normalize]\nnormalizer = \"{v}\"\n");
+            let cfg: Config = toml::from_str(&toml).unwrap();
+            assert_eq!(cfg.normalize.normalizer, want, "normalizer={v}");
+            assert!(cfg.validate().is_ok(), "should accept normalizer={v}");
+        }
+    }
+
+    #[test]
+    fn normalizer_default_is_ir_and_round_trips_as_str() {
+        assert_eq!(Config::default().normalize.normalizer, Normalizer::Ir);
+        assert_eq!(Normalizer::Ir.as_str(), "ir");
+        assert_eq!(Normalizer::Historical.as_str(), "historical");
+    }
 
     #[test]
     fn default_filters_are_coverage_offset_h_tree() {

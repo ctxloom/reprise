@@ -4,7 +4,7 @@
 //! fully-inlined variant (spec §12 cap) — and variants are tagged so the
 //! matching tiers can label findings `inline-assisted`.
 
-use crate::config::Config;
+use crate::config::{Config, Normalizer};
 use crate::fingerprint;
 use crate::fold::{self, RepeatFinding};
 use crate::lang::Lang;
@@ -124,7 +124,7 @@ pub fn extract_file_units_keep_raw(path: &Path, src: &str, lang: Lang, cfg: &Con
     // lowers directly to the canonical IR (D-IR-1a) and skips the historical passes.
     // A language without an IR frontend yet (TS, Kotlin) falls back to the historical
     // normalizer so those files still scan (per-language capability gate, §9 P2).
-    if cfg.normalize.normalizer == "ir" && crate::frontend::has_ir_frontend(lang) {
+    if cfg.normalize.normalizer == Normalizer::Ir && crate::frontend::has_ir_frontend(lang) {
         return extract_ir_file_units(path, src, lang, cfg);
     }
     let mut out = FileUnits {
@@ -263,7 +263,7 @@ fn pass_and_fold(tree: NormNode, lang: Lang, cfg: &Config) -> (NormNode, Vec<Rep
 /// Whether extraction for `lang` used the IR normalizer (else the historical path,
 /// including the TS/Kotlin fallback under `normalizer = "ir"`, §9 P2).
 pub(crate) fn is_ir(lang: Lang, cfg: &Config) -> bool {
-    cfg.normalize.normalizer == "ir" && crate::frontend::has_ir_frontend(lang)
+    cfg.normalize.normalizer == Normalizer::Ir && crate::frontend::has_ir_frontend(lang)
 }
 
 /// The IR analog of [`pass_and_fold`] for a spliced inline variant: re-run recursion
@@ -426,7 +426,7 @@ mod tests {
 
     fn ir_cfg() -> Config {
         let mut cfg = Config::default();
-        cfg.normalize.normalizer = "ir".into();
+        cfg.normalize.normalizer = Normalizer::Ir;
         cfg
     }
 
@@ -435,7 +435,7 @@ mod tests {
         // The canonical IR is the default since the §8 switchover: each function lowers to the
         // `Unit` canonical root (the `Unit` kind is IR-only).
         let cfg = Config::default();
-        assert_eq!(cfg.normalize.normalizer, "ir");
+        assert_eq!(cfg.normalize.normalizer, Normalizer::Ir);
         let units = units_from_source("fn add(a: i32) -> i32 { return a + 1; }", Lang::Rust, &cfg);
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].tree.kind.as_ref(), "Unit");
@@ -446,7 +446,7 @@ mod tests {
         // The per-grammar historical normalizer stays fully supported: selecting it keeps the
         // per-grammar tree (the `Unit` canonical root is IR-only), unchanged from before the flip.
         let mut cfg = Config::default();
-        cfg.normalize.normalizer = "historical".into();
+        cfg.normalize.normalizer = Normalizer::Historical;
         let units = units_from_source("fn add(a: i32) -> i32 { return a + 1; }", Lang::Rust, &cfg);
         assert_eq!(units.len(), 1);
         assert_ne!(units[0].tree.kind.as_ref(), "Unit");
