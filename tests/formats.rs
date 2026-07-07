@@ -158,6 +158,17 @@ fn sarif_group_is_one_multilocation_result_with_structural_fingerprint() {
         "exact-normalized ≥ default fail_on"
     );
     assert_eq!(group["properties"]["tier"], "exact-normalized");
+
+    // Non-api tiers keep `tokenCount` (a real normalized token count) exactly as before,
+    // and never carry the api-only key.
+    assert!(
+        group["properties"]["tokenCount"].as_u64().is_some(),
+        "exact-normalized keeps a numeric tokenCount"
+    );
+    assert!(
+        group["properties"].get("sharedRareCallees").is_none(),
+        "non-api tiers do not carry the api-only property"
+    );
 }
 
 #[test]
@@ -174,6 +185,67 @@ fn sarif_line_mode_omits_our_fingerprint() {
             "line mode falls back to GitHub primaryLocationLineHash — omit ours"
         );
     }
+}
+
+/// A one-off api-profile `ScanReport`: the api tier has no shared token mass, so its
+/// `Group::token_count` holds the shared-rare-callee COUNT (spec §5.7) — the value the
+/// terminal renderer prints as "N shared rare callees". Built by hand because the scan
+/// corpus above only produces exact-normalized groups.
+fn api_report() -> reprise::ScanReport {
+    use reprise::report::{Group, Member, ScanReport, Stats, Tier};
+    let member = |name: &str| Member {
+        file: std::path::PathBuf::from("src/a.rs"),
+        lang: "rust".into(),
+        name: name.into(),
+        line_span: (1, 20),
+        parse_degraded: false,
+    };
+    ScanReport {
+        groups: Vec::new(),
+        test_groups: Vec::new(),
+        api_groups: vec![Group {
+            id: "api-1".into(),
+            tier: Tier::ApiProfile,
+            fingerprint: "deadbeefcafef00d".into(),
+            // NOT tokens: this is the shared-rare-callee count.
+            token_count: 3,
+            value: 42.0,
+            note: None,
+            divergence: 0.0,
+            template: Some("shared rare callees: acquire_lease, flush_wal, seal_segment".into()),
+            inline_chain: None,
+            members: vec![member("replay_journal"), member("recover_index")],
+        }],
+        weak_groups: Vec::new(),
+        stats: Stats::default(),
+        unit_index: Vec::new(),
+    }
+}
+
+#[test]
+fn sarif_api_tier_labels_shared_rare_callees_not_token_count() {
+    let dir = TempDir::new().unwrap();
+    let out = sarif::scan_sarif(&api_report(), dir.path(), &Config::default(), false);
+    let v: Value = serde_json::from_str(&out).expect("SARIF must parse as JSON");
+    assert_eq!(v["version"], "2.1.0", "still well-formed 2.1.0");
+
+    let results = v["runs"][0]["results"].as_array().unwrap();
+    let api = results
+        .iter()
+        .find(|r| r["properties"]["tier"] == "api-profile")
+        .expect("the api-profile group yields a result");
+
+    // The api tier's count is a shared-rare-callee count, not a token count — it must
+    // NOT be emitted under `tokenCount`, which a SARIF consumer would misread.
+    assert!(
+        api["properties"].get("tokenCount").is_none(),
+        "api tier must not carry a misleading `tokenCount`"
+    );
+    // It rides under the api-specific key instead, matching the terminal renderer.
+    assert_eq!(
+        api["properties"]["sharedRareCallees"], 3,
+        "api tier count surfaces as `sharedRareCallees`"
+    );
 }
 
 // ---------- CPD XML ----------

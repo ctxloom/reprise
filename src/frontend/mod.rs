@@ -271,7 +271,7 @@ pub(crate) fn lower_source(
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&lang.ts_language()).ok()?;
     let tree = parser.parse(src, None)?;
-    let func = find_kind(tree.root_node(), root_kind)?;
+    let func = find_kind(tree.root_node(), root_kind, 0)?;
     Some(lower_unit(fe, func, src, log))
 }
 
@@ -531,13 +531,23 @@ fn collect_ir_units(
     }
 }
 
-fn find_kind<'a>(node: Node<'a>, k: &str) -> Option<Node<'a>> {
+/// The unit-*finder* for the test/convenience [`lower_source`] path. Like the production
+/// finders ([`collect_ir_units`] / [`crate::normalize`]'s `collect_units`), this is a recursive
+/// CST descent that would itself overflow the worker stack on a pathologically deep input, so it
+/// stops searching past [`crate::normalize::MAX_EXTRACTION_DEPTH`] — the same cap the lowering
+/// wrapper [`Frontend::lower_node`] enforces. Belt-and-suspenders: these helpers are off the
+/// guarded production `scan` path, but a deep convenience call now returns `None` instead of
+/// SIGSEGV. Normal (shallow) input is unaffected — the target is found far above the cap.
+fn find_kind<'a>(node: Node<'a>, k: &str, depth: u32) -> Option<Node<'a>> {
     if node.kind() == k {
         return Some(node);
     }
+    if depth >= crate::normalize::MAX_EXTRACTION_DEPTH {
+        return None;
+    }
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
-        .find_map(|c| find_kind(c, k))
+        .find_map(|c| find_kind(c, k, depth + 1))
 }
 
 // ---- shared lowering helpers (language-agnostic; the algorithm, written once) ----
@@ -1352,7 +1362,7 @@ mod tests {
         parser.set_language(&lang.ts_language()).unwrap();
         let cst = parser.parse(src, None).unwrap();
         let root_kind = ir_root_kinds(lang)[0];
-        let func = find_kind(cst.root_node(), root_kind).expect("a unit");
+        let func = find_kind(cst.root_node(), root_kind, 0).expect("a unit");
         crate::ir::to_sexpr(&normalize(lang, func, src, log))
     }
 

@@ -132,3 +132,57 @@ fn full_scan_survives_a_pathologically_deep_file() {
         "the truncated deep unit must be counted as parse-degraded in the scan summary",
     );
 }
+
+// ---- convenience/test lowering helpers (`lower_rust_source` &c.) — off the guarded scan
+// path, but must not SIGSEGV on pathological input either. ----
+
+/// `depth` levels of nested `mod`s with NO function inside — so the convenience path's unit
+/// *finder* (`frontend::find_kind`) must recurse the whole CST hunting for a `function_item`
+/// it never finds. Unguarded, that descent overflows the worker stack; the depth cap makes it
+/// stop and report "not found" instead.
+fn deep_rust_mod_nest(depth: usize) -> String {
+    let mut s = String::with_capacity(depth * 10 + 32);
+    for _ in 0..depth {
+        s.push_str("mod m {\n");
+    }
+    s.push_str("const X: i32 = 0;\n");
+    for _ in 0..depth {
+        s.push_str("}\n");
+    }
+    s
+}
+
+#[test]
+fn deep_convenience_helper_finder_does_not_overflow() {
+    // `lower_rust_source` locates its unit via the recursive `find_kind` descent. On a deep,
+    // function-less CST that finder would recurse to full depth and overflow a 2 MiB worker
+    // stack; the depth cap makes it stop at MAX_EXTRACTION_DEPTH and return None. This is
+    // belt-and-suspenders (these helpers are off the production scan path), but a SIGSEGV here
+    // would abort `cargo test` itself — so a green run proves the guarded finder fits the stack.
+    // Nest deeper than the lowering `DEEP`: the finder's frames are lighter, so it needs a
+    // taller CST to overflow unguarded; post-fix it caps at 150 regardless, so this stays cheap.
+    let src = deep_rust_mod_nest(12_000);
+    let found = on_worker_stack(move || reprise::frontend::lower_rust_source(&src).is_some());
+    assert!(
+        !found,
+        "no function_item in the deep module nest ⇒ None (and, crucially, no stack overflow)",
+    );
+}
+
+#[test]
+fn deep_convenience_helper_lowers_deep_body_without_overflow() {
+    // The lowering half of the convenience path already routes through the guarded `lower_node`
+    // wrapper, so a deep function *body* truncates + flags rather than overflowing — the finder
+    // short-circuits at the top-level function, then lowering caps the deep chain.
+    let src = deep_rust_chain(DEEP);
+    let truncated = on_worker_stack(move || {
+        reprise::frontend::lower_rust_source(&src)
+            .expect("the top-level function is found")
+            .1
+            .truncated()
+    });
+    assert!(
+        truncated,
+        "a deep body must be truncated by the lowering depth guard, not overflow the stack",
+    );
+}

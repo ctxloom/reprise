@@ -181,8 +181,17 @@ fn result_for_group(
         "section": section,
         "divergence": group.divergence,
         "value": group.value,
-        "tokenCount": group.token_count,
     });
+    // The api-profile tier overloads `token_count` with its shared-rare-callee
+    // count (there is no normalized token mass — no shared structural form), so
+    // emitting it as `tokenCount` would mislead a SARIF consumer. Mirror the
+    // terminal renderer (`report::render_group`): api tier → `sharedRareCallees`,
+    // every other tier → `tokenCount` (unchanged).
+    if group.tier == Tier::ApiProfile {
+        properties["sharedRareCallees"] = json!(group.token_count);
+    } else {
+        properties["tokenCount"] = json!(group.token_count);
+    }
     if let Some(chain) = &group.inline_chain {
         properties["inlineChain"] = json!(chain);
     }
