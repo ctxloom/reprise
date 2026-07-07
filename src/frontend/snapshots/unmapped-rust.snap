@@ -1,5 +1,5 @@
 grammar: rust (unmapped → native)
-unmapped named kinds (114):
+unmapped named kinds (113):
   abstract_type
   arguments
   array_expression
@@ -59,7 +59,6 @@ unmapped named kinds (114):
   or_pattern
   ordered_field_declaration_list
   outer_doc_comment_marker
-  parameter
   parameters
   pointer_type
   qualified_type

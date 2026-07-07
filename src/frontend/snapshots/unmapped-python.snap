@@ -1,5 +1,5 @@
 grammar: python (unmapped → native)
-unmapped named kinds (83):
+unmapped named kinds (81):
   aliased_import
   argument_list
   as_pattern
@@ -13,7 +13,6 @@ unmapped named kinds (83):
   constrained_type
   decorated_definition
   decorator
-  default_parameter
   delete_statement
   dict_pattern
   dictionary
@@ -75,7 +74,6 @@ unmapped named kinds (83):
   type_conversion
   type_parameter
   typed_default_parameter
-  typed_parameter
   union_pattern
   union_type
   wildcard_import

@@ -89,7 +89,8 @@ pub(crate) const MAP: &[(&str, super::Lowering)] = &[
 /// subject-folded `match` ([`lower_match`]), tuple-assign ([`lower_assignment_rust`]), the
 /// `let` binding rule ([`lower_let_rust`]), and the non-uniform inline lowerings
 /// (`index`/`reference`/`range`/`closure`) — plus the tail-return path ([`Rust::lower_fn_body`]
-/// → [`lower_tail`]/[`return_tail`]) and the deeper discriminants those helpers test.
+/// → [`lower_tail`]/[`return_tail`]) and the deeper discriminants those helpers test, and the
+/// parameter kind [`Rust::lower_params`] matches on (another hand-written, non-`lower_node` path).
 ///
 /// One residue reference is a *suffix* match, not a fixed kind: [`return_tail`] treats any
 /// `*_item` node as a non-value. That is enumerated structurally by the gate, not as a string.
@@ -114,6 +115,10 @@ pub(crate) const RESIDUE_KINDS: &[&str] = &[
     "match_pattern",    // literal_pattern_value
     "negative_literal", // literal_pattern_value (a literal match arm)
     "tuple_expression", // lower_assignment_rust parallel-assign detection
+    // Referenced by the hand-written `lower_params` (not `lower_node`): the parameter node kind it
+    // matches on. Registered so a grammar rename of this kind trips the gate instead of silently
+    // routing params to native(). (Its `pattern` field is already gated via the `For` entry.)
+    "parameter", // lower_params: a `pat: T` function parameter
 ];
 
 impl Frontend for Rust {

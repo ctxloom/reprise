@@ -1,5 +1,5 @@
 grammar: go (unmapped → native)
-unmapped named kinds (62):
+unmapped named kinds (61):
   argument_list
   array_type
   blank_identifier
@@ -35,7 +35,6 @@ unmapped named kinds (62):
   negated_type
   nil
   package_clause
-  parameter_declaration
   parameter_list
   parenthesized_type
   pointer_type

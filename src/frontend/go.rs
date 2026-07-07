@@ -101,9 +101,9 @@ pub(crate) const MAP: &[(&str, super::Lowering)] = &[
 /// non-`lower_node` frontend paths (`splice_kind`, `expand_stmt`) still couple to (the analog of Rust's
 /// tail-return-only kinds `use_declaration`/`empty_statement`/`macro_definition`).
 ///
-/// (The one referenced grammar kind deliberately left out is `parameter_declaration`, matched inside
-/// [`Frontend::lower_params`] — the same param-shape gate gap Rust (`parameter`) and Python
-/// (`typed_parameter`/`default_parameter`) leave open; tracked as cross-frontend deferred work.)
+/// This also includes the parameter kind the hand-written [`Frontend::lower_params`] matches on
+/// (`parameter_declaration`) — another non-`lower_node` path the gate must see, registered uniformly
+/// with Rust (`parameter`) and Python (`typed_parameter`/`default_parameter`).
 // Consumed by the increment-5 conformance gate (via `super::frontend_table`), which asserts every
 // entry still exists in the linked grammar — so the increment-3 `allow(dead_code)` that scoped this
 // to the plain library build is gone (parity with Rust's/Python's `RESIDUE_KINDS`).
@@ -123,6 +123,10 @@ pub(crate) const RESIDUE_KINDS: &[&str] = &[
     "const_declaration",
     "var_spec",
     "const_spec",
+    // Referenced by the hand-written `lower_params` (not `lower_node`): the named-parameter kind it
+    // matches on. Registered so a grammar rename trips the gate instead of silently routing params
+    // to native().
+    "parameter_declaration", // lower_params: a named `(x T)` function parameter
 ];
 
 impl Frontend for Go {

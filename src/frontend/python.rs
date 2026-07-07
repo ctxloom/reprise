@@ -88,14 +88,16 @@ pub(crate) const MAP: &[(&str, super::Lowering)] = &[
 /// registered as data so the increment-5 conformance gate can enumerate EVERY kind the frontend
 /// references (MAP keys ∪ `RESIDUE_KINDS`) and assert each still exists in the linked grammar.
 ///
-/// Two sources, both grammar-coupled strings the gate must still see:
+/// Three sources, all grammar-coupled strings the gate must still see:
 ///   * the one **residue-arm** kind — `subscript`, whose inline `Index` construction the table
-///     can't express (the analog of Rust's residue `index_expression`); and
+///     can't express (the analog of Rust's residue `index_expression`);
 ///   * the internal discriminants of the table-dispatched **language-local (`Std`)** helpers.
 ///     This is the schema increment 2 introduces: an `Std` entry's *own* kind is a MAP key, but the
 ///     grammar kinds it matches on internally (a `case_clause`, an `elif_clause`) are not — so they
 ///     are enumerated here, generalizing Rust's "residue helpers' internal discriminants" to
-///     "residue arm ∪ Std helpers". (Go increment 3 inherits this rule.)
+///     "residue arm ∪ Std helpers". (Go increment 3 inherits this rule.); and
+///   * the parameter kinds the hand-written [`Python::lower_params`] matches on — another
+///     non-`lower_node` path the gate must see (parity with Rust's/Go's param registration).
 // Consumed by the increment-5 conformance gate (via `super::frontend_table`), which asserts every
 // entry still exists in the linked grammar — so the increment-2 `allow(dead_code)` that scoped this
 // to the plain library build is gone (parity with Rust's `RESIDUE_KINDS`).
@@ -111,6 +113,11 @@ pub(crate) const RESIDUE_KINDS: &[&str] = &[
     "tuple_pattern",   // tuple_elements: a destructuring target
     "expression_list", // tuple_elements: a parallel-assign value list
     "tuple",           // tuple_elements: a parenthesized value tuple
+    // Referenced by the hand-written `lower_params` (not `lower_node`): the parameter node kinds it
+    // matches on. Registered so a grammar rename of a param kind trips the gate instead of silently
+    // routing params to native(). (A bare `identifier` param is already gated via the MAP `Var` key.)
+    "typed_parameter",   // lower_params: a `x: T` parameter
+    "default_parameter", // lower_params: a `x = v` parameter
 ];
 
 impl Frontend for Python {

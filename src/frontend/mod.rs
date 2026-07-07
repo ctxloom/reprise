@@ -1747,6 +1747,43 @@ mod conformance_gate_tests {
         );
     }
 
+    /// PARAM COVERAGE. Each frontend lowers parameters in a hand-written `lower_params` (not the
+    /// `lower_node` table), so its parameter CST kinds were invisible to `referenced()` and could
+    /// silently rot to `native()` on a grammar rename. Registering them in `RESIDUE_KINDS` closes
+    /// that: this test proves (a) every param kind is now in the `referenced()` set — so the forward
+    /// gate iterates over it — and (b) each resolves in the linked grammar today. Together with the
+    /// teeth test (`dead_references` flags a non-resolving kind), a grammar rename/removal of a param
+    /// kind now trips `every_referenced_construct_exists_in_the_linked_grammar` instead of routing
+    /// params to `native()` unseen.
+    #[test]
+    fn param_kinds_are_gated() {
+        // The exact kinds each frontend's `lower_params` matches on.
+        let cases: &[(Lang, &[&str])] = &[
+            (Lang::Rust, &["parameter"]),
+            (Lang::Python, &["typed_parameter", "default_parameter"]),
+            (Lang::Go, &["parameter_declaration"]),
+        ];
+        for &(lang, param_kinds) in cases {
+            let (kinds, _) = referenced(lang);
+            let referenced: std::collections::HashSet<&str> = kinds.into_iter().collect();
+            let language = lang.ts_language();
+            for &pk in param_kinds {
+                assert!(
+                    referenced.contains(pk),
+                    "{lang:?} param kind {pk:?} is ungated: absent from referenced() (MAP ∪ \
+                     RESIDUE_KINDS) — the forward gate can't see it, so a grammar rename would \
+                     silently route params to native()",
+                );
+                assert_ne!(
+                    language.id_for_node_kind(pk, true),
+                    0,
+                    "{lang:?} param kind {pk:?} no longer resolves in the linked grammar — \
+                     `lower_params` is dead; the forward gate should now be flagging this",
+                );
+            }
+        }
+    }
+
     /// INVERSE ADVISORY. The named grammar kinds no table models (grammar named kinds − MAP keys −
     /// `RESIDUE_KINDS`) — the set that falls through to `native()`. Snapshotted so a grammar bump
     /// that adds or renames a kind produces a reviewable diff here (a new construct to consider
