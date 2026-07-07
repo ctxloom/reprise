@@ -493,7 +493,7 @@ fn verify(
     if !offset_histogram_passes(a, b, cfg) {
         return Verdict::HistRej;
     }
-    let outcome = au::anti_unify(&ua.tree, &ub.tree, profile, ir);
+    let outcome = au::anti_unify(&ua.tree, &ub.tree, (!ir).then_some(profile), ir);
     if outcome.divergence > cfg.thresholds.max_divergence {
         return Verdict::DivRej;
     }

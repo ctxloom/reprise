@@ -26,7 +26,8 @@ fn two_commutative_chains_anti_unify_is_sound_and_stable() {
     let ub = reprise::units_from_source(B, Lang::Python, &cfg).remove(0);
     let ir = cfg.normalize.normalizer == Normalizer::Ir
         && reprise::frontend::has_ir_frontend(Lang::Python);
-    let profile = Lang::Python.profile();
+    // A profile is required only on the historical path; the IR path passes `None`.
+    let profile = (!ir).then(|| Lang::Python.profile());
 
     // Ground truth (sound memo == no memo): one param-list gap hole plus one
     // `leaf vs x*y` hole per chain. `x*y` is a 4-node subtree (binop + 2 leaves

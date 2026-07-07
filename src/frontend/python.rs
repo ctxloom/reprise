@@ -177,6 +177,31 @@ impl Frontend for Python {
             }
         }
     }
+
+    /// Mirrors the historical `LanguageProfile::unit_is_test` for Python exactly: a `test_`-prefixed
+    /// / `_test`-suffixed name or testy path, or a `pytest`/`fixture`/`test` decorator on the
+    /// wrapping `decorated_definition`.
+    fn unit_is_test(&self, node: Node, src: &str, name: &str, path: &std::path::Path) -> bool {
+        if name.starts_with("test_") || name.ends_with("_test") || crate::lang::path_is_testy(path)
+        {
+            return true;
+        }
+        // Decorators live on the wrapping decorated_definition.
+        if let Some(parent) = node.parent()
+            && parent.kind() == "decorated_definition"
+        {
+            let text = parent
+                .utf8_text(src.as_bytes())
+                .unwrap_or_default()
+                .lines()
+                .take_while(|l| l.trim_start().starts_with('@'))
+                .collect::<String>();
+            if text.contains("pytest") || text.contains("fixture") || text.contains("test") {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 /// Lower a Python `assignment`. A **parallel** multi-target assignment (`a, b = X, Y`) becomes a

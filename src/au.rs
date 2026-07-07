@@ -35,7 +35,11 @@ pub struct AuOutcome {
 }
 
 struct Ctx<'a> {
-    profile: &'a dyn LanguageProfile,
+    /// The historical `LanguageProfile`, consulted ONLY on the historical path (`ir == false`,
+    /// the three `!self.ir` predicate branches below). `None` on the IR path — canonical-IR
+    /// kinds answer those predicates directly — so the IR path holds no `LanguageProfile` and
+    /// its callers pass `None`. Invariant: `profile.is_some() == !ir`.
+    profile: Option<&'a dyn LanguageProfile>,
     /// The units under comparison were extracted by the IR normalizer (canonical-IR kinds
     /// `Loop`/`Block`/`Binop`/…), not the historical grammar. The three structural predicates
     /// AU consults — loop core, list kind, binary shape — are answered on IR kinds instead of
@@ -84,12 +88,20 @@ impl Ctx<'_> {
         self.tokens(node) <= 12 && is_synthetic(node)
     }
 
+    /// The historical profile — present whenever `ir == false` (its only consumers are the
+    /// `!self.ir` branches below). The invariant `profile.is_some() == !ir` is established at
+    /// construction, so reaching this on the IR path would be a caller bug.
+    fn hist_profile(&self) -> &dyn LanguageProfile {
+        self.profile
+            .expect("historical AU (ir == false) requires a LanguageProfile")
+    }
+
     /// The lowered loop core — the IR `Loop` node, or the historical `while True` core.
     fn is_loop_core(&self, node: &NormNode) -> bool {
         if self.ir {
             node.kind.as_ref() == crate::ir::kind::LOOP
         } else {
-            self.profile.is_loop_core(node)
+            self.hist_profile().is_loop_core(node)
         }
     }
 
@@ -99,7 +111,7 @@ impl Ctx<'_> {
         if self.ir {
             kind == crate::ir::kind::BLOCK || kind == crate::ir::kind::BRANCH || kind == "REPEAT"
         } else {
-            self.profile.is_list_kind(kind)
+            self.hist_profile().is_list_kind(kind)
         }
     }
 
@@ -117,15 +129,19 @@ impl Ctx<'_> {
         if self.ir {
             (kind == crate::ir::kind::BINOP).then_some((Some("left"), Some("op"), Some("right")))
         } else {
-            self.profile.binary_fields(kind)
+            self.hist_profile().binary_fields(kind)
         }
     }
 }
 
+/// Anti-unify two normalized units. `profile` is the historical `LanguageProfile`, required
+/// ONLY when `ir == false` (the historical path's structural predicates); IR-path callers pass
+/// `None` — the canonical-IR kinds answer those predicates directly, so the IR path carries no
+/// `LanguageProfile` dependency. Invariant: `profile.is_some() == !ir`.
 pub fn anti_unify(
     a: &NormNode,
     b: &NormNode,
-    profile: &dyn LanguageProfile,
+    profile: Option<&dyn LanguageProfile>,
     ir: bool,
 ) -> AuOutcome {
     let mut ctx = Ctx {

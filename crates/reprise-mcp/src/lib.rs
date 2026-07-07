@@ -80,9 +80,13 @@ pub fn find_similar_json(path: &str, snippet: &str, lang: &str) -> anyhow::Resul
     // rather than by factoring scan() — the corpus accessor is deferred to avoid
     // colliding with the concurrent IR rework (task inner-envy). No cache reuse
     // here; the held index (docs/SERVERS.md §6, M5) is the answer if this is slow.
-    let profile = lang.profile();
     let ir = cfg.normalize.normalizer == reprise::config::Normalizer::Ir
         && reprise::frontend::has_ir_frontend(lang);
+    // The historical `LanguageProfile` is anti_unify's structural oracle ONLY on the historical
+    // path; the IR path answers those predicates from canonical-IR kinds. Bind a profile solely
+    // when `!ir`, so the IR case never touches `LanguageProfile` (the profile call vanishes for
+    // it); a `historical`/TS/Kotlin scan still supplies it.
+    let profile = (!ir).then(|| lang.profile());
     let mut matches: Vec<SimMatch> = Vec::new();
     for (file, flang) in reprise::walk::collect_files(root, &cfg)? {
         if flang != lang {
@@ -127,7 +131,9 @@ pub fn find_similar_json(path: &str, snippet: &str, lang: &str) -> anyhow::Resul
 fn compare(
     cand: &reprise::Unit,
     u: &reprise::Unit,
-    profile: &dyn reprise::lang::LanguageProfile,
+    // The historical `LanguageProfile`, needed ONLY on the historical path (`ir == false`);
+    // `None` on the IR path, which anti_unify answers from canonical-IR kinds.
+    profile: Option<&dyn reprise::lang::LanguageProfile>,
     ir: bool,
     cfg: &reprise::Config,
     root: &Path,

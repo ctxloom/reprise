@@ -229,6 +229,17 @@ impl Frontend for Go {
             _ => None,
         }
     }
+
+    /// Mirrors the historical `LanguageProfile::unit_is_test` for Go exactly: Go tests are the
+    /// funcs in `_test.go` files (the `TestXxx` convention is only meaningful there), plus any
+    /// testy path.
+    fn unit_is_test(&self, _node: Node, _src: &str, _name: &str, path: &std::path::Path) -> bool {
+        let fname = path
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or_default();
+        fname.ends_with("_test.go") || crate::lang::path_is_testy(path)
+    }
 }
 
 /// The named child of a `for_statement` that is the loop *clause* (`for_clause` /

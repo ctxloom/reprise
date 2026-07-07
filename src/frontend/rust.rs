@@ -200,6 +200,27 @@ impl Frontend for Rust {
             None => NormNode::new(kind::BLOCK, Some("body"), span, Vec::new()),
         }
     }
+
+    /// Mirrors the historical `LanguageProfile::unit_is_test` for Rust exactly: a `test_`-prefixed
+    /// name or testy path, or a preceding `#[test]`/`#[bench]`-style attribute sibling.
+    fn unit_is_test(&self, node: Node, src: &str, name: &str, path: &std::path::Path) -> bool {
+        if name.starts_with("test_") || crate::lang::path_is_testy(path) {
+            return true;
+        }
+        // #[test]-style attributes are preceding siblings of the fn item.
+        let mut prev = node.prev_named_sibling();
+        while let Some(sib) = prev {
+            if sib.kind() != "attribute_item" {
+                break;
+            }
+            let text = sib.utf8_text(src.as_bytes()).unwrap_or_default();
+            if text.contains("test") || text.contains("bench") {
+                return true;
+            }
+            prev = sib.prev_named_sibling();
+        }
+        false
+    }
 }
 
 /// Lower a Rust `block` that sits in the function's **return position**: every statement

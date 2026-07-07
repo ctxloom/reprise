@@ -182,8 +182,11 @@ fn near_groups_for_lang(
     stats: &mut RetrievalStats,
     exact_pairs: &HashSet<(usize, usize)>,
 ) -> Vec<NearGroup> {
-    let profile = lang.profile();
     let ir = crate::unit::is_ir(lang, cfg);
+    // The historical `LanguageProfile` is anti_unify's structural oracle ONLY on the historical
+    // path; the IR path answers those predicates from canonical-IR kinds, so bind a profile
+    // solely when `!ir` and pass `None` otherwise (keeps the IR path off `LanguageProfile`).
+    let profile = (!ir).then(|| lang.profile());
     let debug_timing = std::env::var_os("REPRISE_TIMING").is_some();
     let mut t = std::time::Instant::now();
     let mut mark = |label: &str| {

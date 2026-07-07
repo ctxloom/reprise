@@ -110,6 +110,15 @@ pub(crate) trait Frontend {
             .and_then(|b| self.lower_node(b, Some("body"), src, log))
             .unwrap_or_else(|| NormNode::new(kind::BLOCK, Some("body"), span, Vec::new()))
     }
+
+    /// Test-unit recognition on the IR extraction path (spec §5.1 test-code policy). This is the
+    /// `Frontend`-seam home of what the historical path answers via `LanguageProfile::unit_is_test`
+    /// — moved here so the IR path carries **no** `LanguageProfile` dependency (it was the only
+    /// profile method the IR path still reached). Each frontend mirrors its language's historical
+    /// `unit_is_test` exactly (same name/attribute/path sniffing), so the `is_test` flag is
+    /// bit-identical across normalizers. `node` is the raw function-like CST node (parent/sibling
+    /// context intact, as in the historical finder), so attribute/decorator lookups match.
+    fn unit_is_test(&self, node: Node, src: &str, name: &str, path: &std::path::Path) -> bool;
 }
 
 // ---- data-driven dispatch table (D-SP4-1b; docs/sp4-grammar-lift-plan.md §4) ----
@@ -304,6 +313,20 @@ pub(crate) fn lower_unit_for(
         Lang::Go => lower_unit(&go::Go, node, src, log),
         // Remaining frontends (TS, Kotlin) fall back to an empty unit until built.
         _ => NormNode::new(kind::UNIT, None, span_of(node), Vec::new()),
+    }
+}
+
+/// Dispatch to `lang`'s frontend for test-unit recognition — the IR extraction path's
+/// replacement for `LanguageProfile::unit_is_test`, keeping that path off the profile trait.
+/// Only Rust/Python/Go reach here: TS/Kotlin have no IR frontend, so `crate::unit::is_ir` is
+/// false for them and they never take the IR extraction path (`_ => false` is unreachable
+/// today, a safe default should a frontend-less language ever be routed here).
+fn unit_is_test_for(lang: Lang, node: Node, src: &str, name: &str, path: &std::path::Path) -> bool {
+    match lang {
+        Lang::Rust => rust::Rust.unit_is_test(node, src, name, path),
+        Lang::Python => python::Python.unit_is_test(node, src, name, path),
+        Lang::Go => go::Go.unit_is_test(node, src, name, path),
+        _ => false,
     }
 }
 
@@ -508,7 +531,7 @@ fn collect_ir_units(
             .and_then(|n| n.utf8_text(src.as_bytes()).ok())
             .unwrap_or("<anon>")
             .to_string();
-        let is_test = lang.profile().unit_is_test(node, src, &name, path);
+        let is_test = unit_is_test_for(lang, node, src, &name, path);
         out.push(IrUnit {
             name,
             byte_span: (node.start_byte() as u32, node.end_byte() as u32),

@@ -53,7 +53,8 @@ fn main() {
         cfg.thresholds.candidate_sim
     );
     let ir = cfg.normalize.normalizer == Normalizer::Ir && reprise::frontend::has_ir_frontend(lang);
-    let outcome = reprise::au::anti_unify(&ua.tree, &ub.tree, lang.profile(), ir);
+    let profile = (!ir).then(|| lang.profile());
+    let outcome = reprise::au::anti_unify(&ua.tree, &ub.tree, profile, ir);
     println!(
         "AU: divergence={:.3} (max {}), holes={} (max {}), factorable={}",
         outcome.divergence,
