@@ -126,6 +126,14 @@ fn scan_finds_language_partitioned_groups() {
 fn scan_reports_cross_directory_boost_and_line_spans() {
     let repo = build_repo();
     let report = reprise::scan(repo.path(), &Config::default()).unwrap();
+    // Guard against a vacuous pass: the corpus deterministically yields one
+    // rust + one python group (see `scan_finds_language_partitioned_groups`).
+    assert_eq!(
+        report.groups.len(),
+        2,
+        "expected 2 groups: {:#?}",
+        report.groups
+    );
     for group in &report.groups {
         assert!(group.value > 0.0);
         for m in &group.members {

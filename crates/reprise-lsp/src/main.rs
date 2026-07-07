@@ -22,6 +22,15 @@ struct Backend {
     /// Files we last published diagnostics to, so stale ones can be cleared when
     /// a rescan no longer finds them.
     published: Mutex<HashSet<PathBuf>>,
+    /// Serializes `refresh`. tower-lsp-server dispatches notification handlers
+    /// concurrently (the `LanguageServer` bound is `Send + Sync`), so an
+    /// editor "save all" can overlap several `refresh` calls. Without this,
+    /// they would run N redundant full-workspace scans and race the
+    /// `published` read-modify-write into a lost update — leaving a stale
+    /// diagnostic that no later rescan would ever clear. An *async* mutex
+    /// because it is held across the scan's `.await` points; a `std` mutex
+    /// must never be held across an await.
+    refresh_lock: tokio::sync::Mutex<()>,
 }
 
 impl Backend {
@@ -30,13 +39,23 @@ impl Backend {
             client,
             root: Mutex::new(None),
             published: Mutex::new(HashSet::new()),
+            refresh_lock: tokio::sync::Mutex::new(()),
         }
     }
 
     /// Rescan the workspace and (re)publish diagnostics, clearing files that no
-    /// longer have findings. No-op until a root is known. The guards are all
-    /// released before any `.await` so the returned future stays `Send`.
+    /// longer have findings. No-op until a root is known. Serialized end-to-end
+    /// via `refresh_lock` so concurrent invocations neither duplicate scans nor
+    /// race the `published` update (see the field doc). The `std::sync::Mutex`
+    /// guards (`root`, `published`) are each released before any `.await`, so
+    /// the returned future stays `Send`; only the async `refresh_lock` guard is
+    /// held across awaits.
     async fn refresh(&self) {
+        // Hold this for the whole scan→publish→published-update so it is atomic
+        // w.r.t. concurrent `refresh` calls and redundant overlapping scans
+        // collapse (the later caller waits, then re-scans once).
+        let _refresh_guard = self.refresh_lock.lock().await;
+
         let Some(root) = self.root.lock().unwrap().clone() else {
             return;
         };

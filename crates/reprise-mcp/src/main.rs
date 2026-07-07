@@ -124,12 +124,19 @@ impl Reprise {
 }
 
 /// Project a core `anyhow::Result<String>` (JSON) onto an MCP tool result: JSON
-/// text content on success, a JSON-RPC internal error carrying the reprise
-/// failure on error.
+/// text content on success; on failure a tool-level error result (`isError:
+/// true`) carrying the reprise failure text, so the model sees it and can
+/// self-correct. A tool-execution failure — a nonexistent path, a malformed
+/// `reprise.toml`, an unsupported-language rejection — is *not* a JSON-RPC
+/// protocol fault, so it must not become an `McpError` (which MCP clients
+/// render opaquely, hiding the message). `McpError` stays reserved for genuine
+/// transport/parameter faults (e.g. a task that fails to join).
 fn into_result(out: anyhow::Result<String>, context: &str) -> Result<CallToolResult, McpError> {
     match out {
         Ok(json) => Ok(CallToolResult::success(vec![ContentBlock::text(json)])),
-        Err(e) => Err(McpError::internal_error(format!("{context}: {e:#}"), None)),
+        Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+            "{context}: {e:#}"
+        ))])),
     }
 }
 
@@ -153,4 +160,44 @@ async fn main() -> anyhow::Result<()> {
     let service = Reprise::new().serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text_of(result: &CallToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .collect()
+    }
+
+    #[test]
+    fn tool_failure_is_a_tool_level_error_not_a_protocol_error() {
+        // A failure that originates *inside* the tool (here: a simulated bad
+        // input) must surface as a `CallToolResult` with `isError: true`, so
+        // the model sees the text and can self-correct — never as an
+        // `McpError` protocol fault (which clients render opaquely).
+        let out = into_result(
+            Err(anyhow::anyhow!("no such path: /nope")),
+            "reprise scan failed",
+        );
+        let result = out.expect("tool failures must not become protocol errors");
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            text_of(&result).contains("reprise scan failed: no such path: /nope"),
+            "error content must carry the context + reprise failure text"
+        );
+    }
+
+    #[test]
+    fn tool_success_carries_json_content() {
+        let result = into_result(Ok("{\"groups\":[]}".to_string()), "reprise scan failed")
+            .expect("success path");
+        assert_eq!(result.is_error, Some(false));
+        assert_eq!(text_of(&result), "{\"groups\":[]}");
+    }
 }

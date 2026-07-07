@@ -556,8 +556,12 @@ fn cli_check_exit_codes() {
 
 // ---- D37: user-feedback fixes (micro-regions in check, thin wrappers, hint) ----
 
-/// Two functions sharing a ~35-token idiom run (micro: below
-/// report.micro_region_tokens) plus one pair sharing a substantial run.
+/// a.py and b.py share only a ~35-token env-copy idiom (micro: below
+/// `report.micro_region_tokens`), embedded in two otherwise-unrelated
+/// functions — there is no substantial shared run. So this test guards exactly
+/// one thing: micro-region *suppression* in `check` — a sub-threshold
+/// exact-region run must never surface as a drift finding. Hence the single
+/// negative assertion; there is no substantial region to positively assert.
 #[test]
 fn check_emits_only_substantial_regions() {
     let dir = tempfile::TempDir::new().unwrap();
