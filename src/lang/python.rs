@@ -389,12 +389,26 @@ fn is_self_call(node: &NormNode, name: &str) -> bool {
         && child_field(node, "function").is_some_and(|f| is_raw_ident(f, name))
 }
 
+/// Nested callable kinds — a `return <self-call>` inside a nested `def`/`lambda`
+/// is the INNER function's tail position, not the outer unit's. Descending into
+/// it would emit `continue` outside any loop and reassign the outer params,
+/// while the shared `count_self_calls` census still counts the nested call
+/// (`replaced == total`) so the bad lowering would commit. Stopping descent
+/// leaves the nested call uncounted → `replaced != total` → the unit safely
+/// bails out of recursion lowering.
+fn is_nested_callable(kind: &str) -> bool {
+    matches!(kind, "function_definition" | "lambda")
+}
+
 fn rewrite_tail_sites(
     mut node: NormNode,
     name: &str,
     params: &[Box<str>],
     replaced: &mut u32,
 ) -> NormNode {
+    if is_nested_callable(node.kind.as_ref()) {
+        return node; // a self-call inside a nested closure is not a tail site
+    }
     if node.kind.as_ref() == "block" {
         let mut out = Vec::with_capacity(node.children.len());
         for child in node.children {

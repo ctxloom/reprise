@@ -66,7 +66,16 @@ pub const GRAMMAR_VERSIONS: &[&str] = &[
 /// cliff previously extracted a *full* tree and now extracts a truncated one — so its cached
 /// FileUnits could differ from a cold re-extraction. Bumped to keep the D19 hit-≡-cold
 /// invariant: a one-time global cache regen.
-pub const EXTRACTION_VERSION: u32 = 5;
+///
+/// v6: correctness fixes to the HISTORICAL per-language normalizers change their canonical
+/// output for affected units — Go grouped parameters/`var`/`const` names (`func f(a, b int)`,
+/// `var a, b int`) are now fully counted/declared instead of first-only (fixing a mislowered
+/// grouped-param recursion and mis-abstracted trailing names); the TS switch `break` inside a
+/// loop is no longer rewritten as the loop's `return`; and TS/Python/Kotlin recursion lowering
+/// no longer descends into nested closures/local functions (which produced a `continue` outside
+/// any loop). The IR node-set is unchanged (so `ir::kind::SCHEME_VERSION` stays put), but these
+/// historical fingerprints move, so the cache must invalidate: a one-time global cache regen.
+pub const EXTRACTION_VERSION: u32 = 6;
 
 /// Cache key for one source file (D8: the version-keying IS the filename).
 pub fn key(rel_path: &str, content: &str, cfg: &Config) -> u128 {

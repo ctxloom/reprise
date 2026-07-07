@@ -552,12 +552,35 @@ fn is_self_call(node: &NormNode, name: &str) -> bool {
         && child_field(node, "function").is_some_and(|f| is_raw_ident(f, name))
 }
 
+/// Nested callable kinds — a `return <self-call>` inside one of these is the
+/// INNER function's tail position, not the outer unit's, so recursion lowering
+/// must not reach into it (else it emits `continue` outside any loop, reassigns
+/// the outer params, and the shared `count_self_calls` census still counts the
+/// nested call so `replaced == total` and the bad lowering commits). Stopping
+/// descent here leaves the nested call uncounted → `replaced != total` → the
+/// whole unit safely bails out of recursion lowering. Runs pre-desugar, so
+/// arrows are still `arrow_function`.
+fn is_nested_callable(kind: &str) -> bool {
+    matches!(
+        kind,
+        "arrow_function"
+            | "function_expression"
+            | "function_declaration"
+            | "generator_function"
+            | "generator_function_declaration"
+            | "method_definition"
+    )
+}
+
 fn rewrite_tail_sites(
     mut node: NormNode,
     name: &str,
     params: &[Box<str>],
     replaced: &mut u32,
 ) -> NormNode {
+    if is_nested_callable(node.kind.as_ref()) {
+        return node; // a self-call inside a nested closure is not a tail site
+    }
     if node.kind.as_ref() == "statement_block" {
         let mut out = Vec::with_capacity(node.children.len());
         for child in node.children {
@@ -788,6 +811,14 @@ fn replace_breaks(
     top: bool,
 ) {
     if !top && profile.is_loop_core(node) {
+        return;
+    }
+    // A `break` inside a switch targets the SWITCH, not the loop, so it must
+    // stay a switch exit — never become the loop's `return`. Don't descend into
+    // switch bodies (the lowered nested loops are already stopped above; a
+    // labeled `break foo` carries a label child, so the `is_empty` guard below
+    // never rewrites it either).
+    if node.kind.as_ref() == "switch_statement" {
         return;
     }
     let mut i = 0;

@@ -6,7 +6,7 @@ use reprise::config::Config;
 use reprise::lang::Lang;
 
 mod common;
-use common::{fp, is_test_unit, pair_tier, pair_tier_cfg};
+use common::{assert_no_orphan_continue, fp, is_test_unit, pair_tier, pair_tier_cfg};
 
 // ---------- t1: comments + whitespace ----------
 
@@ -150,6 +150,17 @@ fn kt_unrelated_functions_do_not_converge() {
         pair_tier(&[("aa.kt", a), ("bb.kt", b)]).is_none(),
         "unrelated functions must not converge"
     );
+}
+
+// ---------- recursion lowering must not reach into nested local functions ----------
+
+#[test]
+fn kt_nested_local_fun_self_call_is_not_a_tail_site() {
+    // `return f(n - 1)` inside the nested local `fun g` is g's tail, not `f`'s.
+    // Recursion lowering must not rewrite it into `n = n - 1; continue` — that emits
+    // a `continue` with no enclosing loop. The unit safely bails out of lowering.
+    let src = "fun f(n: Int): Int {\n    if (n <= 0) return 0\n    fun g(): Int { return f(n - 1) }\n    return f(n - 1)\n}\n";
+    assert_no_orphan_continue(src, Lang::Kotlin);
 }
 
 // ---------- unit_is_test recognition (@Test annotation) ----------

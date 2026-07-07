@@ -174,6 +174,40 @@ fn go_unrelated_functions_do_not_converge() {
     );
 }
 
+// ---------- grouped parameters / var / const (repeated `name` field) ----------
+
+#[test]
+fn go_grouped_param_recursion_stays_distinct_from_infinite_loop() {
+    // `func f(a, b int)` groups a and b under ONE parameter_declaration (a repeated
+    // `name` field). Undercounting to just `a` made the tail call `f(a-1, b+a)` (2
+    // args) fail arity against the 1 counted param, so every self-call collapsed to a
+    // bare `continue` and the a/b update vanished — the body became a trivial infinite
+    // loop. It must stay DISTINCT from an actual infinite loop.
+    let rec = "package main\nfunc f(a, b int) int {\n\treturn f(a-1, b+a)\n}\n";
+    let spin = "package main\nfunc g(a, b int) int {\n\tfor {\n\t\tcontinue\n\t}\n}\n";
+    assert_ne!(
+        fp(rec, Lang::Go),
+        fp(spin, Lang::Go),
+        "grouped-param tail recursion carries an `a, b = a-1, b+a` update — it must not \
+         collapse to a bare infinite loop"
+    );
+}
+
+#[test]
+fn go_grouped_param_trailing_name_is_declared_local() {
+    // The TRAILING grouped param (`b` in `func f(a, b int)`) must be collected as a
+    // declared local. If it leaks out as external, it is name-sensitive, so two
+    // Type-2-renamed grouped-param functions (b↔q) would wrongly DIVERGE. They must
+    // converge — the trailing name is a rename-invariant local, not an external.
+    let a = "package main\nfunc f(a, b int) int {\n\treturn a + b\n}\n";
+    let b = "package main\nfunc h(p, q int) int {\n\treturn p + q\n}\n";
+    assert_eq!(
+        fp(a, Lang::Go),
+        fp(b, Lang::Go),
+        "trailing grouped param must be a declared local (rename-invariant), not external"
+    );
+}
+
 // ---------- unit_is_test recognition (TestXxx in _test.go) ----------
 
 #[test]

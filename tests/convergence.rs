@@ -5,7 +5,7 @@
 use reprise::lang::Lang;
 
 mod common;
-use common::{fp, fp_ir};
+use common::{assert_no_orphan_continue, fp, fp_ir};
 
 // ---------- Type-1: whitespace + comments ----------
 
@@ -679,4 +679,13 @@ fn python_pure_atomic_guard_merges_with_flat_and_ir() {
         fp_ir(rs_flat, Lang::Rust),
         "a merged pure-atomic Rust guard nest must converge with the flat `&&`",
     );
+}
+
+#[test]
+fn python_nested_def_self_call_is_not_a_tail_site() {
+    // `return f(n - 1)` inside the nested `def g` is g's tail, not `f`'s. Recursion
+    // lowering must not rewrite it into `n = n - 1; continue` — that emits a `continue`
+    // with no enclosing loop. The unit safely bails out of lowering instead.
+    let src = "def f(n):\n    if n <= 0:\n        return 0\n    def g():\n        return f(n - 1)\n    return f(n - 1)\n";
+    assert_no_orphan_continue(src, Lang::Python);
 }

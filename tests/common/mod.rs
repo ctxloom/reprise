@@ -69,3 +69,81 @@ pub fn is_test_unit(src: &str, filename: &str, lang: Lang) -> bool {
     assert_eq!(units.len(), 1);
     units[0].is_test
 }
+
+/// Assert the historical loop/recursion-lowered tree of the OUTER unit in `src` has no orphan
+/// `continue` — one with no enclosing loop core. A nested callable resets the loop context (a
+/// `continue` inside a closure never targets an outer loop), so a `continue` that lands inside
+/// a nested closure/local function with no loop of its own is an invalid rewrite. This is the
+/// nested-closure recursion-lowering defect: `return <self-call>` inside a nested closure is
+/// the INNER callable's tail, not the outer unit's — lowering it emits `continue` outside any
+/// loop. Runs the pre-abstraction passes so `continue` is still recognizable by kind
+/// (`continue_statement`, TS/Python) or by raw label (`identifier "continue"`, Kotlin).
+pub fn assert_no_orphan_continue(src: &str, lang: Lang) {
+    use reprise::tree::{Label, NormNode};
+
+    fn node_count(n: &NormNode) -> usize {
+        1 + n.children.iter().map(node_count).sum::<usize>()
+    }
+    fn is_continue(n: &NormNode) -> bool {
+        n.kind.as_ref() == "continue_statement"
+            || (n.kind.as_ref() == "identifier"
+                && matches!(&n.label, Some(Label::Raw(t) | Label::External(t)) if t.as_ref() == "continue"))
+    }
+    fn is_callable(kind: &str) -> bool {
+        matches!(
+            kind,
+            "arrow_function"
+                | "function_expression"
+                | "function_declaration"
+                | "method_definition"
+                | "lambda_literal"
+                | "anonymous_function"
+                | "function_definition"
+                | "lambda"
+        )
+    }
+    fn is_loop(kind: &str) -> bool {
+        matches!(
+            kind,
+            "while_statement" | "for_statement" | "for_in_statement"
+        )
+    }
+    fn walk(n: &NormNode, loop_depth: u32) {
+        if is_callable(n.kind.as_ref()) {
+            for c in &n.children {
+                walk(c, 0); // a nested callable resets the loop context
+            }
+            return;
+        }
+        if is_continue(n) {
+            assert!(
+                loop_depth > 0,
+                "`continue` outside any loop — recursion lowering descended into a nested closure"
+            );
+        }
+        let depth = if is_loop(n.kind.as_ref()) {
+            loop_depth + 1
+        } else {
+            loop_depth
+        };
+        for c in &n.children {
+            walk(c, depth);
+        }
+    }
+
+    let raw = reprise::normalize::raw_units_from_source(src, lang);
+    assert!(!raw.is_empty(), "expected at least one unit in:\n{src}");
+    // The outer unit contains the nested callable, so it has the most nodes (a nested `def`/
+    // `fun`/`const g = …` is also extracted as its own unit).
+    let outer = raw
+        .into_iter()
+        .map(|(_, t)| t)
+        .max_by_key(node_count)
+        .unwrap();
+    let profile = lang.profile();
+    let tree = profile.lower_recursion(outer);
+    let tree = profile.rewrite_iteration(tree);
+    let tree = profile.lower_loops(tree);
+    let tree = profile.normalize_loop_exit(tree);
+    walk(&tree, 0);
+}

@@ -46,9 +46,6 @@ xxhash-rust = { version = "0.8.16", features = ["xxh3"] }
 [target.'cfg(target_env = "musl")'.dependencies]
 mimalloc = "0.1"
 
-[dev-dependencies]
-tempfile = "3.27.0"
-
 # The root crate is also the workspace root. Server surfaces live in additive
 # crates under crates/ (docs/SERVERS.md D-SRV-2) so the CLI's buildless,
 # tokio-free, single-static-binary profile is untouched — `cargo build`

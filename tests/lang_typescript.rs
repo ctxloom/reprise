@@ -6,7 +6,7 @@ use reprise::config::Config;
 use reprise::lang::Lang;
 
 mod common;
-use common::{fp, is_test_unit, pair_tier, pair_tier_cfg};
+use common::{assert_no_orphan_continue, fp, is_test_unit, pair_tier, pair_tier_cfg};
 
 // ---------- t1: comments + whitespace ----------
 
@@ -213,6 +213,51 @@ fn duplicated_const_arrows_converge() {
         pair_tier(&[("aa.ts", a), ("bb.ts", b)]).is_some(),
         "two duplicated const-arrow functions should form a group"
     );
+}
+
+// ---------- switch `break` targets the switch, not the loop ----------
+
+#[test]
+fn ts_switch_break_is_not_rewritten_as_loop_return() {
+    // An unlabeled `break` inside a `switch` exits the SWITCH, not the enclosing loop.
+    // This function is loop-exit-normalizable (a `while (true)` core with a trailing
+    // `return x`), so the `break` in `if (x > 10) break` correctly becomes the loop's
+    // `return x`. But the rewrite must NOT descend into the switch and turn
+    // `case 1: break` into `return x` too — that models the wrong control flow (the
+    // switch would return from the function instead of exiting the switch). Asserted on
+    // the TREE, not a fingerprint: a `field`-label quirk (a synthesized field-less
+    // `return_statement` vs a natural `return_statement[body]`) otherwise masks the bug.
+    let src = "function f(x: number): number {\n  while (true) {\n    switch (x) {\n      case 1: break;\n      default: x++;\n    }\n    if (x > 10) break;\n  }\n  return x;\n}\n";
+    let raw = reprise::normalize::raw_units_from_source(src, Lang::TypeScript);
+    let p = Lang::TypeScript.profile();
+    let t = p.lower_recursion(raw.into_iter().next().unwrap().1);
+    let t = p.rewrite_iteration(t);
+    let t = p.lower_loops(t);
+    let t = p.normalize_loop_exit(t);
+
+    fn switch_keeps_break(n: &reprise::tree::NormNode) -> bool {
+        fn has_break(n: &reprise::tree::NormNode) -> bool {
+            n.kind.as_ref() == "break_statement" || n.children.iter().any(has_break)
+        }
+        (n.kind.as_ref() == "switch_statement" && has_break(n))
+            || n.children.iter().any(switch_keeps_break)
+    }
+    assert!(
+        switch_keeps_break(&t),
+        "switch `break` must survive loop-exit normalization (not be rewritten as the loop's return)"
+    );
+}
+
+// ---------- recursion lowering must not reach into nested closures ----------
+
+#[test]
+fn ts_nested_closure_self_call_is_not_a_tail_site() {
+    // `return f(n - 1)` inside the nested arrow `g` is the ARROW's tail, not `f`'s.
+    // Recursion lowering must not rewrite it into `n = n - 1; continue;` — that emits
+    // a `continue` with no enclosing loop (the closure has none). The unit safely bails
+    // out of lowering instead, so the normalized tree stays valid.
+    let src = "function f(n: number): number {\n  if (n <= 0) { return 0; }\n  const g = () => { return f(n - 1); };\n  return f(n - 1);\n}\n";
+    assert_no_orphan_continue(src, Lang::TypeScript);
 }
 
 // ---------- unit_is_test recognition (spec §5.1) ----------

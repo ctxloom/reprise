@@ -86,7 +86,10 @@ impl LanguageProfile for GoProfile {
                     }
                 }
                 "parameter_declaration" => {
-                    if let Some(name) = child_field(node, "name") {
+                    // `name` is a REPEATED field (`func f(a, b int)` groups both
+                    // under one node) — collect every name, not `child_field`'s
+                    // first-only (undercount → grouped names bound as external).
+                    for name in name_fields(node) {
                         push_idents(name, out);
                     }
                 }
@@ -96,7 +99,8 @@ impl LanguageProfile for GoProfile {
                     }
                 }
                 "var_spec" | "const_spec" => {
-                    if let Some(name) = child_field(node, "name") {
+                    // `name` is a REPEATED field here too (`var a, b int`).
+                    for name in name_fields(node) {
                         push_idents(name, out);
                     }
                 }
@@ -572,13 +576,34 @@ fn simple_params(root: &NormNode) -> Option<Vec<Box<str>>> {
         if p.kind.as_ref() != "parameter_declaration" {
             return None; // variadic / unnamed: bail
         }
-        let name = child_field(p, "name")?;
-        match &name.label {
-            Some(Label::Raw(text)) if name.kind.as_ref() == "identifier" => out.push(text.clone()),
-            _ => return None,
+        // `name` is a REPEATED field: `func f(a, b int)` groups both names under
+        // one `parameter_declaration` (matching the IR frontend, frontend/go.rs).
+        // Taking only the first (`child_field`) undercounts the params, so a
+        // grouped-param self-call `f(x, y)` fails arity vs the 1 counted param
+        // and mislowers the recursion.
+        let before = out.len();
+        for name in name_fields(p) {
+            match &name.label {
+                Some(Label::Raw(text)) if name.kind.as_ref() == "identifier" => {
+                    out.push(text.clone())
+                }
+                _ => return None,
+            }
+        }
+        if out.len() == before {
+            return None; // unnamed parameter (no `name` field): bail
         }
     }
     Some(out)
+}
+
+/// Every child of `node` in the repeated `name` field. tree-sitter-go groups
+/// `func f(a, b int)` / `var a, b int` / `const a, b = …` names under one node
+/// via a REPEATED `name` field, so `child_field` (first-only) undercounts them.
+fn name_fields(node: &NormNode) -> impl Iterator<Item = &NormNode> {
+    node.children
+        .iter()
+        .filter(|c| c.field.as_deref() == Some("name"))
 }
 
 fn is_self_call(node: &NormNode, name: &str) -> bool {
