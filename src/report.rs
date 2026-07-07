@@ -44,6 +44,19 @@ impl fmt::Display for Tier {
 }
 
 impl Tier {
+    /// Every tier, in confidence order — the single list `parse_fail_on`
+    /// iterates so the name↔rank mapping can't drift from `Display`/`fail_rank`.
+    pub const ALL: &'static [Tier] = &[
+        Tier::InconsistentUpdate,
+        Tier::ExactNormalized,
+        Tier::InternalRepeat,
+        Tier::NearNormalized,
+        Tier::ExactRegion,
+        Tier::InlineAssisted,
+        Tier::ApiProfile,
+        Tier::WeakSimilarity,
+    ];
+
     /// Position in the §6 confidence order for the CI gate; `None` for tiers
     /// that NEVER fail CI (api-profile, weak-similarity). A finding fails iff
     /// `fail_rank(tier) <= fail_rank(fail_on threshold)`.
@@ -60,23 +73,25 @@ impl Tier {
     }
 
     /// Parse a `fail_on` value (config `[report].fail_on` or `--fail-on`):
-    /// a failable tier name, or "none" to disable the gate.
+    /// a failable tier name, or "none" to disable the gate. Derived from the
+    /// single `ALL`/`fail_rank` source of truth — a tier's name and its gate
+    /// rank can't disagree because both come from the tier itself.
     pub fn parse_fail_on(s: &str) -> anyhow::Result<Option<u32>> {
-        let rank = match s {
-            "none" => None,
-            "inconsistent-update" => Some(0),
-            "exact-normalized" => Some(1),
-            "internal-repeat" => Some(2),
-            "exact-region" => Some(3),
-            "near-normalized" => Some(4),
-            "inline-assisted" => Some(5),
-            other => anyhow::bail!(
-                "unknown fail_on tier `{other}` (expected inconsistent-update, \
-                 exact-normalized, internal-repeat, exact-region, near-normalized, \
-                 inline-assisted, or none)"
-            ),
-        };
-        Ok(rank)
+        if s == "none" {
+            return Ok(None);
+        }
+        for &tier in Tier::ALL {
+            // Only failable tiers (`fail_rank().is_some()`) are valid thresholds;
+            // api-profile/weak never gate, so their names aren't accepted here.
+            if tier.fail_rank().is_some() && tier.to_string() == s {
+                return Ok(tier.fail_rank());
+            }
+        }
+        anyhow::bail!(
+            "unknown fail_on tier `{s}` (expected inconsistent-update, \
+             exact-normalized, internal-repeat, exact-region, near-normalized, \
+             inline-assisted, or none)"
+        )
     }
 }
 
@@ -131,6 +146,9 @@ pub struct Stats {
     pub regions_substantial: usize,
     pub files_scanned: usize,
     pub files_skipped_generated: usize,
+    /// Files dropped because they could not be read as UTF-8 text (I/O error or
+    /// non-UTF-8 source): surfaced so the scan can't silently shrink (spec §2).
+    pub files_unreadable: usize,
     pub units_indexed: usize,
     pub units_below_floor: u32,
     pub parse_degraded_units: usize,
@@ -233,11 +251,18 @@ impl ScanReport {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
+        // Surface unreadable-file drops only when nonzero — a silent shrink otherwise.
+        let unreadable = if s.files_unreadable > 0 {
+            format!(" ({} unreadable)", s.files_unreadable)
+        } else {
+            String::new()
+        };
         let mut out = format!(
-            "reprise scan: {} files, {} units indexed ({} below floor, {} parse-degraded, \
+            "reprise scan: {} files{}, {} units indexed ({} below floor, {} parse-degraded, \
              {} suppressed), inline [{} variants, {} scc units, {} ambiguity skips], \
              {} api signatures, cache [{} hits, {} misses], findings [{}] in {}ms\n",
             s.files_scanned,
+            unreadable,
             s.units_indexed,
             s.units_below_floor,
             s.parse_degraded_units,
@@ -345,13 +370,21 @@ fn render_group(out: &mut String, rank: usize, group: &Group, verbose: bool) {
     } else {
         String::new()
     };
+    // The api-profile tier overloads `token_count` with its shared-rare-callee
+    // count (there is no normalized token mass — no shared structural form), so
+    // it needs an accurate label; every other tier prints normalized tokens.
+    let count_label = if group.tier == Tier::ApiProfile {
+        format!("{} shared rare callees", group.token_count)
+    } else {
+        format!("{} tokens", group.token_count)
+    };
     out.push_str(&format!(
-        "\n#{} [{}] value {:.0} · {} members · {} tokens{}\n",
+        "\n#{} [{}] value {:.0} · {} members · {}{}\n",
         rank,
         group.tier,
         group.value,
         group.members.len(),
-        group.token_count,
+        count_label,
         similarity,
     ));
     for member in &group.members {

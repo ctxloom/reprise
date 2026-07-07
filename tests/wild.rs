@@ -76,28 +76,47 @@ fn wild_pairs_converge_under_the_ir_normalizer() {
     let mut cfg = Config::default();
     cfg.cache.enabled = false;
     cfg.normalize.normalizer = "ir".into();
-    // (fixture, converges under IR). w7: the residual `min_seq_tokens` fork. w8: non-finding.
-    let ir_expect: &[(&str, bool)] = &[
-        ("w1_gin_marshalxml", true),
-        ("w2_ripgrep_bytecount", true),
-        ("w3_ripgrep_sort", true),
-        ("w4_serde_end", true),
-        ("w5_serde_tagorcontent", true),
-        ("w6_flask_maxprops", true),
-        ("w7_click_chunkpump", false),
-        ("w8_ripgrep_convert", false),
-        ("w9_ripgrep_cpufeatures", true),
+    // (fixture, expected IR result): `None` = must NOT converge; `Some((tier, members))` = a group
+    // at `tier` with at least `members` must exist. This is a stronger gate than a bare
+    // converges/doesn't bool — it also pins the tier and member floor, catching a tier *downgrade*
+    // or a lost member. The IR tiers are NOT the historical labels: w1 lands at `exact-normalized`
+    // under IR (the ~18% more compact canonical tree turns gin's near-clone into an exact match),
+    // vs `near-normalized` on the historical path. w7 is the residual `min_seq_tokens` fork; w8 is
+    // the by-design non-finding.
+    let ir_expect: &[(&str, Option<(&str, usize)>)] = &[
+        ("w1_gin_marshalxml", Some(("exact-normalized", 2))),
+        ("w2_ripgrep_bytecount", Some(("exact-normalized", 2))),
+        ("w3_ripgrep_sort", Some(("exact-normalized", 2))),
+        ("w4_serde_end", Some(("exact-normalized", 2))),
+        ("w5_serde_tagorcontent", Some(("near-normalized", 2))),
+        ("w6_flask_maxprops", Some(("near-normalized", 2))),
+        ("w7_click_chunkpump", None),
+        ("w8_ripgrep_convert", None),
+        ("w9_ripgrep_cpufeatures", Some(("internal-repeat", 1))),
     ];
-    for (dir, converges) in ir_expect {
+    for (dir, expect) in ir_expect {
         let root = wild_root().join(dir);
         let report = reprise::scan(&root, &cfg)
             .unwrap_or_else(|e| panic!("IR scan of wild fixture {dir} failed: {e}"));
-        assert_eq!(
-            !report.groups.is_empty(),
-            *converges,
-            "wild fixture {dir} under IR: expected converges={converges}, groups: {:#?}",
-            report.groups
-        );
+        match expect {
+            None => assert!(
+                report.groups.is_empty(),
+                "wild fixture {dir} under IR must NOT converge, groups: {:#?}",
+                report.groups
+            ),
+            Some((tier, members)) => {
+                let hit = report
+                    .groups
+                    .iter()
+                    .find(|g| g.tier.to_string() == *tier && g.members.len() >= *members);
+                assert!(
+                    hit.is_some(),
+                    "wild fixture {dir} under IR must converge at {tier} with >= {members} members, \
+                     groups: {:#?}",
+                    report.groups
+                );
+            }
+        }
     }
     // Gap B lock-in: flask's `max_content_length`/`max_form_memory_size` near-clone offers only
     // 4 shared aligned subtrees on the compact IR tree — below the historical 5-vote histogram

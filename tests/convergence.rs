@@ -2,24 +2,10 @@
 //! Type-1/Type-2 variants must produce equal exact structural hashes;
 //! genuinely different code must not.
 
-use reprise::config::Config;
 use reprise::lang::Lang;
 
-fn fp(src: &str, lang: Lang) -> u128 {
-    let cfg = Config::default();
-    let units = reprise::units_from_source(src, lang, &cfg);
-    assert_eq!(units.len(), 1, "expected exactly one unit in:\n{src}");
-    units[0].fingerprint
-}
-
-/// Fingerprint under the IR normalizer (`[normalize] normalizer = "ir"`).
-fn fp_ir(src: &str, lang: Lang) -> u128 {
-    let mut cfg = Config::default();
-    cfg.normalize.normalizer = "ir".into();
-    let units = reprise::units_from_source(src, lang, &cfg);
-    assert_eq!(units.len(), 1, "expected exactly one unit in:\n{src}");
-    units[0].fingerprint
-}
+mod common;
+use common::{fp, fp_ir};
 
 // ---------- Type-1: whitespace + comments ----------
 
@@ -200,6 +186,49 @@ fn drain(n: i64) -> i64 {
     assert_eq!(fp(a, Lang::Rust), fp(b, Lang::Rust));
 }
 
+#[test]
+fn rust_while_stays_distinct_from_do_while_loop() {
+    // `while cond { body }` synthesizes the break-guard at the TOP of the loop body; the
+    // do-while equivalent `loop { body; if !cond { break } }` guards at the BOTTOM (the body
+    // always runs at least once). Identical bodies — the guard position must survive, so they
+    // stay distinct (a normalizer that canonicalized guard position would wrongly collapse them).
+    let while_top = r#"
+fn drain(n: i64) -> i64 {
+    let mut k = n;
+    let mut steps = 0;
+    while k > 0 {
+        k -= 2;
+        steps += 1;
+    }
+    steps
+}
+"#;
+    let loop_bottom = r#"
+fn drain(n: i64) -> i64 {
+    let mut k = n;
+    let mut steps = 0;
+    loop {
+        k -= 2;
+        steps += 1;
+        if !(k > 0) {
+            break;
+        }
+    }
+    steps
+}
+"#;
+    assert_ne!(
+        fp(while_top, Lang::Rust),
+        fp(loop_bottom, Lang::Rust),
+        "while (guard-first) must stay distinct from the do-while loop (guard-last, historical)"
+    );
+    assert_ne!(
+        fp_ir(while_top, Lang::Rust),
+        fp_ir(loop_bottom, Lang::Rust),
+        "while (guard-first) must stay distinct from the do-while loop (guard-last, IR default)"
+    );
+}
+
 // ---------- Python: `while cond` and `while True: if not cond: break` converge ----------
 
 #[test]
@@ -275,6 +304,30 @@ fn rust_while_index_near_misses_stay_distinct_ir() {
         fp_ir(use_index, Lang::Rust),
         fp_ir(RUST_FOREACH, Lang::Rust),
         "index used for its own sake",
+    );
+}
+
+#[test]
+fn python_counter_used_after_block_does_not_rewrite_ir() {
+    // oozy-rover minor c: Python names are FUNCTION-scoped, so a counter `i` used AFTER its
+    // enclosing block is still live. The old block-scoped liveness check only saw the `if`
+    // body's siblings, so it wrongly rewrote the loop to foreach — dropping the `i = 0` init
+    // and the index binding the later `print(i)` reads. The whole-unit scan must see that
+    // post-loop use and keep the loop distinct (NO CounterIter edit).
+    let live = "def f(xs, cond):\n    if cond:\n        i = 0\n        while i < len(xs):\n            g(xs[i])\n            i += 1\n    print(i)\n";
+    let (ir, _) = reprise::frontend::lower_python_source(live).unwrap();
+    assert!(
+        reprise::ir::detect_counter_iter(&ir).is_empty(),
+        "a counter used after its enclosing block must NOT be rewritten to foreach",
+    );
+    // Control: the SAME loop with the index DEAD after the block still rewrites (one edit) —
+    // the whole-unit scan must not stop legitimate rewrites (guards against an over-eager fix).
+    let dead = "def f(xs, cond):\n    if cond:\n        i = 0\n        while i < len(xs):\n            g(xs[i])\n            i += 1\n    print(0)\n";
+    let (ir2, _) = reprise::frontend::lower_python_source(dead).unwrap();
+    assert_eq!(
+        reprise::ir::detect_counter_iter(&ir2).len(),
+        1,
+        "a counter dead after its block should still rewrite to foreach",
     );
 }
 
@@ -422,6 +475,22 @@ fn independent_decomposition_does_not_collide_with_unrelated_pair_ir() {
     );
 }
 
+#[test]
+fn swap_with_mt_named_source_var_decomposes_correctly_ir() {
+    // oozy-rover minor d: the cycle-break temp names (`__mt{n}`) must be DISJOINT from the names
+    // already in the assign. A swap whose own variable is literally named `__mt0` (`a, __mt0 =
+    // __mt0, a`) is still just a two-variable swap, so it must converge with the ordinary swap
+    // `a, b = b, a`. The old minter reused `__mt0`, clobbering the real one and producing a
+    // corrupt decomposition that diverged.
+    let ordinary = "def f(a, b):\n    a, b = b, a\n    return a\n";
+    let collides = "def f(a, __mt0):\n    a, __mt0 = __mt0, a\n    return a\n";
+    assert_eq!(
+        fp_ir(collides, Lang::Python),
+        fp_ir(ordinary, Lang::Python),
+        "a swap whose var is named `__mt0` must decompose like any other two-var swap",
+    );
+}
+
 // ---------- Rust implicit tail-return ≡ explicit return (IR path, spec §5.2) ----------
 //
 // A Rust function-body tail expression is an implicit `return` (`fn f() -> T { … expr }` ≡
@@ -474,5 +543,140 @@ fn rust_tail_expression_stays_distinct_from_statement_ir() {
         fp_ir(statement, Lang::Rust),
         fp_ir(tail, Lang::Rust),
         "a `;`-terminated statement must not converge with a tail return",
+    );
+}
+
+// ---------- Canonical-IR pass correctness batch (SCHEME_VERSION 4) ----------
+
+#[test]
+fn nested_index_loop_does_not_retarget_inner_loop_ir() {
+    // slow-wind: retargeting the OUTER index loop's iterator to `xs` must not recurse into the
+    // inner loop and rewrite ITS `__has_next(ys)`/`__next(ys)` to `xs`. `for i in 0..xs.len() {
+    // for y in ys { g(xs[i], y) } }` iterates ys at the inner level, so it must stay DISTINCT
+    // from the form that iterates xs at BOTH levels.
+    let outer_index =
+        "fn f(xs: &[i64], ys: &[i64]) { for i in 0..xs.len() { for y in ys { g(xs[i], y); } } }";
+    let both_xs = "fn f(xs: &[i64], ys: &[i64]) { for x in xs { for y in xs { g(x, y); } } }";
+    assert_ne!(
+        fp_ir(outer_index, Lang::Rust),
+        fp_ir(both_xs, Lang::Rust),
+        "the inner loop must keep iterating ys, not be retargeted to xs",
+    );
+    // And it DOES converge with the proper foreach (outer→xs, inner untouched over ys).
+    let proper = "fn f(xs: &[i64], ys: &[i64]) { for x in xs { for y in ys { g(x, y); } } }";
+    assert_eq!(
+        fp_ir(outer_index, Lang::Rust),
+        fp_ir(proper, Lang::Rust),
+        "the outer index loop must converge with the proper nested foreach",
+    );
+}
+
+#[test]
+fn non_tail_recursion_is_not_lowered_ir() {
+    // armed-mower: a bare self-call inside a loop body is NON-tail (its synthesized `continue`
+    // would bind the inner loop, and the post-order `process(n)` after it would be dropped).
+    // Lowering it wrongly wraps the body in a recursion `Loop`; a post-order tree-walk must keep
+    // its recursive self-call. `lower_python_source` already runs tail-recursion lowering.
+    let (ir, _) = reprise::frontend::lower_python_source(
+        "def walk(n):\n    for c in n.children:\n        walk(c)\n    process(n)\n",
+    )
+    .unwrap();
+    let s = reprise::ir::to_sexpr(&ir);
+    // Exactly ONE Loop (the lowered `for`) — NOT wrapped in an extra recursion loop.
+    assert_eq!(
+        s.matches("(Loop").count(),
+        1,
+        "non-tail recursion must not be wrapped in a recursion loop: {s}"
+    );
+    // No synthesized `continue` replaced the self-call.
+    assert!(
+        !s.contains("(Continue)"),
+        "non-tail self-call wrongly lowered to a continue: {s}"
+    );
+}
+
+#[test]
+fn arity_mismatch_tail_call_is_not_lowered_ir() {
+    // oozy-rover a: a self-call whose arity does not match the params (`f(a+1)` vs `f(a, b)`)
+    // can't build a parallel reassignment; the buggy path emitted a bare `continue` (dropping
+    // the `a+1` update) and collapsed to an infinite loop. It must stay recursive/distinct.
+    let recursive = "fn f(a: i64, b: i64) -> i64 { if a > 10 { return a; } return f(a + 1); }";
+    let infinite = "fn f(a: i64, b: i64) -> i64 { loop { if a > 10 { return a; } } }";
+    assert_ne!(
+        fp_ir(recursive, Lang::Rust),
+        fp_ir(infinite, Lang::Rust),
+        "an arity-mismatch tail call must not collapse to an infinite loop",
+    );
+}
+
+#[test]
+fn non_breaking_counter_guard_stays_distinct_ir() {
+    // oozy-rover b: a guard whose arm is NOT a bare `break` (`if !(i<len) { log(); }`) is a
+    // different, non-terminating loop. Rewriting it to a foreach would delete the `log()` body
+    // (dropped with guard[0]) and falsely converge with `for x in xs { g(x) }`.
+    let non_breaking = "fn f(xs: &[i64]) { let mut i = 0; loop { if !(i < xs.len()) { log_overflow(); } g(xs[i]); i += 1; } }";
+    let foreach = "fn f(xs: &[i64]) { for x in xs { g(x); } }";
+    assert_ne!(
+        fp_ir(non_breaking, Lang::Rust),
+        fp_ir(foreach, Lang::Rust),
+        "a non-breaking guard loop must not collapse to a foreach",
+    );
+}
+
+#[test]
+fn python_guard_merge_uses_and_token_not_ampersand() {
+    // askew-taps: a merged Python `if a and c: if b:` nest must synthesize the Python `and`
+    // token, never `&&` (which no Python source produces). The nest carries `a and c`, so the
+    // token family is derivable locally from the subtree.
+    let (ir, _) = reprise::frontend::lower_python_source(
+        "def f(a, b, c):\n    if a and c:\n        if b:\n            g()\n",
+    )
+    .unwrap();
+    let s = reprise::ir::to_sexpr(&reprise::ir::guard_canonicalize(ir, Lang::Python));
+    assert_eq!(
+        s.matches("(Branch").count(),
+        1,
+        "the guards did not merge: {s}"
+    );
+    assert!(
+        !s.contains("(&&@op)"),
+        "the merged Python guard wrongly synthesized a `&&` token: {s}"
+    );
+}
+
+#[test]
+fn python_nested_conjunction_guard_merges_with_flat_and_ir() {
+    // askew-taps (convergence half): the merged nest's `and` chain must converge with the
+    // hand-written flat conjunction. A `&&` token would make convergence impossible.
+    let nested = "def f(a, b, c):\n    if a and c:\n        if b:\n            g()\n";
+    let flat = "def f(a, b, c):\n    if a and c and b:\n        g()\n";
+    assert_eq!(
+        fp_ir(nested, Lang::Python),
+        fp_ir(flat, Lang::Python),
+        "a merged Python guard nest must converge with the flat conjunction",
+    );
+}
+
+#[test]
+fn python_pure_atomic_guard_merges_with_flat_and_ir() {
+    // askew-taps residual: a PURE-ATOMIC Python nest (`if a: if b: g()`) carries NO boolean
+    // operator anywhere, so the merged conjunction token cannot be sniffed from the subtree —
+    // it must come from the LANGUAGE (`and` for Python). It must converge with the hand-written
+    // flat `if a and b:`. A hardcoded `&&` default (no Python source can emit it) diverges.
+    let nested = "def f(a, b):\n    if a:\n        if b:\n            g()\n";
+    let flat = "def f(a, b):\n    if a and b:\n        g()\n";
+    assert_eq!(
+        fp_ir(nested, Lang::Python),
+        fp_ir(flat, Lang::Python),
+        "a merged pure-atomic Python guard nest must converge with the flat `and`",
+    );
+    // No regression for Rust: a pure-atomic Rust nest still merges with the `&&` token, so it
+    // converges with the hand-written `if a && b`.
+    let rs_nested = "fn f(a: bool, b: bool) { if a { if b { g(); } } }";
+    let rs_flat = "fn f(a: bool, b: bool) { if a && b { g(); } }";
+    assert_eq!(
+        fp_ir(rs_nested, Lang::Rust),
+        fp_ir(rs_flat, Lang::Rust),
+        "a merged pure-atomic Rust guard nest must converge with the flat `&&`",
     );
 }

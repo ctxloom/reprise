@@ -10,6 +10,7 @@
 use crate::fingerprint::{HashMode, merkle, merkle_mode};
 use crate::lang::LanguageProfile;
 use crate::tree::{Label, NormNode};
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -45,12 +46,17 @@ struct Ctx<'a> {
     next_hole: u32,
     /// Memo of input-subtree hashes keyed by node ADDRESS: exact merkle +
     /// sorted MaskedAll subtree-hash multiset (whose len is the D1 token
-    /// count — one hash per node). Sound because both input trees are
-    /// borrowed, hence immovable, for the whole `anti_unify` call. Before
-    /// this cache, `au_list` recomputed `merkle`/`collect_hashes` from
-    /// scratch for every DP CELL of the similarity matrix — the dominant
-    /// cost of the near tier at 500k LOC (M4a perf pass; output-identical
-    /// by construction).
+    /// count — one hash per node). Sound ONLY because every node ever passed
+    /// to `node_info` is borrowed from one of the two original input trees,
+    /// which are immovable for the whole `anti_unify` call — so no address is
+    /// ever reused for a different node mid-call. This invariant is load-
+    /// bearing: `flatten_operands` therefore collects `&NormNode` INTO the
+    /// input tree (never clones into a transient `Vec` that would free —
+    /// freeing under a stale entry lets the allocator hand the address to a
+    /// later node and return the wrong hash/token-count). Before this cache,
+    /// `au_list` recomputed `merkle`/`collect_hashes` from scratch for every
+    /// DP CELL of the similarity matrix — the dominant cost of the near tier
+    /// at 500k LOC (M4a perf pass; output-identical by construction).
     memo: HashMap<usize, (u128, Rc<Vec<u128>>)>,
 }
 
@@ -207,8 +213,8 @@ fn au(a: &NormNode, b: &NormNode, ctx: &mut Ctx) -> NormNode {
         if a.children[1].kind != b.children[1].kind {
             return hole(a, b, ctx);
         }
-        let mut ops_a = Vec::new();
-        let mut ops_b = Vec::new();
+        let mut ops_a: Vec<&NormNode> = Vec::new();
+        let mut ops_b: Vec<&NormNode> = Vec::new();
         flatten_operands(a, &a.kind.clone(), &a.children[1].kind.clone(), &mut ops_a);
         flatten_operands(b, &b.kind.clone(), &b.children[1].kind.clone(), &mut ops_b);
         if ops_a.len() > 2 || ops_b.len() > 2 || ops_a.len() != ops_b.len() {
@@ -234,20 +240,34 @@ fn au(a: &NormNode, b: &NormNode, ctx: &mut Ctx) -> NormNode {
 }
 
 /// Graded alignment of child lists (NW with gap penalty; matched pairs recurse).
-fn au_list(xs: &[NormNode], ys: &[NormNode], ctx: &mut Ctx) -> Vec<NormNode> {
+///
+/// Generic over `Borrow<NormNode>` so the same code aligns owned child slices
+/// (`&[NormNode]`) and borrowed operand chains (`&[&NormNode]` from
+/// `flatten_operands`) — the borrowed form is mandatory for memo soundness (see
+/// `Ctx::memo`); it monomorphizes to the identity borrow for the owned case.
+fn au_list<T: Borrow<NormNode>>(xs: &[T], ys: &[T], ctx: &mut Ctx) -> Vec<NormNode> {
     const GAP: f64 = -0.30;
-    const MATCH_BIAS: f64 = -0.35; // sim below this prefers gaps
+    // A per-pair match-quality bias, NOT a gap-preference threshold: a pair scores
+    // `sim + MATCH_BIAS`, a gap-gap trade scores `2*GAP`, so a pair wins whenever
+    // `sim > 2*GAP - MATCH_BIAS = -0.25` — i.e. ALWAYS for sim ∈ [0,1]. MATCH_BIAS
+    // therefore only breaks ties between near-equal alignments and shrinks the
+    // template of a marginal pairing; it never makes a real pair lose to gaps.
+    const MATCH_BIAS: f64 = -0.35;
     let n = xs.len();
     let m = ys.len();
     if n * m > 40_000 {
         // Degenerate size: single two-sided hole.
-        let ra: Vec<&NormNode> = xs.iter().collect();
-        let rb: Vec<&NormNode> = ys.iter().collect();
+        let ra: Vec<&NormNode> = xs.iter().map(Borrow::borrow).collect();
+        let rb: Vec<&NormNode> = ys.iter().map(Borrow::borrow).collect();
         return vec![run_hole(&ra, &rb, ctx)];
     }
     let sims: Vec<Vec<f64>> = xs
         .iter()
-        .map(|x| ys.iter().map(|y| similarity(x, y, ctx)).collect())
+        .map(|x| {
+            ys.iter()
+                .map(|y| similarity(x.borrow(), y.borrow(), ctx))
+                .collect()
+        })
         .collect();
     let mut dp = vec![vec![0.0f64; m + 1]; n + 1];
     for i in 1..=n {
@@ -303,10 +323,10 @@ fn au_list(xs: &[NormNode], ys: &[NormNode], ctx: &mut Ctx) -> Vec<NormNode> {
         match (oi, oj) {
             (Some(x), Some(y)) => {
                 flush(&mut out, &mut gap_a, &mut gap_b, ctx);
-                out.push(au(&xs[x], &ys[y], ctx));
+                out.push(au(xs[x].borrow(), ys[y].borrow(), ctx));
             }
-            (Some(x), None) => gap_a.push(&xs[x]),
-            (None, Some(y)) => gap_b.push(&ys[y]),
+            (Some(x), None) => gap_a.push(xs[x].borrow()),
+            (None, Some(y)) => gap_b.push(ys[y].borrow()),
             (None, None) => unreachable!(),
         }
     }
@@ -319,10 +339,20 @@ fn au_list(xs: &[NormNode], ys: &[NormNode], ctx: &mut Ctx) -> Vec<NormNode> {
 /// Hashes come from the per-call memo (`Ctx::node_info`) — computed once per
 /// node, not once per DP cell.
 fn similarity(a: &NormNode, b: &NormNode, ctx: &mut Ctx) -> f64 {
-    // Synthetic lowering machinery (the small guard/bind statements) must GAP
-    // against real code — gapped it costs nothing; paired it pollutes
-    // divergence. Scoped to the machinery statements themselves: a whole loop
-    // CONTAINS the markers but must still pair (e.g. with REPEAT).
+    // Synthetic lowering machinery (the small guard/bind statements) vs real code:
+    // zero the pair similarity to DISCOURAGE pairing them. This is a soft tie-break,
+    // NOT an enforced gap — with the NW constants in `au_list` a pair still beats a
+    // gap-gap trade for any sim ≥ 0 (a pair scores sim+MATCH_BIAS, gap-gap scores
+    // 2*GAP, and 2*GAP−MATCH_BIAS = −0.25 < 0), so equal-length lists still ALIGN the
+    // machinery against real code positionally. The rule is fully effective only where
+    // list lengths already force the machinery into a ONE-SIDED, all-synthetic gap run,
+    // which `run_hole` leaves uncounted (its `synthetic` branch); zeroing sim only
+    // nudges the DP toward that gap when it is otherwise a close call. (A whole loop
+    // CONTAINS the markers but is not itself machinery, so it still pairs, e.g. with
+    // REPEAT.) Making the gap unconditionally achievable — a negative sentinel here, so
+    // gap-gap beats pairing — was tried and produced NO mutation-recall or full-suite
+    // change (the recall benches sit at a 100% ceiling), so enforcing it is a DEFERRED
+    // behavioral question: it needs its own recall+precision study on real corpora.
     if ctx.is_machinery(a) != ctx.is_machinery(b) {
         return 0.0;
     }
@@ -368,15 +398,20 @@ fn collect_hashes(node: &NormNode, out: &mut Vec<u128>) {
 
 /// Collect operands of a same-kind, same-operator chain (mirrors the
 /// normalize-pass flatten; template-only shape, rebuilding is not needed).
-fn flatten_operands(node: &NormNode, kind: &str, op: &str, out: &mut Vec<NormNode>) {
+///
+/// Collects BORROWS into the input tree, never clones: every operand handed on
+/// to `au_list`/`node_info` must outlive the whole `anti_unify` call so the
+/// address-keyed memo stays sound (see `Ctx::memo`). Cloning into a transient
+/// `Vec` — which then frees — is a use-after-free of the memo key.
+fn flatten_operands<'a>(node: &'a NormNode, kind: &str, op: &str, out: &mut Vec<&'a NormNode>) {
     if node.kind.as_ref() == kind
         && node.children.len() == 3
         && node.children[1].kind.as_ref() == op
     {
         flatten_operands(&node.children[0], kind, op, out);
-        out.push(node.children[2].clone());
+        out.push(&node.children[2]);
     } else {
-        out.push(node.clone());
+        out.push(node);
     }
 }
 

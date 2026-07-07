@@ -15,7 +15,7 @@ use crate::lang::{Lang, LanguageProfile, child_field};
 use crate::report::{Group, Tier};
 use crate::tree::{Label, NormNode};
 use crate::unit::{self, Unit};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// Signature element: callee name + control context.
 type Elem = (Box<str>, u8, bool, bool);
@@ -171,8 +171,7 @@ fn api_groups_for_lang(
         let mut min_mass = 0.0f64;
         let mut max_mass = 0.0f64;
         let mut shared: Vec<(&Elem, u32)> = Vec::new();
-        let keys: HashSet<&Elem> = a.elems.keys().chain(b.elems.keys()).collect();
-        for elem in keys {
+        for elem in union_keys(&a.elems, &b.elems) {
             let ca = a.elems.get(elem).copied().unwrap_or(0);
             let cb = b.elems.get(elem).copied().unwrap_or(0);
             let w = idf(&elem.0);
@@ -229,6 +228,21 @@ fn api_groups_for_lang(
         });
     }
     groups
+}
+
+/// The union of two signatures' element keys, in a single **deterministic**
+/// (sorted, `BTreeMap`) order.
+///
+/// The pair-scoring loop accumulates f64 masses, and f64 addition is
+/// non-associative, so the iteration order is load-bearing: a `std` `HashSet`
+/// here (per-process `RandomState` seed) makes two scans of an *unchanged* repo
+/// emit byte-different `value`/`divergence` in their final ULPs — and, at a
+/// threshold-borderline `sim`, can flip a pair in or out of the report. Both
+/// `elems` maps are already sorted, so collecting their key chain into a
+/// `BTreeSet` deduplicates *and* fixes the order in one step (masses unchanged;
+/// only the order becomes deterministic).
+fn union_keys<'a>(a: &'a BTreeMap<Elem, u32>, b: &'a BTreeMap<Elem, u32>) -> BTreeSet<&'a Elem> {
+    a.keys().chain(b.keys()).collect()
 }
 
 fn render_elem(elem: &Elem, count: u32) -> String {
@@ -409,5 +423,66 @@ fn callee_name(function: &NormNode) -> Option<Box<str>> {
     match found {
         Some(name) if name.as_ref() == "__has_next" || name.as_ref() == "__next" => None,
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn elem(name: &str, depth: u8, branch: bool, tail: bool) -> Elem {
+        (name.into(), depth, branch, tail)
+    }
+
+    /// Regression for the api-profile nondeterminism bug: the pair-scoring loop
+    /// sums f64 masses (non-associative add) while iterating the union of the two
+    /// signatures' element keys. That union was built with a `std` `HashSet`
+    /// (per-process `RandomState` seed), so its iteration order — and thus the
+    /// final ULPs of `value`/`divergence`, and a threshold-borderline pair's
+    /// in/out decision — drifted run-to-run on an UNCHANGED repo.
+    ///
+    /// A differential (scan-twice-and-diff) test is unreliable here: within one
+    /// test process the seed can iterate the same order twice, so the drift never
+    /// shows. This guards the fix STRUCTURALLY instead — [`union_keys`] must yield
+    /// a single deterministic order: the sorted, deduplicated merge of both key
+    /// sets. Reverting `union_keys` to collect into a `HashSet` makes this fail
+    /// (its sequence is neither strictly ascending nor equal to the sorted merge).
+    #[test]
+    fn union_keys_is_the_sorted_deduped_merge() {
+        // Keys interleaved across the two maps, with one key shared, so a
+        // hash-ordered union would essentially never come out sorted.
+        let mut a: BTreeMap<Elem, u32> = BTreeMap::new();
+        let mut b: BTreeMap<Elem, u32> = BTreeMap::new();
+        for e in [
+            elem("zap", 0, false, false),
+            elem("open_widget", 1, false, false),
+            elem("finalize_registry", 0, false, true),
+            elem("shared_call", 2, true, false),
+        ] {
+            *a.entry(e).or_insert(0) += 1;
+        }
+        for e in [
+            elem("flush_widget", 1, true, false),
+            elem("alpha", 0, false, false),
+            elem("shared_call", 2, true, false), // present in both → deduped
+            elem("mega_helper", 3, false, true),
+        ] {
+            *b.entry(e).or_insert(0) += 1;
+        }
+
+        let ordered: Vec<&Elem> = union_keys(&a, &b).into_iter().collect();
+
+        // Strictly ascending — the invariant the order-sensitive f64 sum needs.
+        assert!(
+            ordered.windows(2).all(|w| w[0] < w[1]),
+            "union must iterate in a single deterministic (sorted) order: {ordered:?}"
+        );
+        // Exactly the sorted, deduplicated merge of both key sets.
+        let mut expected: Vec<&Elem> = a.keys().chain(b.keys()).collect();
+        expected.sort_unstable();
+        expected.dedup();
+        assert_eq!(ordered, expected);
+        // The shared key appears once (dedup), not twice.
+        assert_eq!(ordered.len(), 7);
     }
 }

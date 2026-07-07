@@ -7,6 +7,7 @@
 use crate::ir::edit::Edit;
 use crate::ir::kind;
 use crate::ir::transform::{TransformKind, TransformLog, Witness};
+use crate::lang::Lang;
 use crate::tree::{Label, NormNode};
 use std::collections::{HashMap, HashSet};
 
@@ -137,18 +138,26 @@ fn comm_sort_edits(node: &NormNode, out: &mut Vec<Edit>) -> NormNode {
         let operands: Vec<NormNode> = operands.iter().map(|o| comm_sort_edits(o, out)).collect();
         if operands.len() >= 2 {
             let order = sort_perm(&operands);
-            let sorted = order
+            let sorted: Vec<NormNode> = order
                 .iter()
                 .map(|&i| operands[i as usize].clone())
                 .collect();
-            out.push(Edit::CommSort {
-                locus: node.span,
-                order,
-            });
-            return rebuild_chain(sorted, op, node.field.clone());
+            // An already-sorted chain (identity permutation) emits NO edit — a no-op
+            // reorder is not a transform, and fabricating one would break detect
+            // idempotence on a canonical tree. Either way the chain is rebuilt from its
+            // (recursively canonicalized) operands with the ORIGINAL node span kept on
+            // the root, never collapsed to operands[0].span. Span is hash-excluded, so
+            // this changes no fingerprint.
+            if !order_is_identity(&order) {
+                out.push(Edit::CommSort {
+                    locus: node.span,
+                    order,
+                });
+            }
+            return rebuild_chain(sorted, op, node.field.clone(), node.span);
         }
     }
-    let mut n = node.clone();
+    let mut n = node.shallow_clone();
     n.children = node
         .children
         .iter()
@@ -161,7 +170,7 @@ fn comm_sort_edits(node: &NormNode, out: &mut Vec<Edit>) -> NormNode {
 /// `perm[k]` is the pre-sort index of the operand now at position `k`. Stable (ties
 /// keep source order), matching the historical `sort_by_cached_key`; recorded as the
 /// witness so reversal restores the original order (D-IR-9).
-fn sort_perm(operands: &[NormNode]) -> Vec<u32> {
+pub(crate) fn sort_perm(operands: &[NormNode]) -> Vec<u32> {
     let keys: Vec<String> = operands.iter().map(crate::ir::render::to_sexpr).collect();
     let mut perm: Vec<u32> = (0..operands.len() as u32).collect();
     perm.sort_by(|&a, &b| keys[a as usize].cmp(&keys[b as usize]));
@@ -186,11 +195,14 @@ pub(crate) fn flatten_chain(node: &NormNode, op: &str, out: &mut Vec<NormNode>) 
 }
 
 /// Rebuild a left-associative commutative chain over `operands` — the shared mutation
-/// [`crate::ir::edit::apply`] performs for a `CommSort`.
+/// [`crate::ir::edit::apply`] performs for a `CommSort`. `root_span` is stamped on the
+/// chain ROOT so a reorder preserves the original node's span (spans are excluded from
+/// fingerprints, so this is hash-neutral — it only keeps provenance honest).
 pub(crate) fn rebuild_chain(
     mut operands: Vec<NormNode>,
     op: NormNode,
     field: Option<Box<str>>,
+    root_span: (u32, u32),
 ) -> NormNode {
     let span = operands[0].span;
     let mut acc = operands.remove(0);
@@ -203,7 +215,14 @@ pub(crate) fn rebuild_chain(
         acc.children[0].field = Some("left".into());
     }
     acc.field = field;
+    acc.span = root_span;
     acc
+}
+
+/// A permutation is the identity when `perm[k] == k` for every position — the chain is
+/// already in canonical order, so a `CommSort` edit would be a fabricated no-op.
+pub(crate) fn order_is_identity(order: &[u32]) -> bool {
+    order.iter().enumerate().all(|(k, &v)| k as u32 == v)
 }
 
 // ---- Family A: relational/boolean canonicalization (§4.2, D-IR-13) ----
@@ -468,28 +487,30 @@ fn swap_binop(mut node: NormNode, new_op: &str) -> NormNode {
 /// that A then normalizes and comm-sort finally sorts). Detect-only — one
 /// [`GuardMerge`](Edit::GuardMerge) / [`DropElse`](Edit::DropElse) edit per site, so a fold
 /// cannot happen without [`crate::ir::edit::apply`] recording the event.
-pub fn detect_guard_canonicalize(root: &NormNode) -> Vec<Edit> {
+pub fn detect_guard_canonicalize(root: &NormNode, lang: Lang) -> Vec<Edit> {
     let mut edits = Vec::new();
-    guard_canon_edits(root, &mut edits);
+    guard_canon_edits(root, &mut edits, lang);
     edits
 }
 
 /// Convenience over the seam (tests): disabled sink → identical tree. See [`abstract_idents`].
-pub fn guard_canonicalize(node: NormNode) -> NormNode {
-    let edits = detect_guard_canonicalize(&node);
+pub fn guard_canonicalize(node: NormNode, lang: Lang) -> NormNode {
+    let edits = detect_guard_canonicalize(&node, lang);
     crate::ir::edit::apply(node, &edits, &mut TransformLog::disabled())
 }
 
 /// Bottom-up companion to [`detect_guard_canonicalize`]: canonicalize inner guards before this
 /// one (a merged inner branch becomes this node's sole body child, itself then mergeable),
 /// emit one edit per fold, and return the rewritten subtree so the walk stays in step with the
-/// applier.
-fn guard_canon_edits(node: &NormNode, out: &mut Vec<Edit>) -> NormNode {
-    let mut n = node.clone();
+/// applier. The conjunction token to synthesize for a C1 merge comes from the `lang`
+/// ([`Lang::conjunction_token`]) and rides ON the [`GuardMerge`](Edit::GuardMerge) edit, so the
+/// lang-less applier can replay it (a pure-atomic nest carries no boolean operator to sniff).
+fn guard_canon_edits(node: &NormNode, out: &mut Vec<Edit>, lang: Lang) -> NormNode {
+    let mut n = node.shallow_clone();
     n.children = node
         .children
         .iter()
-        .map(|c| guard_canon_edits(c, out))
+        .map(|c| guard_canon_edits(c, out, lang))
         .collect();
     // C2 · redundant-else: a block-level splice, one edit per else dropped (keyed to the block).
     let locus = n.span;
@@ -497,8 +518,12 @@ fn guard_canon_edits(node: &NormNode, out: &mut Vec<Edit>) -> NormNode {
         out.push(Edit::DropElse { locus });
     }
     // C1 · conjunction-merge (a node is a Block or a Branch, never both — no double-count).
-    if let Some(merged) = try_merge_branch(&n) {
-        out.push(Edit::GuardMerge { locus: n.span });
+    let op_tok = lang.conjunction_token();
+    if let Some(merged) = try_merge_branch(&n, op_tok) {
+        out.push(Edit::GuardMerge {
+            locus: n.span,
+            op_tok: op_tok.into(),
+        });
         return merged;
     }
     n
@@ -511,18 +536,10 @@ fn guard_canon_edits(node: &NormNode, out: &mut Vec<Edit>) -> NormNode {
 /// `Branch{ Arm{ g_outer && g_inner, body } }`. Returns `None` (no fold) for any other shape —
 /// an `else` on either branch, or extra statements around the inner `if`, where the merge would
 /// be unsound.
-pub(crate) fn try_merge_branch(node: &NormNode) -> Option<NormNode> {
-    let outer_arm = single_guarded_arm(node)?;
-    let outer_guard = arm_field(outer_arm, "guard")?;
-    let outer_body = arm_field(outer_arm, "body")?;
-    if outer_body.kind.as_ref() != kind::BLOCK || outer_body.children.len() != 1 {
-        return None;
-    }
-    let inner_arm = single_guarded_arm(&outer_body.children[0])?;
-    let inner_guard = arm_field(inner_arm, "guard")?;
-    let inner_body = arm_field(inner_arm, "body")?;
+pub(crate) fn try_merge_branch(node: &NormNode, op_tok: &str) -> Option<NormNode> {
+    let (outer_guard, inner_guard, inner_body) = merge_branch_parts(node)?;
     let span = node.span;
-    let guard = and_guard(outer_guard.clone(), inner_guard.clone(), span);
+    let guard = and_guard(outer_guard.clone(), inner_guard.clone(), span, op_tok);
     let mut body = inner_body.clone();
     body.field = Some("body".into());
     let arm = NormNode::new(kind::ARM, Some("arm"), span, vec![guard, body]);
@@ -532,6 +549,31 @@ pub(crate) fn try_merge_branch(node: &NormNode) -> Option<NormNode> {
         span,
         vec![arm],
     ))
+}
+
+/// The shape-only mergeability check for C1 (independent of the conjunction token): `node` is a
+/// single-arm, no-else `Branch{ Arm{ g_outer, Block{ inner } } }` whose sole body statement is
+/// itself a single-arm, no-else `Branch{ Arm{ g_inner, body } }`. Split out of
+/// [`try_merge_branch`] so the applier can decide to consume the [`GuardMerge`](Edit::GuardMerge)
+/// edit — and read its recorded token — BEFORE building. The token never affects mergeability, so
+/// the two paths agree on which nodes fire regardless of the language.
+pub(crate) fn is_mergeable_branch(node: &NormNode) -> bool {
+    merge_branch_parts(node).is_some()
+}
+
+/// The `(outer_guard, inner_guard, inner_body)` a C1 merge needs, or `None` for a non-mergeable
+/// shape (an `else` on either branch, or extra statements around the inner `if`).
+fn merge_branch_parts(node: &NormNode) -> Option<(&NormNode, &NormNode, &NormNode)> {
+    let outer_arm = single_guarded_arm(node)?;
+    let outer_guard = arm_field(outer_arm, "guard")?;
+    let outer_body = arm_field(outer_arm, "body")?;
+    if outer_body.kind.as_ref() != kind::BLOCK || outer_body.children.len() != 1 {
+        return None;
+    }
+    let inner_arm = single_guarded_arm(&outer_body.children[0])?;
+    let inner_guard = arm_field(inner_arm, "guard")?;
+    let inner_body = arm_field(inner_arm, "body")?;
+    Some((outer_guard, inner_guard, inner_body))
 }
 
 /// The sole `Arm` of a single-arm, no-else `Branch` (an `if` with no `else`): the branch has
@@ -551,12 +593,13 @@ fn arm_field<'a>(arm: &'a NormNode, field: &str) -> Option<&'a NormNode> {
         .find(|c| c.field.as_deref() == Some(field))
 }
 
-/// Build a conjunction guard `Binop{ l && r }@guard` — byte-identical to how a source
-/// `if l && r` lowers, so the merged nest converges with the hand-written conjunction.
-fn and_guard(mut l: NormNode, mut r: NormNode, span: (u32, u32)) -> NormNode {
+/// Build a conjunction guard `Binop{ l <op> r }@guard` — byte-identical to how a source
+/// `if l <op> r` lowers, so the merged nest converges with the hand-written conjunction. `op_tok`
+/// is the language's AND spelling ([`Lang::conjunction_token`]), replayed from the recorded edit.
+fn and_guard(mut l: NormNode, mut r: NormNode, span: (u32, u32), op_tok: &str) -> NormNode {
     l.field = Some("left".into());
     r.field = Some("right".into());
-    let op = NormNode::new("&&", Some("op"), span, Vec::new());
+    let op = NormNode::new(op_tok, Some("op"), span, Vec::new());
     NormNode::new(kind::BINOP, Some("guard"), span, vec![l, op, r])
 }
 
@@ -663,7 +706,7 @@ pub fn detect_dead(node: &NormNode) -> Vec<Edit> {
 /// historical post-order recursion), popping each trailing `Continue` and recording its
 /// locus, and return the stripped subtree so the walk stays in step with the applier.
 fn dead_edits(node: &NormNode, out: &mut Vec<Edit>) -> NormNode {
-    let mut n = node.clone();
+    let mut n = node.shallow_clone();
     n.children = node.children.iter().map(|c| dead_edits(c, out)).collect();
     if n.kind.as_ref() == kind::LOOP
         && let Some(body) = n
@@ -707,14 +750,17 @@ pub fn detect_loop_exit(node: &NormNode) -> Vec<Edit> {
 /// the historical post-order recursion) and return the folded subtree so the walk stays in
 /// step with the applier.
 fn loop_exit_edits(node: &NormNode, out: &mut Vec<Edit>) -> NormNode {
-    let mut n = node.clone();
+    let mut n = node.shallow_clone();
     n.children = node
         .children
         .iter()
         .map(|c| loop_exit_edits(c, out))
         .collect();
-    if n.kind.as_ref() == kind::BLOCK && fold_loop_exit(&mut n) {
-        out.push(Edit::LoopExit { locus: n.span });
+    if n.kind.as_ref() == kind::BLOCK {
+        let locus = n.span;
+        for _ in 0..fold_loop_exit(&mut n) {
+            out.push(Edit::LoopExit { locus });
+        }
     }
     n
 }
@@ -728,25 +774,41 @@ pub fn normalize_loop_exit(node: NormNode) -> NormNode {
 /// The shared loop-exit fold [`crate::ir::edit::apply`] performs for a
 /// [`LoopExit`](Edit::LoopExit): if `block`'s tail is `Loop{…}; Return{E}` and the loop has a
 /// top-level bare break, replace those breaks with `Return{E}` and drop the trailing return.
-/// Returns whether it fired (a firing block is exactly a detected site).
-pub(crate) fn fold_loop_exit(block: &mut NormNode) -> bool {
+/// Returns the NUMBER of folds performed here (0 ⇒ not a site).
+///
+/// Folds to a **fixpoint** (vile-apron): converting the loop's tail break to `Return{E}` can
+/// expose a fresh `[Loop, Return{E}]` tail *inside* that loop's own body (`loop { loop{…} break }
+/// return E` first folds the outer break, leaving `loop { loop{…} return E }` — itself a site
+/// the bottom-up walk has already passed). Re-running the fold on the mutated loop body converges
+/// the nested case in one pass and makes the pass idempotent. Detector and applier both drive
+/// this single helper, so the per-block fold *count* (edits emitted == edits consumed) matches.
+pub(crate) fn fold_loop_exit(block: &mut NormNode) -> u32 {
     let n = block.children.len();
     if n < 2 {
-        return false;
+        return 0;
     }
     let last = &block.children[n - 1];
     let is_return_value = last.kind.as_ref() == kind::RETURN && last.children.len() == 1;
     if !is_return_value || block.children[n - 2].kind.as_ref() != kind::LOOP {
-        return false;
+        return 0;
     }
     let value = block.children[n - 1].children[0].clone();
     let mut replaced = 0;
     replace_breaks(&mut block.children[n - 2], &value, &mut replaced, true);
-    if replaced > 0 {
-        block.children.truncate(n - 1);
-        return true;
+    if replaced == 0 {
+        return 0;
     }
-    false
+    block.children.truncate(n - 1);
+    // Recurse into the just-mutated loop's body — the break→return may have exposed a nested site.
+    let mut folds = 1;
+    if let Some(loop_body) = block.children.last_mut().and_then(|lp| {
+        lp.children
+            .iter_mut()
+            .find(|c| c.field.as_deref() == Some("body"))
+    }) {
+        folds += fold_loop_exit(loop_body);
+    }
+    folds
 }
 
 fn replace_breaks(node: &mut NormNode, value: &NormNode, replaced: &mut u32, top: bool) {
@@ -785,7 +847,7 @@ pub fn detect_iter_protocol(node: &NormNode) -> Vec<Edit> {
 /// one (mirrors the historical post-order recursion) and return the rewritten subtree, so a
 /// nested rewrite settles first and the walk stays in step with the applier.
 fn iter_protocol_edits(node: &NormNode, out: &mut Vec<Edit>) -> NormNode {
-    let mut n = node.clone();
+    let mut n = node.shallow_clone();
     n.children = node
         .children
         .iter()
@@ -977,6 +1039,13 @@ fn index_uses_only(node: &NormNode, ivar: &str, coll: &str) -> bool {
 /// Swap the range iterator inside a protocol `__has_next(ITER)` / `__next(ITER)` call for a
 /// bare `Var coll` (leaving the arg's field intact).
 fn retarget_iterator(node: &mut NormNode, _ivar: &str, coll: &str, span: (u32, u32)) {
+    // A nested loop owns its own iteration protocol — do NOT retarget its `__has_next`/`__next`
+    // to THIS loop's collection (slow-wind: recursing in would make the inner loop iterate `coll`
+    // too, a false convergence). Mirrors `replace_breaks`'s nested-loop stop. This loop's own
+    // protocol lives in its guard/bind (never inside a nested loop), so it is still reached.
+    if node.kind.as_ref() == kind::LOOP {
+        return;
+    }
     let is_protocol = node.kind.as_ref() == kind::CALL
         && node.children.iter().any(|c| {
             c.field.as_deref() == Some("callee")
@@ -1030,7 +1099,10 @@ fn replace_index(mut node: NormNode, ivar: &str, coll: &str) -> NormNode {
 /// [`crate::ir::edit::apply`] recording the event.
 pub fn detect_counter_iter(node: &NormNode) -> Vec<Edit> {
     let mut edits = Vec::new();
-    counter_iter_edits(node, &mut edits);
+    // `node` is the whole unit tree; pass it as the `root` for the counter's function-scoped
+    // liveness check (a counter used ANYWHERE outside the (init, loop) pair is live — oozy-rover
+    // minor c). It stays constant through the recursion so a nested block still sees the whole unit.
+    counter_iter_edits(node, node, &mut edits);
     edits
 }
 
@@ -1038,15 +1110,15 @@ pub fn detect_counter_iter(node: &NormNode) -> Vec<Edit> {
 /// nested counter loop settles first) and return the rewritten subtree, so the walk stays in
 /// step with the applier. Both sides drive the shared [`fold_counter_loops`], so the matches —
 /// and the emitted/consumed edit order — agree by construction.
-fn counter_iter_edits(node: &NormNode, out: &mut Vec<Edit>) -> NormNode {
-    let mut n = node.clone();
+fn counter_iter_edits(node: &NormNode, root: &NormNode, out: &mut Vec<Edit>) -> NormNode {
+    let mut n = node.shallow_clone();
     n.children = node
         .children
         .iter()
-        .map(|c| counter_iter_edits(c, out))
+        .map(|c| counter_iter_edits(c, root, out))
         .collect();
     let locus = n.span;
-    for (coll, ivar, _span) in fold_counter_loops(&mut n) {
+    for (coll, ivar, _span) in fold_counter_loops(&mut n, root) {
         out.push(Edit::CounterIter { locus, coll, ivar });
     }
     n
@@ -1069,17 +1141,17 @@ pub(crate) type CounterMatch = (Box<str>, Box<str>, (u32, u32));
 /// coll` lowers). Returns one `(coll, ivar, span)` per rewritten loop, in block order — a
 /// firing pair is exactly a detected site, so detector and applier stay in lockstep (like
 /// [`fold_loop_exit`]). A no-op on non-`Block` nodes.
-pub(crate) fn fold_counter_loops(block: &mut NormNode) -> Vec<CounterMatch> {
+pub(crate) fn fold_counter_loops(block: &mut NormNode, root: &NormNode) -> Vec<CounterMatch> {
     if block.kind.as_ref() != kind::BLOCK {
         return Vec::new();
     }
     let children = std::mem::take(&mut block.children);
-    // Match (init@k, loop@k+1) pairs immutably first — the "index var used only here"
-    // safety check needs to see every sibling, so a single streaming pass won't do.
+    // Match (init@k, loop@k+1) pairs immutably first — the "index var live nowhere else in the
+    // UNIT" safety check needs to see the whole `root`, so a single streaming pass won't do.
     let matched: Vec<Option<CounterMatch>> = (0..children.len())
         .map(|k| {
             (k + 1 < children.len())
-                .then(|| counter_loop_pair(&children, k))
+                .then(|| counter_loop_pair(&children, k, root))
                 .flatten()
         })
         .collect();
@@ -1108,10 +1180,13 @@ pub(crate) fn fold_counter_loops(block: &mut NormNode) -> Vec<CounterMatch> {
 /// safety restrictions (mirroring the range form's `index_uses_only`, plus the counter-loop
 /// specifics): the loop's guard is `!(ivar < len(coll))`, its tail is the unit increment
 /// `ivar = ivar + 1`, the init is `ivar = 0`, every use of `ivar` between guard and increment
-/// is exactly `coll[ivar]`, and `ivar` appears NOWHERE else in the block (a loop-local
-/// counter) — so a var mutated elsewhere, a different indexed collection, a non-unit stride,
-/// or an index used for its own sake all fail the match and stay distinct.
-fn counter_loop_pair(children: &[NormNode], k: usize) -> Option<CounterMatch> {
+/// is exactly `coll[ivar]`, and `ivar` appears NOWHERE else in the UNIT (a loop-local counter)
+/// — so a var mutated elsewhere, a different indexed collection, a non-unit stride, an index
+/// used for its own sake, or an index LIVE AFTER the enclosing block all fail the match and stay
+/// distinct. `root` is the whole unit tree, so the liveness scan is FUNCTION-scoped, not
+/// block-scoped: a Python counter read after the enclosing `if` block is still live (oozy-rover
+/// minor c) — a block-scoped scan misses it and would wrongly drop the live post-loop use.
+fn counter_loop_pair(children: &[NormNode], k: usize, root: &NormNode) -> Option<CounterMatch> {
     let loop_node = &children[k + 1];
     if loop_node.kind.as_ref() != kind::LOOP {
         return None;
@@ -1143,13 +1218,14 @@ fn counter_loop_pair(children: &[NormNode], k: usize) -> Option<CounterMatch> {
     {
         return None;
     }
-    // `ivar` is a loop-local counter: it must not appear in any other sibling (before the
-    // init or after the loop) — else the rewrite would drop a live use.
-    if !children
-        .iter()
-        .enumerate()
-        .all(|(j, c)| j == k || j == k + 1 || !mentions_raw(c, &ivar))
-    {
+    // `ivar` is a loop-local counter: it must appear NOWHERE in the unit outside the (init, loop)
+    // pair — else the rewrite (which drops the init + the index binding) would drop a live use.
+    // Python names are FUNCTION-scoped, so the scan must cover the whole `root`, not just this
+    // block's siblings: a counter read after the enclosing block (`if cond: <loop>; print(i)`) is
+    // still live (oozy-rover minor c). Count total mentions in the unit against the mentions
+    // inside the (init, loop) pair; any excess is a use elsewhere.
+    let within = count_raw_mentions(&children[k], &ivar) + count_raw_mentions(loop_node, &ivar);
+    if count_raw_mentions(root, &ivar) > within {
         return None;
     }
     Some((coll, ivar, loop_node.span))
@@ -1164,6 +1240,13 @@ fn counter_guard(branch: &NormNode) -> Option<(Box<str>, Box<str>)> {
     if arm.kind.as_ref() != kind::ARM {
         return None;
     }
+    // The arm body MUST be exactly a bare `break` — the loop-exit condition of a `for x in coll`.
+    // A non-breaking guard (`if !(i < len) { log(); }`) is a different loop that keeps running;
+    // matching it would let `rewrite_counter_loop` delete that body when it drops guard[0]
+    // (oozy-rover b), so it must stay distinct.
+    if !arm_field(arm, "body").is_some_and(is_bare_break_body) {
+        return None;
+    }
     let guard = arm
         .children
         .iter()
@@ -1173,6 +1256,17 @@ fn counter_guard(branch: &NormNode) -> Option<(Box<str>, Box<str>)> {
         return None;
     }
     Some((raw_text(left)?, len_collection(right)?))
+}
+
+/// `body` is exactly a bare `Break` — either the `Break` node directly, or a `Block` whose sole
+/// statement is one. (`break_guard` lowers the guard to `Block{ Break }`.)
+fn is_bare_break_body(body: &NormNode) -> bool {
+    let stmts: &[NormNode] = if body.kind.as_ref() == kind::BLOCK {
+        &body.children
+    } else {
+        std::slice::from_ref(body)
+    };
+    matches!(stmts, [b] if b.kind.as_ref() == kind::BREAK && b.children.is_empty())
 }
 
 /// The collection of a `len` call, either Rust `coll.len()` or Go/Python `len(coll)`.
@@ -1229,6 +1323,20 @@ fn mentions_raw(node: &NormNode, name: &str) -> bool {
     (node.kind.as_ref() == kind::VAR
         && matches!(&node.label, Some(Label::Raw(t)) if t.as_ref() == name))
         || node.children.iter().any(|c| mentions_raw(c, name))
+}
+
+/// How many `Raw` `Var`s named `name` occur in `node` (the counting form of [`mentions_raw`], for
+/// the counter's function-scoped liveness check: total mentions in the unit vs. mentions inside
+/// the (init, loop) pair — any excess is a live use elsewhere).
+fn count_raw_mentions(node: &NormNode, name: &str) -> usize {
+    let here = (node.kind.as_ref() == kind::VAR
+        && matches!(&node.label, Some(Label::Raw(t)) if t.as_ref() == name))
+        as usize;
+    here + node
+        .children
+        .iter()
+        .map(|c| count_raw_mentions(c, name))
+        .sum::<usize>()
 }
 
 /// Rewrite a matched counter `Loop` in place to the canonical iteration-protocol form — the
@@ -1307,7 +1415,7 @@ pub fn detect_multi_assign(root: &NormNode) -> Vec<Edit> {
 /// return the rewritten subtree, so the walk stays in step with the applier. Both sides drive
 /// the shared [`fold_multi_assign`], so the matches — and the emitted/consumed edit order — agree.
 fn multi_assign_edits(node: &NormNode, out: &mut Vec<Edit>) -> NormNode {
-    let mut n = node.clone();
+    let mut n = node.shallow_clone();
     n.children = node
         .children
         .iter()
@@ -1410,6 +1518,14 @@ fn sequentialize_parallel_assign(
     names: Vec<Box<str>>,
     span: (u32, u32),
 ) -> Vec<NormNode> {
+    // The cycle-break temps (`__mt{n}`) must be DISJOINT from every `Raw` name already in the
+    // assign — a source var literally named `__mt0` (`a, __mt0 = __mt0, a`) would otherwise be
+    // clobbered by a synthesized `__mt0`, corrupting the decomposition (oozy-rover minor d).
+    // Collect all mentioned names (targets + values) up front so minting can skip collisions.
+    let mut used: HashSet<Box<str>> = names.iter().cloned().collect();
+    for v in &values {
+        collect_raw_names(v, &mut used);
+    }
     // Drop identity pairs (`a_i = a_i`): a genuine no-op whose target is never disturbed, so it
     // imposes no ordering constraint and dropping it is always sound.
     let mut tgt = Vec::new();
@@ -1440,10 +1556,16 @@ fn sequentialize_parallel_assign(
         } else {
             // Deadlock ⇒ a read-after-write cycle. Break it: save the lowest-index remaining
             // target to a fresh temp, then read that temp everywhere it was read — freeing the
-            // target to be overwritten (the pair becomes ready next round).
+            // target to be overwritten (the pair becomes ready next round). The temp name is bumped
+            // past any `__mt{n}` already present (monotone `temp_ctr` keeps later temps distinct too).
             let i = *remaining.first().expect("remaining is non-empty");
-            let temp: Box<str> = format!("__mt{temp_ctr}").into();
-            temp_ctr += 1;
+            let temp: Box<str> = loop {
+                let cand: Box<str> = format!("__mt{temp_ctr}").into();
+                temp_ctr += 1;
+                if !used.contains(&cand) {
+                    break cand;
+                }
+            };
             out.push(temp_save(&temp, &name[i], span));
             for &j in &remaining {
                 substitute_raw(&mut val[j], &name[i], &temp);
@@ -1451,6 +1573,19 @@ fn sequentialize_parallel_assign(
         }
     }
     out
+}
+
+/// Collect every `Raw` `Var` name anywhere in `node` into `out` — the disjointness set the
+/// cycle-break temp minter avoids (so a synthesized `__mt{n}` never shadows a real name).
+fn collect_raw_names(node: &NormNode, out: &mut HashSet<Box<str>>) {
+    if node.kind.as_ref() == kind::VAR
+        && let Some(Label::Raw(t)) = &node.label
+    {
+        out.insert(t.clone());
+    }
+    for c in &node.children {
+        collect_raw_names(c, out);
+    }
 }
 
 /// `target = value` as a single `Assign`, the target keeping its `@place`/`@target` field and the
@@ -1517,7 +1652,7 @@ pub fn lower_tail_recursion(
     }
     let mut rewritten = body.clone();
     let mut replaced = 0;
-    rewrite_tail_sites(&mut rewritten, name, params, &mut replaced);
+    rewrite_tail_sites(&mut rewritten, name, params, &mut replaced, false, true);
     if replaced != total {
         return body; // the lone self-call was not a tail site — not linear recursion
     }
@@ -1551,28 +1686,56 @@ fn count_self_calls(node: &NormNode, name: &str) -> u32 {
             .sum::<u32>()
 }
 
-fn rewrite_tail_sites(node: &mut NormNode, name: &str, params: &[Box<str>], replaced: &mut u32) {
+/// Rewrite each tail self-call in `node` to its param-reassignment + `continue`. A `return
+/// f(..)` is a tail site anywhere. A **bare** self-call (statement position, result discarded)
+/// is a tail site ONLY as the FINAL statement of the function body's top-level block and NOT
+/// inside any loop (`top_level && !in_loop && i == last`) — a bare self-call mid-block, or in a
+/// loop body, is *non-tail* (armed-mower: a post-order side effect follows it, or a synthesized
+/// `continue` would bind the wrong loop). Any non-tail bare self-call is left unreplaced, so the
+/// `replaced != total` guard in [`lower_tail_recursion`] bails the whole lowering. A site whose
+/// arity does not match the params is likewise left unreplaced (see [`reassign_stmts`]).
+fn rewrite_tail_sites(
+    node: &mut NormNode,
+    name: &str,
+    params: &[Box<str>],
+    replaced: &mut u32,
+    in_loop: bool,
+    top_level: bool,
+) {
     if node.kind.as_ref() == kind::BLOCK {
+        let last = node.children.len().wrapping_sub(1);
         let mut out = Vec::with_capacity(node.children.len());
-        for child in std::mem::take(&mut node.children) {
+        for (i, child) in std::mem::take(&mut node.children).into_iter().enumerate() {
             let is_return_self = child.kind.as_ref() == kind::RETURN
                 && child.children.len() == 1
                 && is_self_call(&child.children[0], name);
+            let is_tail_bare = is_self_call(&child, name) && top_level && !in_loop && i == last;
             if is_return_self {
-                let call = child.children.into_iter().next().unwrap();
-                out.extend(reassign_stmts(&call, params, replaced));
-            } else if is_self_call(&child, name) {
-                out.extend(reassign_stmts(&child, params, replaced));
+                match reassign_stmts(&child.children[0], params, replaced) {
+                    Some(stmts) => out.extend(stmts),
+                    None => out.push(child), // arity mismatch — keep the original `return f(..)`
+                }
+            } else if is_tail_bare {
+                match reassign_stmts(&child, params, replaced) {
+                    Some(stmts) => out.extend(stmts),
+                    None => out.push(child), // arity mismatch — keep the original bare call
+                }
             } else {
+                // Descending out of the top-level tail position (into a branch arm, an
+                // expression, or a nested block): no longer `top_level`.
                 let mut c = child;
-                rewrite_tail_sites(&mut c, name, params, replaced);
+                rewrite_tail_sites(&mut c, name, params, replaced, in_loop, false);
                 out.push(c);
             }
         }
         node.children = out;
     } else {
+        // Crossing a `Loop` marks everything below it as in-loop, so a bare self-call inside a
+        // loop body is never treated as a tail site (its synthesized `continue` would restart the
+        // inner loop, not the recursion loop).
+        let deeper_in_loop = in_loop || node.kind.as_ref() == kind::LOOP;
         for c in &mut node.children {
-            rewrite_tail_sites(c, name, params, replaced);
+            rewrite_tail_sites(c, name, params, replaced, deeper_in_loop, false);
         }
     }
 }
@@ -1584,32 +1747,43 @@ fn rewrite_tail_sites(node: &mut NormNode, name: &str, params: &[Box<str>], repl
 /// reduce byte-identically (and a coupled swap gets its cycle-breaking temp instead of the old,
 /// unsound sequential rewrite). Params are `@place` mutations (matching the iterative form); the
 /// decomposition pass drops identity pairs and inserts minimal temps.
-fn reassign_stmts(call: &NormNode, params: &[Box<str>], replaced: &mut u32) -> Vec<NormNode> {
-    *replaced += 1;
+///
+/// Returns `None` — leaving the self-call in place and NOT counting it as `replaced` — when the
+/// call's arity does not match the param count (default/variadic params, or a wrong-arity call).
+/// A parallel reassignment can only be built when the args and params line up 1:1; emitting a
+/// bare `continue` on a mismatch would silently drop the argument update (oozy-rover a), so the
+/// site is refused and the `replaced != total` guard bails the whole lowering.
+fn reassign_stmts(
+    call: &NormNode,
+    params: &[Box<str>],
+    replaced: &mut u32,
+) -> Option<Vec<NormNode>> {
     let span = call.span;
     let args: Vec<&NormNode> = call
         .children
         .iter()
         .filter(|c| c.field.as_deref() == Some("arg"))
         .collect();
-    let mut out = Vec::new();
-    if args.len() == params.len() {
-        let mut children: Vec<NormNode> = params
-            .iter()
-            .map(|p| {
-                NormNode::new(kind::VAR, Some("place"), span, Vec::new())
-                    .with_label(Label::Raw(p.clone()))
-            })
-            .collect();
-        for arg in args {
-            let mut value = arg.clone();
-            value.field = Some("value".into());
-            children.push(value);
-        }
-        out.push(NormNode::new(kind::ASSIGN, None, span, children));
+    if args.len() != params.len() {
+        return None; // arity mismatch — not a sound reassignment; refuse the site
     }
-    out.push(NormNode::new(kind::CONTINUE, None, span, Vec::new()));
-    out
+    *replaced += 1;
+    let mut children: Vec<NormNode> = params
+        .iter()
+        .map(|p| {
+            NormNode::new(kind::VAR, Some("place"), span, Vec::new())
+                .with_label(Label::Raw(p.clone()))
+        })
+        .collect();
+    for arg in args {
+        let mut value = arg.clone();
+        value.field = Some("value".into());
+        children.push(value);
+    }
+    Some(vec![
+        NormNode::new(kind::ASSIGN, None, span, children),
+        NormNode::new(kind::CONTINUE, None, span, Vec::new()),
+    ])
 }
 
 #[cfg(test)]
@@ -1696,6 +1870,43 @@ mod tests {
             ev.witness,
             Witness::Order(vec![1, 0]),
             "the witness must record the pre-sort operand order"
+        );
+    }
+
+    #[test]
+    fn already_sorted_chain_emits_no_edit() {
+        // `a + b` is already in canonical (sorted) order, so detect_comm_sort must emit
+        // NO edit — a fabricated no-op reorder would break detect idempotence on a
+        // canonical tree. With no edit, `apply` is a total no-op, so the fingerprint
+        // (span-excluded s-expression) is byte-identical before and after.
+        let (ir, _) = lower_rust_source("fn f() { return a + b; }").unwrap();
+        let tree = abstract_idents(ir);
+        let edits = detect_comm_sort(&tree);
+        assert!(
+            edits.is_empty(),
+            "an already-sorted commutative chain must emit no CommSort edit"
+        );
+        let before = to_sexpr(&tree);
+        let after = to_sexpr(&crate::ir::edit::apply(
+            tree,
+            &edits,
+            &mut TransformLog::disabled(),
+        ));
+        assert_eq!(
+            before, after,
+            "the no-op comm-sort must not change the tree"
+        );
+    }
+
+    #[test]
+    fn comm_sort_is_idempotent() {
+        // Sorting `b + a` yields a canonical tree; re-running the detector on that
+        // output must emit no further edit (the fix's motivating idempotence property).
+        let (ir, _) = lower_rust_source("fn f() { return b + a; }").unwrap();
+        let sorted = comm_sorted(ir, &mut TransformLog::disabled());
+        assert!(
+            detect_comm_sort(&sorted).is_empty(),
+            "comm-sort must be idempotent on its own canonical output"
         );
     }
 
@@ -1897,7 +2108,11 @@ mod tests {
         // silently — a merged tree implies a recorded event (the CQRS write-side guarantee).
         let (ir, _) = lower_rust_source("fn f() { if a { if b { g(); } } }").unwrap();
         let mut log = TransformLog::new();
-        let merged = crate::ir::edit::apply(ir.clone(), &detect_guard_canonicalize(&ir), &mut log);
+        let merged = crate::ir::edit::apply(
+            ir.clone(),
+            &detect_guard_canonicalize(&ir, Lang::Rust),
+            &mut log,
+        );
         let s = to_sexpr(&merged);
         assert!(s.contains("(&&@op)"), "guards not merged into `&&`: {s}");
         assert_eq!(
@@ -1922,7 +2137,11 @@ mod tests {
             lower_rust_source("fn f(c: bool) -> i32 { if c { return 1; } else { g(); } h() }")
                 .unwrap();
         let mut log = TransformLog::new();
-        let out = crate::ir::edit::apply(ir.clone(), &detect_guard_canonicalize(&ir), &mut log);
+        let out = crate::ir::edit::apply(
+            ir.clone(),
+            &detect_guard_canonicalize(&ir, Lang::Rust),
+            &mut log,
+        );
         let s = to_sexpr(&out);
         // One arm left on the branch (the else is gone) and `g()` now sits as a sibling.
         assert_eq!(s.matches("(Arm").count(), 1, "else arm not dropped: {s}");

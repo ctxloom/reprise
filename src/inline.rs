@@ -37,7 +37,10 @@ impl Shapes {
     /// is `"ir"` and `lang` has a frontend, else the historical profile (which also
     /// covers the TS/Kotlin fallback under `normalizer = "ir"`, §9 P2).
     pub fn for_lang(lang: Lang, cfg: &Config) -> Shapes {
-        if cfg.normalize.normalizer == "ir" && crate::frontend::has_ir_frontend(lang) {
+        // Single IR-eligibility predicate, shared with the api tier's selector
+        // (`api::Shapes::for_lang`), so the two can't drift (they once re-spelled
+        // this condition independently).
+        if crate::unit::is_ir(lang, cfg) {
             Shapes::Ir(lang)
         } else {
             Shapes::Historical(lang.profile())

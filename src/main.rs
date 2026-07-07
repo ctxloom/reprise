@@ -75,11 +75,16 @@ Exit codes:
   1  findings at or above --fail-on (CI should fail)
   2  usage or runtime error (bad flag, unknown format, missing git ref)";
 
-/// Print to stdout, treating a closed pipe (`reprise scan | head`) as success.
-fn emit(text: &str) -> anyhow::Result<()> {
+/// Print to stdout, treating a closed pipe (`reprise scan | head`) as terminal. On a
+/// broken pipe the process exits with `broken_pipe_code` — 0 for `scan` (always clean),
+/// but the COMPUTED gate code for `check`, so `reprise check … | head` closing the pipe
+/// can never silently mask a CI-failing gate (spec §8 exit contract).
+fn emit(text: &str, broken_pipe_code: i32) -> anyhow::Result<()> {
     use std::io::Write;
     match std::io::stdout().write_all(text.as_bytes()) {
-        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => std::process::exit(0),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+            std::process::exit(broken_pipe_code)
+        }
         result => Ok(result?),
     }
 }
@@ -107,20 +112,28 @@ fn run() -> anyhow::Result<i32> {
         } => {
             let config = reprise::Config::load(&path)?;
             let report = reprise::scan(&path, &config)?;
+            // `scan` always exits 0, so a broken pipe exits 0 too.
             match format.as_str() {
-                "terminal" => {
-                    emit(&report.render_terminal(top.unwrap_or(config.report.top), verbose))?
-                }
-                "json" => emit(&format!("{}\n", serde_json::to_string_pretty(&report)?))?,
-                "sarif" => emit(&format!(
-                    "{}\n",
-                    reprise::formats::sarif::scan_sarif(&report, &path, &config, verbose)
-                ))?,
-                "cpd" => emit(&reprise::formats::cpd::scan_cpd(&report, &path, verbose))?,
-                "jscpd" => emit(&format!(
-                    "{}\n",
-                    reprise::formats::jscpd::scan_jscpd(&report, &path, verbose)
-                ))?,
+                "terminal" => emit(
+                    &report.render_terminal(top.unwrap_or(config.report.top), verbose),
+                    0,
+                )?,
+                "json" => emit(&format!("{}\n", serde_json::to_string_pretty(&report)?), 0)?,
+                "sarif" => emit(
+                    &format!(
+                        "{}\n",
+                        reprise::formats::sarif::scan_sarif(&report, &path, &config, verbose)
+                    ),
+                    0,
+                )?,
+                "cpd" => emit(&reprise::formats::cpd::scan_cpd(&report, &path, verbose), 0)?,
+                "jscpd" => emit(
+                    &format!(
+                        "{}\n",
+                        reprise::formats::jscpd::scan_jscpd(&report, &path, verbose)
+                    ),
+                    0,
+                )?,
                 other => {
                     bail!("unknown format `{other}` (expected: terminal, json, sarif, cpd, jscpd)")
                 }
@@ -141,24 +154,34 @@ fn run() -> anyhow::Result<i32> {
                     "no base ref: pass --base <ref> or pin one in reprise.toml ([baseline] ref = \"...\")"
                 ))?;
             let report = reprise::check::run(&path, &config, &base, fail_on.as_deref())?;
+            // Compute the gate code UP FRONT: exit 1 only for real findings, else 0
+            // (errors above already mapped to 2). A broken pipe (`… | head`) must exit
+            // with THIS code, not an unconditional 0 — else closing the pipe silently
+            // passes a gate that should fail CI.
+            let gate_code = if report.failed() { 1 } else { 0 };
             match format.as_str() {
-                "terminal" => emit(&report.render_terminal(verbose))?,
-                "json" => emit(&format!("{}\n", serde_json::to_string_pretty(&report)?))?,
-                "sarif" => emit(&format!(
-                    "{}\n",
-                    reprise::formats::sarif::check_sarif(&report, &path, &config)
-                ))?,
-                "cpd" => emit(&reprise::formats::cpd::check_cpd(&report, &path))?,
-                "jscpd" => emit(&format!(
-                    "{}\n",
-                    reprise::formats::jscpd::check_jscpd(&report, &path)
-                ))?,
+                "terminal" => emit(&report.render_terminal(verbose), gate_code)?,
+                "json" => emit(
+                    &format!("{}\n", serde_json::to_string_pretty(&report)?),
+                    gate_code,
+                )?,
+                "sarif" => emit(
+                    &format!(
+                        "{}\n",
+                        reprise::formats::sarif::check_sarif(&report, &path, &config)
+                    ),
+                    gate_code,
+                )?,
+                "cpd" => emit(&reprise::formats::cpd::check_cpd(&report, &path), gate_code)?,
+                "jscpd" => emit(
+                    &format!("{}\n", reprise::formats::jscpd::check_jscpd(&report, &path)),
+                    gate_code,
+                )?,
                 other => {
                     bail!("unknown format `{other}` (expected: terminal, json, sarif, cpd, jscpd)")
                 }
             }
-            // Exit 1 only for real findings; errors above already mapped to 2.
-            Ok(if report.failed() { 1 } else { 0 })
+            Ok(gate_code)
         }
     }
 }

@@ -517,6 +517,26 @@ fn api_profile_pairs_structurally_different_reimplementations() {
 }
 
 #[test]
+fn api_profile_terminal_labels_shared_rare_callees_not_tokens() {
+    // The api tier overloads `token_count` with its shared-rare-callee count
+    // (no normalized token mass exists — no shared structural form). The
+    // terminal must label it accurately, not as "{n} tokens".
+    let report = scan_snippets("rs", &[RS_API_A, RS_API_B]);
+    let g = &report.api_groups[0];
+    let n = g.token_count;
+    assert!(n >= 1, "the pair shares ≥1 rare callee");
+    let text = report.render_terminal(0, false);
+    assert!(
+        text.contains(&format!("{n} shared rare callees")),
+        "api finding must label shared rare callees, got:\n{text}"
+    );
+    assert!(
+        !text.contains(&format!("{n} tokens")),
+        "api finding must NOT read as a token count, got:\n{text}"
+    );
+}
+
+#[test]
 fn api_profile_pairs_structurally_different_reimplementations_ir() {
     // Same corpus on the IR normalizer: `extract_calls` must read `Call`/`External`/
     // canonical control-context off the lowered tree and emit the same *kind* of

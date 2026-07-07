@@ -13,7 +13,16 @@
 /// aug-assign/desugars, iteration-protocol + loop-exit passes, fold, destructure binds.
 /// Bumped to 3 for the relational-boolean-normalization batch — Family B desugars Go
 /// `i++`/`i--` and `+=`/`-=`/… through the `AugAssign` path (moves the Go canonical tree).
-pub const SCHEME_VERSION: u32 = 3;
+/// Bumped to 4 for the canonical-IR pass correctness batch — the loop/recursion/guard
+/// canonicalizers stop over-matching (nested-loop iterator retarget, non-tail recursion,
+/// arity-mismatch reassignment, non-breaking counter guards) and fold loop-exit to a
+/// fixpoint, so several constructs' canonical output (and merkle fingerprint) shifts.
+/// Bumped to 5 for the canonicalization-correctness batch — a pure-atomic Python guard nest
+/// now merges with the language's `and` token (not a hardcoded `&&`), the counter-loop
+/// iteration rewrite's liveness check became function-scoped (a counter used after its
+/// enclosing block no longer wrongly rewrites), and cycle-break temps are minted disjoint from
+/// existing `__mt{n}` names — each shifting its construct's canonical output (merkle fingerprint).
+pub const SCHEME_VERSION: u32 = 5;
 
 // ---- structural ----
 pub const UNIT: &str = "Unit";

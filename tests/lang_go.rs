@@ -3,54 +3,10 @@
 //! The canonical Go index loop (`for i:=0; i<len(xs); i++`) gets the
 //! iteration-protocol rewrite (spec §5.2.2).
 
-use reprise::config::Config;
 use reprise::lang::Lang;
-use std::fs;
-use std::path::Path;
-use tempfile::TempDir;
 
-fn fp(src: &str, lang: Lang) -> u128 {
-    let units = reprise::units_from_source(src, lang, &Config::default());
-    assert_eq!(units.len(), 1, "expected exactly one unit in:\n{src}");
-    units[0].fingerprint
-}
-
-/// Fingerprint under the IR normalizer (`[normalize] normalizer = "ir"`).
-fn fp_ir(src: &str, lang: Lang) -> u128 {
-    let mut cfg = Config::default();
-    cfg.normalize.normalizer = "ir".into();
-    let units = reprise::units_from_source(src, lang, &cfg);
-    assert_eq!(units.len(), 1, "expected exactly one unit in:\n{src}");
-    units[0].fingerprint
-}
-
-fn pair_tier(sources: &[(&str, &str)]) -> Option<String> {
-    let dir = TempDir::new().unwrap();
-    for (name, src) in sources {
-        fs::write(dir.path().join(name), src).unwrap();
-    }
-    let report = reprise::scan(dir.path(), &Config::default()).unwrap();
-    report
-        .groups
-        .iter()
-        .filter(|g| {
-            let fs: Vec<_> = g
-                .members
-                .iter()
-                .map(|m| m.file.to_string_lossy().to_string())
-                .collect();
-            fs.iter().any(|f| f.contains("aa.")) && fs.iter().any(|f| f.contains("bb."))
-        })
-        .map(|g| g.tier.to_string())
-        .next()
-}
-
-fn is_test_unit(src: &str, filename: &str) -> bool {
-    let (units, _) =
-        reprise::unit::extract_file_units(Path::new(filename), src, Lang::Go, &Config::default());
-    assert_eq!(units.len(), 1);
-    units[0].is_test
-}
+mod common;
+use common::{fp, fp_ir, is_test_unit, pair_tier};
 
 // ---------- t1: comments + whitespace ----------
 
@@ -80,6 +36,25 @@ fn go_while_form_and_loop_core_converge() {
     assert_eq!(fp(a, Lang::Go), fp(b, Lang::Go));
 }
 
+#[test]
+fn go_while_form_stays_distinct_from_do_while() {
+    // `for cond { body }` checks the guard at the TOP; the do-while equivalent
+    // `for { body; if !cond { break } }` checks it at the BOTTOM (the body always runs at
+    // least once). Identical bodies — the guard position must survive, so they stay distinct.
+    let top = "package main\nfunc drain(n int) int {\n\tk := n\n\ts := 0\n\tfor k > 0 {\n\t\tk -= 2\n\t\ts += 1\n\t}\n\treturn s\n}\n";
+    let bottom = "package main\nfunc drain(n int) int {\n\tk := n\n\ts := 0\n\tfor {\n\t\tk -= 2\n\t\ts += 1\n\t\tif !(k > 0) {\n\t\t\tbreak\n\t\t}\n\t}\n\treturn s\n}\n";
+    assert_ne!(
+        fp(top, Lang::Go),
+        fp(bottom, Lang::Go),
+        "top-guard `for cond` must stay distinct from bottom-guard do-while (historical)"
+    );
+    assert_ne!(
+        fp_ir(top, Lang::Go),
+        fp_ir(bottom, Lang::Go),
+        "top-guard `for cond` must stay distinct from bottom-guard do-while (IR default)"
+    );
+}
+
 // ---------- three-clause for ↔ while+init ----------
 
 #[test]
@@ -100,9 +75,9 @@ fn go_index_loop_converges_with_range() {
 
 #[test]
 fn go_index_loop_converges_with_range_ir() {
-    // Same contract under the IR normalizer (the default-flip blocker): the block-level
-    // C-style counter loop and the idiomatic blank-index `range` both rewrite to the one
-    // canonical iteration-protocol foreach form (spec §5.2.2).
+    // Same contract under the IR normalizer (now the default, §8): the block-level C-style
+    // counter loop and the idiomatic blank-index `range` both rewrite to the one canonical
+    // iteration-protocol foreach form (spec §5.2.2).
     let a = "package main\nfunc total(xs []int) int {\n\tacc := 0\n\tfor i := 0; i < len(xs); i++ {\n\t\tacc += xs[i]\n\t}\n\treturn acc\n}\n";
     let b = "package main\nfunc total(xs []int) int {\n\tacc := 0\n\tfor _, x := range xs {\n\t\tacc += x\n\t}\n\treturn acc\n}\n";
     assert_eq!(fp_ir(a, Lang::Go), fp_ir(b, Lang::Go));
@@ -182,6 +157,12 @@ fn go_unrelated_functions_do_not_converge() {
 #[test]
 fn go_test_recognition() {
     let f = "package main\nfunc TestSummarize(t *testing.T) {\n\tgot := summarize(1)\n\tif got != 2 {\n\t\tt.Errorf(\"bad: %d\", got)\n\t}\n}\n";
-    assert!(is_test_unit(f, "summary_test.go"), "_test.go → test");
-    assert!(!is_test_unit(f, "summary.go"), "plain file → not test");
+    assert!(
+        is_test_unit(f, "summary_test.go", Lang::Go),
+        "_test.go → test"
+    );
+    assert!(
+        !is_test_unit(f, "summary.go", Lang::Go),
+        "plain file → not test"
+    );
 }

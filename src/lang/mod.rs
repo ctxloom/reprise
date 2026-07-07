@@ -71,6 +71,21 @@ impl Lang {
             Lang::Kotlin => "kotlin",
         }
     }
+
+    /// The canonical AND-operator spelling this language's source produces (Python `and`, every
+    /// other language `&&`). The IR preserves the surface boolean token (see
+    /// `LanguageProfile::commutative_ops` — Python has `and`/`or`, Rust/Go `&&`/`||`), so a
+    /// synthesized conjunction (the C1 guard merge, `ir::pass::try_merge_branch`) must use the
+    /// SAME token the language's hand-written `a && b` / `a and b` lowers to, or the
+    /// "nesting ≡ conjunction" convergence never fires (askew-taps). Used when the merged subtree
+    /// carries no boolean operator to sniff (a pure-atomic `if a: if b:`), so the token must come
+    /// from the language rather than the tree.
+    pub fn conjunction_token(self) -> &'static str {
+        match self {
+            Lang::Python => "and",
+            _ => "&&",
+        }
+    }
 }
 
 pub trait LanguageProfile: Sync {

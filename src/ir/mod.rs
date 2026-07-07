@@ -24,9 +24,10 @@ pub mod transform;
 pub use edit::{Edit, apply};
 pub use pass::{
     abstract_idents, boolean_normalize, decompose_multi_assign, detect_abstract_idents,
-    detect_boolean_normalize, detect_comm_sort, detect_dead, detect_guard_canonicalize,
-    detect_iter_protocol, detect_loop_exit, detect_multi_assign, guard_canonicalize,
-    normalize_loop_exit, rewrite_iteration, strip_dead,
+    detect_boolean_normalize, detect_comm_sort, detect_counter_iter, detect_dead,
+    detect_guard_canonicalize, detect_iter_protocol, detect_loop_exit, detect_multi_assign,
+    guard_canonicalize, normalize_loop_exit, rewrite_counter_iteration, rewrite_iteration,
+    strip_dead,
 };
 pub use provenance::Provenance;
 pub use render::to_sexpr;

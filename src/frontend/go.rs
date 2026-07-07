@@ -125,7 +125,7 @@ pub(crate) const RESIDUE_KINDS: &[&str] = &[
 ];
 
 impl Frontend for Go {
-    fn lower_node(
+    fn lower_node_inner(
         &self,
         node: Node,
         field: Option<&str>,

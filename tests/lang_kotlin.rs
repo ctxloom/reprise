@@ -4,51 +4,9 @@
 
 use reprise::config::Config;
 use reprise::lang::Lang;
-use std::fs;
-use std::path::Path;
-use tempfile::TempDir;
 
-fn fp(src: &str, lang: Lang) -> u128 {
-    let units = reprise::units_from_source(src, lang, &Config::default());
-    assert_eq!(units.len(), 1, "expected exactly one unit in:\n{src}");
-    units[0].fingerprint
-}
-
-fn pair_tier(sources: &[(&str, &str)]) -> Option<String> {
-    pair_tier_cfg(sources, &Config::default())
-}
-
-fn pair_tier_cfg(sources: &[(&str, &str)], cfg: &Config) -> Option<String> {
-    let dir = TempDir::new().unwrap();
-    for (name, src) in sources {
-        fs::write(dir.path().join(name), src).unwrap();
-    }
-    let report = reprise::scan(dir.path(), cfg).unwrap();
-    report
-        .groups
-        .iter()
-        .filter(|g| {
-            let fs: Vec<_> = g
-                .members
-                .iter()
-                .map(|m| m.file.to_string_lossy().to_string())
-                .collect();
-            fs.iter().any(|f| f.contains("aa.")) && fs.iter().any(|f| f.contains("bb."))
-        })
-        .map(|g| g.tier.to_string())
-        .next()
-}
-
-fn is_test_unit(src: &str, filename: &str) -> bool {
-    let (units, _) = reprise::unit::extract_file_units(
-        Path::new(filename),
-        src,
-        Lang::Kotlin,
-        &Config::default(),
-    );
-    assert_eq!(units.len(), 1);
-    units[0].is_test
-}
+mod common;
+use common::{fp, is_test_unit, pair_tier, pair_tier_cfg};
 
 // ---------- t1: comments + whitespace ----------
 
@@ -99,6 +57,50 @@ fn kt_index_loop_until_size_converges_with_for_in() {
     let a = "fun total(xs: List<Int>): Int {\n    var acc = 0\n    for (i in 0 until xs.size) { acc += xs[i] }\n    return acc\n}\n";
     let b = "fun total(xs: List<Int>): Int {\n    var acc = 0\n    for (x in xs) { acc += x }\n    return acc\n}\n";
     assert_eq!(fp(a, Lang::Kotlin), fp(b, Lang::Kotlin));
+}
+
+#[test]
+fn kt_index_loop_near_misses_stay_distinct() {
+    // Precision controls for the index-loop→foreach rewrite (mirrors the Rust/Go controls,
+    // e.g. `go_counter_loop_near_misses_stay_distinct_ir`): shapes that are NOT a clean
+    // index-iteration must NOT collapse to the plain foreach.
+    let foreach = "fun total(xs: List<Int>): Int {\n    var acc = 0\n    for (x in xs) { acc += x }\n    return acc\n}\n";
+    // (i) non-unit stride (`step 2`).
+    let stride = "fun total(xs: List<Int>): Int {\n    var acc = 0\n    for (i in 0 until xs.size step 2) { acc += xs[i] }\n    return acc\n}\n";
+    // (ii) the index is used for its own sake (not only as `xs[i]`).
+    let use_index = "fun total(xs: List<Int>): Int {\n    var acc = 0\n    for (i in xs.indices) { acc += xs[i] + i }\n    return acc\n}\n";
+    // (iii) a DIFFERENT collection is indexed (`ys[i]` while iterating over xs's range).
+    let other = "fun total(xs: List<Int>, ys: List<Int>): Int {\n    var acc = 0\n    for (i in xs.indices) { acc += ys[i] }\n    return acc\n}\n";
+    assert_ne!(
+        fp(foreach, Lang::Kotlin),
+        fp(stride, Lang::Kotlin),
+        "non-unit stride must not collapse to the foreach"
+    );
+    assert_ne!(
+        fp(foreach, Lang::Kotlin),
+        fp(use_index, Lang::Kotlin),
+        "index used for its own sake must not collapse to the foreach"
+    );
+    assert_ne!(
+        fp(foreach, Lang::Kotlin),
+        fp(other, Lang::Kotlin),
+        "indexing a different collection must not collapse to the foreach"
+    );
+}
+
+#[test]
+fn kt_while_stays_distinct_from_do_while() {
+    // A `while (cond) { body }` checks the guard BEFORE the body; a `do { body } while (cond)`
+    // checks it AFTER (the body always runs at least once). They differ only in guard position,
+    // so a normalizer that canonicalized guard position would wrongly collapse them. Identical
+    // bodies — must stay distinct.
+    let while_top = "fun drain(n: Int): Int {\n    var k = n\n    var s = 0\n    while (k > 0) { k -= 2; s += 1 }\n    return s\n}\n";
+    let do_while = "fun drain(n: Int): Int {\n    var k = n\n    var s = 0\n    do { k -= 2; s += 1 } while (k > 0)\n    return s\n}\n";
+    assert_ne!(
+        fp(while_top, Lang::Kotlin),
+        fp(do_while, Lang::Kotlin),
+        "while (guard-first) must stay distinct from do-while (guard-last)"
+    );
 }
 
 // ---------- recursion ↔ iteration (spec §5.2.2 Rev 5) ----------
@@ -156,6 +158,12 @@ fn kt_unrelated_functions_do_not_converge() {
 fn kt_test_recognition() {
     let annotated = "@Test\nfun checkSummarize() {\n    val r = summarize(1)\n    assertEquals(2, r)\n    assertTrue(r > 0)\n}\n";
     let plain = "fun checkSummarize(): Int {\n    val r = summarize(1)\n    return r\n}\n";
-    assert!(is_test_unit(annotated, "Widget.kt"), "@Test → test");
-    assert!(!is_test_unit(plain, "Widget.kt"), "no @Test → not test");
+    assert!(
+        is_test_unit(annotated, "Widget.kt", Lang::Kotlin),
+        "@Test → test"
+    );
+    assert!(
+        !is_test_unit(plain, "Widget.kt", Lang::Kotlin),
+        "no @Test → not test"
+    );
 }

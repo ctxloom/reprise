@@ -121,6 +121,17 @@ pub struct TransformLog {
     /// returns and nothing is materialized. Because the log is hash-excluded, this
     /// never changes the canonical tree — it only skips the (discarded) stream.
     disabled: bool,
+    /// Current CST-recursion depth during lowering — the DoS guard's counter (not an
+    /// event; tracked in BOTH sinks, so [`enter`](Self::enter)/[`leave`](Self::leave)
+    /// ignore `disabled`). A frontend's [`lower_node`](crate::frontend) wrapper bumps it
+    /// on entry and stops recursing once it hits [`crate::normalize::MAX_EXTRACTION_DEPTH`],
+    /// so an untrusted, pathologically-nested input (a several-thousand-term operator
+    /// chain, deep nested literals) can no longer overflow the worker stack. Balanced to 0
+    /// after a normal unit, so it never perturbs log equality/serialization.
+    depth: u32,
+    /// Set when the depth guard truncated an over-deep subtree, so the unit can be flagged
+    /// `parse_degraded` (never a silent drop — spec §5.1/§12 never-drop-but-flag).
+    truncated: bool,
 }
 
 impl TransformLog {
@@ -135,7 +146,36 @@ impl TransformLog {
         Self {
             events: Vec::new(),
             disabled: true,
+            depth: 0,
+            truncated: false,
         }
+    }
+
+    /// Current CST-recursion depth (the DoS guard's counter). Tracked in both sinks.
+    pub fn depth(&self) -> u32 {
+        self.depth
+    }
+
+    /// Descend one CST level (the frontend `lower_node` wrapper calls this on entry).
+    /// Unaffected by `disabled`: depth is structural, not an event.
+    pub fn enter(&mut self) {
+        self.depth += 1;
+    }
+
+    /// Ascend one CST level (paired with [`enter`](Self::enter) on return).
+    pub fn leave(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
+    }
+
+    /// Record that the depth guard truncated an over-deep subtree — surfaced by flagging
+    /// the unit `parse_degraded` so the truncation is visible in the scan summary.
+    pub fn mark_truncated(&mut self) {
+        self.truncated = true;
+    }
+
+    /// Whether the depth guard fired during this lowering.
+    pub fn truncated(&self) -> bool {
+        self.truncated
     }
 
     /// Whether events are being recorded (a [`disabled`](Self::disabled) log is not) —

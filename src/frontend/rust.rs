@@ -118,7 +118,7 @@ pub(crate) const RESIDUE_KINDS: &[&str] = &[
 ];
 
 impl Frontend for Rust {
-    fn lower_node(
+    fn lower_node_inner(
         &self,
         node: Node,
         field: Option<&str>,

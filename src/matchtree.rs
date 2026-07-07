@@ -40,7 +40,15 @@ pub struct RetrievalStats {
     /// a live number, not an assumption.
     pub candidates_landmark_coverage_gated: usize,
     pub candidates_total: usize,
-    pub histogram_rejected: usize,
+    /// Filter-cascade rejections, split per filter so the funnel decomposes (the
+    /// short-circuiting AND attributes each reject to the FIRST filter that failed).
+    pub offset_histogram_rejected: usize,
+    pub htree_rejected: usize,
+    /// Pairs that cleared every filter but exceeded `max_divergence` at anti_unify.
+    pub divergence_rejected: usize,
+    /// Pairs that cleared the filter cascade AND the divergence gate (counted at the
+    /// one point — pre-acceptance — for both the plain and the inline path, so it is
+    /// the true verify-survivor count, not the post-acceptance subset).
     pub verified_pairs: usize,
     /// Verified pairs proposed only by landmark pairs (§7.4b record).
     pub verified_only_landmark: usize,
@@ -223,7 +231,9 @@ fn near_groups_for_lang(
     // (its landmark-candidacy-scoped phase); the remaining filters run here. ----
     let filters = active_filters(cfg);
     enum Verify {
-        HistogramRejected,
+        /// Rejected by a filter; carries the canonical name of the FIRST filter that
+        /// failed (the cascade short-circuits), so the funnel splits per filter.
+        FilterRejected(&'static str),
         DivergenceRejected,
         Verified(AuOutcome),
     }
@@ -232,8 +242,10 @@ fn near_groups_for_lang(
         // short-circuiting AND (order is result-invariant — a conjunction — so it
         // sets only cost). Evidence is memoized in Ctx, computed once for all filters.
         let ctx = Ctx::new(&reps[i], &reps[j], cfg);
-        if !filters.iter().all(|f| f(&ctx)) {
-            return Verify::HistogramRejected;
+        for &(name, f) in &filters {
+            if !f(&ctx) {
+                return Verify::FilterRejected(name);
+            }
         }
         // ── FIXED TERMINAL VERIFY: anti_unify ────────────────────────────────────
         // anti_unify is deliberately kept OUT of `retrieval.filters` and pinned here
@@ -282,11 +294,14 @@ fn near_groups_for_lang(
         .collect();
     for (&(i, j, by_bag, by_lm), v) in plain_cands.iter().zip(plain_verified) {
         let outcome = match v {
-            Verify::HistogramRejected => {
-                stats.histogram_rejected += 1;
+            Verify::FilterRejected(name) => {
+                record_filter_reject(stats, name);
                 continue;
             }
-            Verify::DivergenceRejected => continue,
+            Verify::DivergenceRejected => {
+                stats.divergence_rejected += 1;
+                continue;
+            }
             Verify::Verified(outcome) => outcome,
         };
         stats.verified_pairs += 1;
@@ -330,21 +345,26 @@ fn near_groups_for_lang(
     let mut inline_best: BTreeMap<(usize, usize), VerifiedPair> = BTreeMap::new();
     for (&(i, j, by_bag, by_lm), v) in inline_cands.iter().zip(inline_verified) {
         let outcome = match v {
-            Verify::HistogramRejected => {
-                stats.histogram_rejected += 1;
+            Verify::FilterRejected(name) => {
+                record_filter_reject(stats, name);
                 continue;
             }
-            Verify::DivergenceRejected => continue,
+            Verify::DivergenceRejected => {
+                stats.divergence_rejected += 1;
+                continue;
+            }
             Verify::Verified(outcome) => outcome,
         };
+        // Count the verify-survivor here — pre-acceptance, the SAME point as the
+        // plain path — so `verified_pairs` means the same thing on both paths.
+        stats.verified_pairs += 1;
+        if by_lm && !by_bag {
+            stats.verified_only_landmark += 1;
+        }
         // Near-normalized acceptance criteria; no weak demotion — a weak
         // inline match is noise, not a verbose-only finding.
         if outcome.holes.len() > cfg.thresholds.max_holes as usize || !outcome.factorable {
             continue;
-        }
-        stats.verified_pairs += 1;
-        if by_lm && !by_bag {
-            stats.verified_only_landmark += 1;
         }
         let (ua, ub) = (reps[i].unit_idx, reps[j].unit_idx);
         let (ba, bb) = (base_of(units, ua), base_of(units, ub));
@@ -811,16 +831,27 @@ fn filter_h_tree(ctx: &Ctx) -> bool {
     depth_consistency(ctx.evidence(), ctx.needed())
 }
 
-/// Resolve a `retrieval.filters` name to its verify-phase [`Filter`] predicate.
-/// `coverage` is a known filter but returns `None` here: it is landmark-candidacy-
-/// scoped and runs in the landmark retriever's own phase (see [`coverage_active`]),
-/// not as a per-pair `&Ctx` predicate — so it is dispatched separately, not in the
-/// verify cascade. Unknown names are rejected at config load.
-fn filter_by_name(name: &str) -> Option<Filter> {
+/// Resolve a `retrieval.filters` name to its canonical name + verify-phase [`Filter`]
+/// predicate. `coverage` is a known filter but returns `None` here: it is landmark-
+/// candidacy-scoped and runs in the landmark retriever's own phase (see
+/// [`coverage_active`]), not as a per-pair `&Ctx` predicate — so it is dispatched
+/// separately, not in the verify cascade. Unknown names are rejected at config load.
+fn filter_by_name(name: &str) -> Option<(&'static str, Filter)> {
     match name {
-        "offset-histogram" => Some(filter_offset_histogram),
-        "h-tree" => Some(filter_h_tree),
+        "offset-histogram" => Some(("offset-histogram", filter_offset_histogram)),
+        "h-tree" => Some(("h-tree", filter_h_tree)),
         _ => None,
+    }
+}
+
+/// Attribute a filter-cascade rejection to its per-filter [`RetrievalStats`] counter.
+/// `coverage` never reaches here (it is retriever-scoped); an unknown name is ignored
+/// rather than panicking, keeping the diagnostic path infallible.
+fn record_filter_reject(stats: &mut RetrievalStats, name: &str) {
+    match name {
+        "offset-histogram" => stats.offset_histogram_rejected += 1,
+        "h-tree" => stats.htree_rejected += 1,
+        _ => {}
     }
 }
 
@@ -849,9 +880,10 @@ fn coverage_active(cfg: &Config) -> bool {
     cfg.retrieval.filters.iter().any(|n| n == "coverage")
 }
 
-/// The configured verify-phase filter predicates, in listed order, resolved once per
-/// language scan (`coverage` excluded — it runs in the retriever phase).
-fn active_filters(cfg: &Config) -> Vec<Filter> {
+/// The configured verify-phase filters as `(canonical name, predicate)`, in listed
+/// order, resolved once per language scan (`coverage` excluded — it runs in the
+/// retriever phase). The name rides along so a rejection is attributed to its filter.
+fn active_filters(cfg: &Config) -> Vec<(&'static str, Filter)> {
     cfg.retrieval
         .filters
         .iter()
@@ -944,4 +976,36 @@ fn build_groups(pairs: Vec<VerifiedPair>, tier: Tier, units: &[Unit]) -> Vec<Nea
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filter_rejects_route_to_per_filter_counters() {
+        // Item 1: the funnel decomposes — each verify-phase filter has its OWN counter
+        // (`histogram_rejected` used to lump both), and `divergence_rejected` /
+        // `verified_pairs` are distinct fields, so the retrieval knob analysis can read
+        // decomposable numbers. `coverage` is retriever-scoped and never routed here.
+        let mut stats = RetrievalStats::default();
+        record_filter_reject(&mut stats, "offset-histogram");
+        record_filter_reject(&mut stats, "offset-histogram");
+        record_filter_reject(&mut stats, "h-tree");
+        record_filter_reject(&mut stats, "coverage"); // ignored — not a verify-phase filter
+        assert_eq!(stats.offset_histogram_rejected, 2);
+        assert_eq!(stats.htree_rejected, 1);
+        // Distinct funnel stages, untouched by filter rejections.
+        assert_eq!(stats.divergence_rejected, 0);
+        assert_eq!(stats.verified_pairs, 0);
+    }
+
+    #[test]
+    fn active_filters_carry_canonical_names() {
+        // The name rides along with each predicate so a rejection is attributable.
+        let cfg = Config::default();
+        let names: Vec<&str> = active_filters(&cfg).iter().map(|(n, _)| *n).collect();
+        // `coverage` is dispatched to the retriever phase, not the verify cascade.
+        assert_eq!(names, vec!["offset-histogram", "h-tree"]);
+    }
 }

@@ -25,14 +25,44 @@ use tree_sitter::Node;
 
 /// A per-language CST → canonical-IR mapping — the only per-language surface.
 pub(crate) trait Frontend {
-    /// Map one CST node to a canonical IR node (or `None` if dropped).
-    fn lower_node(
+    /// Map one CST node to a canonical IR node (or `None` if dropped). **Implement this,
+    /// but never call it directly** — every recursion goes through [`lower_node`](Frontend::lower_node),
+    /// the shared wrapper that enforces the DoS depth guard.
+    fn lower_node_inner(
         &self,
         node: Node,
         field: Option<&str>,
         src: &str,
         log: &mut TransformLog,
     ) -> Option<NormNode>;
+
+    /// The recursion entry point every helper and frontend calls: a thin wrapper over
+    /// [`lower_node_inner`](Frontend::lower_node_inner) that enforces the extraction depth
+    /// guard (the untrusted-input DoS fix). tree-sitter's own parse is iterative and cannot
+    /// overflow our stack, but this recursive descent of the CST can — a several-thousand-
+    /// term left-assoc operator chain or deeply nested literals in a generated/minified file
+    /// would exhaust a rayon worker's 2 MiB stack and SIGSEGV the whole scan. Past
+    /// [`crate::normalize::MAX_EXTRACTION_DEPTH`] we stop descending and truncate the subtree
+    /// (returning `None`, the same value a dropped node yields — callers already skip it),
+    /// marking the unit truncated so it is flagged `parse_degraded`, never silently dropped
+    /// (spec §5.1/§12). Every downstream walk (passes, fold, fingerprint) then operates on a
+    /// tree whose depth is bounded by the cap, so none of them can overflow either.
+    fn lower_node(
+        &self,
+        node: Node,
+        field: Option<&str>,
+        src: &str,
+        log: &mut TransformLog,
+    ) -> Option<NormNode> {
+        if log.depth() >= crate::normalize::MAX_EXTRACTION_DEPTH {
+            log.mark_truncated();
+            return None;
+        }
+        log.enter();
+        let result = self.lower_node_inner(node, field, src, log);
+        log.leave();
+        result
+    }
 
     /// Push the unit's parameters as `Var@param` (binding shape differs per grammar).
     fn lower_params(
@@ -255,7 +285,7 @@ pub(crate) fn lower_source(
 /// calibration consumer passes [`TransformLog::new`] to fold the complete event stream.
 /// The log is hash-excluded, so the canonical tree is byte-identical either way.
 pub fn normalize(lang: Lang, node: Node, src: &str, log: &mut TransformLog) -> NormNode {
-    run_passes(lower_unit_for(lang, node, src, log), log)
+    run_passes(lower_unit_for(lang, node, src, log), lang, log)
 }
 
 /// Lower one function CST node to canonical IR for `lang` (no passes yet) — the
@@ -280,7 +310,7 @@ pub(crate) fn lower_unit_for(
 /// Run the language-agnostic canonicalization passes on a lowered IR tree — the
 /// second half of [`normalize`], factored out so the inline phase can re-run it on a
 /// spliced (still `Raw`) variant, converging it with the frontend's own canonical form.
-pub fn run_passes(tree: NormNode, log: &mut TransformLog) -> NormNode {
+pub fn run_passes(tree: NormNode, lang: Lang, log: &mut TransformLog) -> NormNode {
     // Every canonicalization pass runs through the D-IR-12 detect/emit seam: each detector
     // takes an immutable tree and cannot mutate, and `apply` is the sole mutator — it performs
     // the edits AND records their events. Order is load-bearing (§4.1): each detector runs on
@@ -308,7 +338,7 @@ pub fn run_passes(tree: NormNode, log: &mut TransformLog) -> NormNode {
     let tree = crate::ir::edit::apply(tree, &counter, log);
     let loop_exit = crate::ir::pass::detect_loop_exit(&tree);
     let tree = crate::ir::edit::apply(tree, &loop_exit, log);
-    let guard = crate::ir::pass::detect_guard_canonicalize(&tree);
+    let guard = crate::ir::pass::detect_guard_canonicalize(&tree, lang);
     let tree = crate::ir::edit::apply(tree, &guard, log);
     // Parallel multi-assign decomposition (§13, multi-assign rung only): `a, b = X, Y` and the
     // parallel Assign a tail-rec reassignment lowers to both reduce to a minimal single-assign
@@ -449,10 +479,15 @@ pub fn extract_ir_units(src: &str, lang: Lang, path: &std::path::Path) -> Vec<Ir
         return Vec::new();
     };
     let mut out = Vec::new();
-    collect_ir_units(cst.root_node(), src, lang, root_kinds, path, &mut out);
+    collect_ir_units(cst.root_node(), src, lang, root_kinds, path, &mut out, 0);
     out
 }
 
+/// `depth` bounds the unit-*finder*'s own CST descent — a second recursive walk, independent
+/// of the lowering guard: it descends every named child hunting for nested units, so an
+/// untrusted, deeply-nested file would overflow *here* (before or after lowering) too. Past
+/// [`crate::normalize::MAX_EXTRACTION_DEPTH`] we stop searching deeper; a unit nested that far
+/// is itself pathological, and units we already found lower under their own guard.
 fn collect_ir_units(
     node: Node,
     src: &str,
@@ -460,13 +495,18 @@ fn collect_ir_units(
     root_kinds: &[&str],
     path: &std::path::Path,
     out: &mut Vec<IrUnit>,
+    depth: u32,
 ) {
     if root_kinds.contains(&node.kind()) {
         // Bulk scan is the read-model selector's disabled sink (D-IR-12 /
         // `docs/transform-seam.md` §3): recording is a no-op, so the event stream costs
-        // nothing and — being hash-excluded — cannot move the canonical tree.
-        let raw = lower_unit_for(lang, node, src, &mut TransformLog::disabled());
-        let tree = run_passes(raw.clone(), &mut TransformLog::disabled());
+        // nothing and — being hash-excluded — cannot move the canonical tree. The one live
+        // signal a disabled sink still carries is the depth guard's `truncated` flag: an
+        // untrusted, over-deep unit is lowered up to `MAX_EXTRACTION_DEPTH` then truncated,
+        // and the flag surfaces as `parse_degraded` (never a silent drop — spec §5.1/§12).
+        let mut log = TransformLog::disabled();
+        let raw = lower_unit_for(lang, node, src, &mut log);
+        let tree = run_passes(raw.clone(), lang, &mut log);
         let name = node
             .child_by_field_name("name")
             .and_then(|n| n.utf8_text(src.as_bytes()).ok())
@@ -480,15 +520,18 @@ fn collect_ir_units(
                 node.start_position().row as u32 + 1,
                 node.end_position().row as u32 + 1,
             ),
-            parse_degraded: node.has_error(),
+            parse_degraded: node.has_error() || log.truncated(),
             is_test,
             tree,
             raw,
         });
     }
+    if depth >= crate::normalize::MAX_EXTRACTION_DEPTH {
+        return;
+    }
     let mut cursor = node.walk();
     for c in node.named_children(&mut cursor) {
-        collect_ir_units(c, src, lang, root_kinds, path, out);
+        collect_ir_units(c, src, lang, root_kinds, path, out, depth + 1);
     }
 }
 

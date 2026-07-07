@@ -176,6 +176,27 @@ fn parse_degraded_units_are_still_indexed() {
 }
 
 #[test]
+fn unreadable_files_are_counted_and_surfaced() {
+    // Spec §2: a file that can't be read as UTF-8 text (here invalid UTF-8 in a .rs
+    // source) must be counted, not silently dropped — else the scan quietly shrinks.
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("bad.rs"), [0xFFu8, 0xFE, 0x00, 0x80, 0xFF]).unwrap();
+    let report = reprise::scan(dir.path(), &Config::default()).unwrap();
+    assert_eq!(
+        report.stats.files_unreadable, 1,
+        "a non-UTF-8 source must increment files_unreadable"
+    );
+    assert_eq!(
+        report.stats.files_scanned, 0,
+        "the unreadable file must not count as scanned"
+    );
+    assert!(
+        report.render_terminal(20, false).contains("1 unreadable"),
+        "the scan summary must surface the unreadable-file count"
+    );
+}
+
+#[test]
 fn verbose_render_dumps_member_source() {
     let repo = build_repo();
     let report = reprise::scan(repo.path(), &Config::default()).unwrap();

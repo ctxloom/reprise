@@ -13,6 +13,31 @@ use crate::lang::{Lang, LanguageProfile};
 use crate::tree::{Bucket, Label, NormNode};
 use std::collections::{HashMap, HashSet};
 
+/// CST-recursion depth cap for extraction — the untrusted-input DoS guard, shared by all
+/// three recursive descents of the parsed CST: the two unit-*finders* ([`collect_units`] and
+/// the IR path's `collect_ir_units`) and the two unit-*lowerers* ([`convert`] and the IR
+/// frontend's `lower_node` wrapper, [`crate::frontend`]). Scanned source is untrusted: a
+/// generated/minified file with a several-thousand-term left-assoc operator chain (`a+b+c+…`)
+/// or deeply nested literals parses to a CST that deep, and our recursive descent of it
+/// (tree-sitter's own parse is iterative and safe) would exhaust a rayon worker's default
+/// 2 MiB stack and SIGSEGV the whole scan. Past this depth we stop descending — the lowerers
+/// truncate the subtree and flag the unit `parse_degraded` (never a silent drop, spec
+/// §5.1/§12); the finders stop searching (a unit nested this deep is itself pathological).
+/// Every downstream walk (passes, fold, fingerprint) then runs on a ≤-cap-deep tree and
+/// cannot overflow either — this is the ONE guard the whole pipeline needs.
+///
+/// Value: 150. Two forces set it. Ceiling: real hand-written code essentially never nests
+/// expressions/blocks past a few dozen levels (deeply *generated* code is wide, not deep), so
+/// 150 (~3× the deepest realistic source) never fires on genuine input; a rare over-150 unit
+/// still gets indexed + flagged, so even a false trigger only degrades, never drops. Floor:
+/// extraction must be safe on the smallest stack that ever runs it — rayon's 2 MiB default
+/// workers AND library-API callers on 2 MiB spawned threads — and in a *debug* build the IR
+/// lowering burns ~4 `NormNode`-holding frames per CST level, so the empirical 2 MiB overflow
+/// cliff sits near ~250–300 levels (measured: 200 survives, 350 overflows). 150 keeps a ~2×
+/// margin under that cliff, covering debug frames, cross-grammar/-platform variance, and the
+/// worst case where a deep finder descent and a deep lowering descent stack.
+pub const MAX_EXTRACTION_DEPTH: u32 = 150;
+
 pub struct RawUnit {
     pub name: String,
     pub byte_span: (u32, u32),
@@ -35,7 +60,7 @@ pub fn extract_raw_units(src: &str, lang: Lang, path: &std::path::Path) -> Vec<R
     };
     let profile = lang.profile();
     let mut units = Vec::new();
-    collect_units(cst.root_node(), src, profile, path, &mut units);
+    collect_units(cst.root_node(), src, profile, path, &mut units, 0);
     units
 }
 
@@ -47,12 +72,16 @@ pub fn raw_units_from_source(src: &str, lang: Lang) -> Vec<(String, NormNode)> {
         .collect()
 }
 
+/// `depth` bounds the unit-*finder*'s own CST descent (see the IR path's `collect_ir_units`):
+/// this recursion hunts every named child for nested units and would itself overflow on a
+/// pathologically deep file. Past [`MAX_EXTRACTION_DEPTH`] we stop searching deeper.
 fn collect_units(
     node: tree_sitter::Node,
     src: &str,
     profile: &dyn LanguageProfile,
     path: &std::path::Path,
     out: &mut Vec<RawUnit>,
+    depth: u32,
 ) {
     if profile.is_function_like(node.kind()) {
         let name = node
@@ -68,9 +97,12 @@ fn collect_units(
         // callable body, so a nested binding is extracted too.
         push_unit(callable, name, src, profile, path, out);
     }
+    if depth >= MAX_EXTRACTION_DEPTH {
+        return;
+    }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect_units(child, src, profile, path, out);
+        collect_units(child, src, profile, path, out, depth + 1);
     }
 }
 
@@ -85,7 +117,8 @@ fn push_unit(
     path: &std::path::Path,
     out: &mut Vec<RawUnit>,
 ) {
-    if let Some(tree) = convert(node, None, "", src, profile) {
+    let mut truncated = false;
+    if let Some(tree) = convert(node, None, "", src, profile, 0, &mut truncated) {
         out.push(RawUnit {
             is_test: profile.unit_is_test(node, src, &name, path),
             name,
@@ -94,7 +127,9 @@ fn push_unit(
                 node.start_position().row as u32 + 1,
                 node.end_position().row as u32 + 1,
             ),
-            parse_degraded: node.has_error(),
+            // A depth-truncated unit is flagged like a parse-degraded one (never dropped):
+            // both mean the extracted tree is not a faithful, complete lowering (spec §5.1/§12).
+            parse_degraded: node.has_error() || truncated,
             tree,
         });
     }
@@ -102,13 +137,24 @@ fn push_unit(
 
 /// CST → raw normalized tree. Performs spec §5.2.1 (strip) and the
 /// paren-flattening half of §5.2.7 on the way through.
+///
+/// `depth` is the current CST-recursion depth and `truncated` the out-signal for the
+/// untrusted-input DoS guard ([`MAX_EXTRACTION_DEPTH`]): past the cap we stop descending
+/// and drop the over-deep subtree (returning `None`, which every caller already treats as a
+/// dropped node), setting `*truncated` so the unit is flagged `parse_degraded`.
 fn convert(
     node: tree_sitter::Node,
     field: Option<&str>,
     parent_kind: &str,
     src: &str,
     profile: &dyn LanguageProfile,
+    depth: u32,
+    truncated: &mut bool,
 ) -> Option<NormNode> {
+    if depth >= MAX_EXTRACTION_DEPTH {
+        *truncated = true;
+        return None;
+    }
     let kind = node.kind();
     let span = (node.start_byte() as u32, node.end_byte() as u32);
     let text = || node.utf8_text(src.as_bytes()).unwrap_or_default();
@@ -129,7 +175,15 @@ fn convert(
         // the wrapper's field.
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
-            if let Some(inner) = convert(child, field, parent_kind, src, profile) {
+            if let Some(inner) = convert(
+                child,
+                field,
+                parent_kind,
+                src,
+                profile,
+                depth + 1,
+                truncated,
+            ) {
                 return Some(inner);
             }
         }
@@ -154,7 +208,9 @@ fn convert(
         loop {
             let child = cursor.node();
             let child_field = cursor.field_name();
-            if let Some(converted) = convert(child, child_field, kind, src, profile) {
+            if let Some(converted) =
+                convert(child, child_field, kind, src, profile, depth + 1, truncated)
+            {
                 // Splice-through wrappers (Go `statement_list`): hoist the
                 // wrapper's children into this node so blocks hold statements
                 // directly, matching the Rust/Python shape the passes expect.
@@ -184,70 +240,105 @@ pub fn apply_passes(tree: NormNode, lang: Lang, cfg: &Config) -> NormNode {
     let tree = profile.normalize_loop_exit(tree);
     let tree = abstract_idents(tree, profile);
     let tree = abstract_literals(tree, profile, cfg);
-    let tree = canonicalize_order(tree, profile);
+    let tree = canonicalize_order(tree, profile, None);
     remove_dead(tree, profile)
 }
 
 /// Spec §5.2.6: sort operand chains of commutative operators (by exact-mode
 /// subtree hash) and key/value pair lists by key. Unsound for floats and
 /// overloading — accepted, output is a report.
-fn canonicalize_order(mut node: NormNode, profile: &dyn LanguageProfile) -> NormNode {
+///
+/// `parent_chain` carries the enclosing commutative chain's `(kind, op)` down the left
+/// spine. A left-assoc chain like `((a+b)+c)+d` parses as nested binary nodes; canonicalizing
+/// bottom-up, every inner spine node would independently re-flatten and rebuild its whole
+/// prefix → O(n²) subtree clones for an n-term chain. Only the chain HEAD (a node whose parent
+/// is not the same commutative kind+op) needs to flatten the entire chain and rebuild — the
+/// head's re-flatten discards every inner spine node's structure, so skipping the inner
+/// rebuild is byte-identical. The head threads its chain context to its index-0 (left-operand)
+/// child only: `flatten_chain` descends the left spine, while right operands are pushed whole
+/// and so must canonicalize as chain heads in their own right (context `None`).
+fn canonicalize_order(
+    mut node: NormNode,
+    profile: &dyn LanguageProfile,
+    parent_chain: Option<(&str, &str)>,
+) -> NormNode {
+    // Is THIS node a flatten-able commutative chain node, and what is its operator? The op is
+    // a childless, label-less leaf at the operator position (index 1 of a len-3 binary node),
+    // unaffected by canonicalizing the operands — so this is stable whether computed before or
+    // after the child recursion. We compute it before, to thread the chain context down the
+    // spine. Cloning the kind decouples the tuple's lifetime from `node` (whose `children` are
+    // moved out just below), at the cost of one small `Box<str>` clone per node.
+    let this_kind: Box<str> = node.kind.clone();
+    let this_op: Option<Box<str>> =
+        if profile.binary_fields(&node.kind).is_some() && node.children.len() == 3 {
+            node.children
+                .iter()
+                .find(|c| {
+                    c.children.is_empty()
+                        && c.label.is_none()
+                        && profile.commutative_ops().contains(&c.kind.as_ref())
+                })
+                .map(|c| c.kind.clone())
+        } else {
+            None
+        };
+    let this_chain: Option<(&str, &str)> = this_op.as_deref().map(|op| (this_kind.as_ref(), op));
+
+    // Canonicalize children bottom-up. The left operand (index 0) inherits this node's chain
+    // context so a same-kind/op child recognizes itself as an inner spine node and skips its
+    // rebuild; every other child (notably the right operand, which the head pushes whole) is a
+    // chain head in its own right and gets `None`.
     node.children = node
         .children
         .into_iter()
-        .map(|c| canonicalize_order(c, profile))
+        .enumerate()
+        .map(|(i, c)| canonicalize_order(c, profile, if i == 0 { this_chain } else { None }))
         .collect();
 
-    if let Some((lf, of, rf)) = profile.binary_fields(&node.kind) {
-        let op_kind = node
-            .children
-            .iter()
-            .find(|c| {
-                c.children.is_empty()
-                    && c.label.is_none()
-                    && profile.commutative_ops().contains(&c.kind.as_ref())
-            })
-            .map(|c| c.kind.to_string());
-        if let Some(op) = op_kind
-            && node.children.len() == 3
-        {
-            let mut operands = Vec::new();
-            flatten_chain(&node, &node.kind.clone(), &op, &mut operands);
-            if operands.len() >= 2 {
-                let op_node = node
-                    .children
-                    .iter()
-                    .find(|c| c.kind.as_ref() == op)
-                    .unwrap()
-                    .clone();
-                // Masked hash first (stable when local indices shift — the D2
-                // cascade), exact hash as tie-break (so `a*b` vs `b*a` still
-                // sorts consistently).
-                operands.sort_by_key(|o| {
-                    (
-                        crate::fingerprint::merkle_mode(
-                            o,
-                            crate::fingerprint::HashMode::MaskedLocals,
-                        ),
-                        crate::fingerprint::merkle(o),
-                    )
-                });
-                let field = node.field.clone();
-                let span = node.span;
-                let kind = node.kind.clone();
-                let mut acc = operands.remove(0);
-                acc.field = lf.map(Into::into);
-                for mut next in operands {
-                    next.field = rf.map(Into::into);
-                    let mut op_clone = op_node.clone();
-                    op_clone.field = of.map(Into::into);
-                    let mut merged = NormNode::new(&kind, None, span, vec![acc, op_clone, next]);
-                    merged.children[0].field = lf.map(Into::into);
-                    acc = merged;
-                }
-                acc.field = field;
-                return acc;
+    // An inner spine node is the index-0 child of a parent chain of its exact (kind, op) —
+    // precisely the node the head's `flatten_chain` descends through. Its flatten+rebuild is
+    // redundant (the head re-flattens and rebuilds the whole chain), so skip it.
+    let is_inner_spine = parent_chain.is_some() && parent_chain == this_chain;
+
+    if !is_inner_spine
+        && let Some((lf, of, rf)) = profile.binary_fields(&node.kind)
+        && let Some(op) = this_op.as_deref()
+    {
+        let mut operands = Vec::new();
+        flatten_chain(&node, &node.kind, op, &mut operands);
+        if operands.len() >= 2 {
+            let op_node = node
+                .children
+                .iter()
+                .find(|c| c.kind.as_ref() == op)
+                .unwrap()
+                .clone();
+            // Masked hash first (stable when local indices shift — the D2
+            // cascade), exact hash as tie-break (so `a*b` vs `b*a` still
+            // sorts consistently). `sort_by_cached_key` computes each element's
+            // (two-merkle) key exactly once instead of on every comparison —
+            // same sort result, no recomputation.
+            operands.sort_by_cached_key(|o| {
+                (
+                    crate::fingerprint::merkle_mode(o, crate::fingerprint::HashMode::MaskedLocals),
+                    crate::fingerprint::merkle(o),
+                )
+            });
+            let field = node.field.clone();
+            let span = node.span;
+            let kind = node.kind.clone();
+            let mut acc = operands.remove(0);
+            acc.field = lf.map(Into::into);
+            for mut next in operands {
+                next.field = rf.map(Into::into);
+                let mut op_clone = op_node.clone();
+                op_clone.field = of.map(Into::into);
+                let mut merged = NormNode::new(&kind, None, span, vec![acc, op_clone, next]);
+                merged.children[0].field = lf.map(Into::into);
+                acc = merged;
             }
+            acc.field = field;
+            return acc;
         }
     }
 

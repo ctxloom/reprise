@@ -219,16 +219,27 @@ fn jscpd_json_has_statistics_and_pairwise_duplicates() {
     let v: Value = serde_json::from_str(&out).expect("jscpd must parse as JSON");
 
     let total = &v["statistics"]["total"];
+    // jscpd `IStatisticRow` field names (the emitter must match them exactly):
+    // `tokens` + `duplicatedTokens` grand totals present, and the token ratio is
+    // `percentageTokens` — NOT our old misspelling `tokensPercentage`.
     for key in [
         "lines",
+        "tokens",
         "sources",
         "clones",
         "duplicatedLines",
+        "duplicatedTokens",
         "percentage",
+        "percentageTokens",
     ] {
         assert!(!total[key].is_null(), "statistics.total.{key} present");
     }
+    assert!(
+        total.get("tokensPercentage").is_none(),
+        "the jscpd field is `percentageTokens`, not `tokensPercentage`"
+    );
     assert_eq!(total["sources"].as_u64().unwrap(), 3, "3 scanned files");
+    assert!(total["tokens"].as_u64().unwrap() >= 1, "grand-total tokens");
 
     let dups = v["duplicates"].as_array().expect("duplicates[]");
     // 3-member group ⇒ 2 pairwise entries (first vs each other, D28).
@@ -242,8 +253,22 @@ fn jscpd_json_has_statistics_and_pairwise_duplicates() {
             assert!(d[side]["name"].is_string());
             assert!(d[side]["start"].as_u64().unwrap() >= 1);
             assert!(d[side]["end"].as_u64().unwrap() >= d[side]["start"].as_u64().unwrap());
-            assert!(d[side]["startLoc"]["line"].as_u64().unwrap() >= 1);
-            assert!(d[side]["endLoc"]["line"].as_u64().unwrap() >= 1);
+            let start_loc = &d[side]["startLoc"];
+            let end_loc = &d[side]["endLoc"];
+            assert!(start_loc["line"].as_u64().unwrap() >= 1);
+            assert!(end_loc["line"].as_u64().unwrap() >= 1);
+            // jscpd's ITokenLocation.position is a stream OFFSET, not a line
+            // number — the old emitter wrongly set it to the line. It must be a
+            // byte offset now, so it differs from the line for these fixtures
+            // (functions start on line ≥2 at byte offset 1).
+            let start_pos = start_loc["position"].as_u64().expect("startLoc.position");
+            assert_ne!(
+                start_pos,
+                start_loc["line"].as_u64().unwrap(),
+                "position must be a stream offset, not the line number"
+            );
+            let end_pos = end_loc["position"].as_u64().expect("endLoc.position");
+            assert!(end_pos >= start_pos, "end offset ≥ start offset");
         }
         assert!(d["fragment"].as_str().unwrap().contains("pub fn"));
         // firstFile is the shared anchor across the group's pairwise entries.

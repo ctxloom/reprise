@@ -182,7 +182,8 @@ pub struct RetrievalCfg {
     /// `[coverage, offset-histogram, h-tree]` was promoted from `[coverage,
     /// offset-histogram]` after the whole-repo + inline-on byte-identical `verified_pairs`
     /// gate held (187=187, every clone-group set identical; only the diagnostic
-    /// histogram_rejected moved, +98 = 98 fewer anti_unify calls). Unknown names error at
+    /// filter-rejection count moved, +98 = 98 fewer anti_unify calls — now attributed
+    /// to `htree_rejected`). Unknown names error at
     /// load. Matching-time only — hash-neutral, never in the extraction cache key.
     pub filters: Vec<String>,
 }
@@ -408,7 +409,44 @@ impl Config {
             .map_err(|e| anyhow::anyhow!("reprise.toml [report] fail_on: {e}"))?;
         crate::matchtree::validate_filters(&self.retrieval.filters)
             .map_err(|e| anyhow::anyhow!("reprise.toml [retrieval] filters: {e}"))?;
+        // Enumerated string keys whose consumer silently treats an unknown value
+        // as a fallthrough default. `tests.mode` is the load-bearing one: an
+        // unknown value falls through lib.rs's partition catch-all and routes
+        // all-test groups into the CI-gating `main` section (they get ranked and
+        // counted in the duplication ratio). Allowed set = exactly what that
+        // switch understands: `separate` / `exclude`, plus `normal` (the
+        // catch-all's intent). `sarif_fingerprint`'s consumer is `!= "line"`, so
+        // a typo silently reads as `structural`; its set is the documented pair.
+        //
+        // NOT validated here: `retrieval.retriever` and `normalize.normalizer`
+        // are deliberately string-keyed, plugin-extensible selectors ("any value
+        // resolves to Landmark for now"; "further normalizers may register") — no
+        // bounded valid set to check against, so validating them would be a guess.
+        validate_enum(
+            "[tests] mode",
+            &self.tests.mode,
+            &["normal", "separate", "exclude"],
+        )?;
+        validate_enum(
+            "[report] sarif_fingerprint",
+            &self.report.sarif_fingerprint,
+            &["structural", "line"],
+        )?;
         Ok(())
+    }
+}
+
+/// Reject an enumerated string value outside its allowed set, naming both the
+/// bad value and the full allowed list — so a typo (e.g. `mode = "excluded"`)
+/// fails clearly at load, never as silent misbehavior at `check`-time.
+fn validate_enum(key: &str, value: &str, allowed: &[&str]) -> anyhow::Result<()> {
+    if allowed.contains(&value) {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "reprise.toml {key}: unknown value {value:?} (expected one of: {})",
+            allowed.join(", ")
+        )
     }
 }
 
@@ -445,6 +483,53 @@ mod tests {
         let toml = "[retrieval]\nfilters = [\"offset-histogram\", \"anti-unify\"]\n";
         let cfg: Config = toml::from_str(toml).unwrap();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_unknown_tests_mode() {
+        // The typo `"excluded"` must fail at LOAD, not fall through lib.rs's
+        // catch-all and silently route all-test groups into the CI-gating
+        // `main` section.
+        let toml = "[tests]\nmode = \"excluded\"\n";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("excluded"), "error names the bad value: {err}");
+        assert!(err.contains("mode"), "error names the key: {err}");
+        assert!(err.contains("separate"), "error lists the known set: {err}");
+    }
+
+    #[test]
+    fn validate_accepts_all_valid_tests_modes() {
+        // The exact set lib.rs's partition switch understands.
+        for mode in ["normal", "separate", "exclude"] {
+            let toml = format!("[tests]\nmode = \"{mode}\"\n");
+            let cfg: Config = toml::from_str(&toml).unwrap();
+            assert!(cfg.validate().is_ok(), "should accept mode={mode}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_unknown_sarif_fingerprint() {
+        let toml = "[report]\nsarif_fingerprint = \"structual\"\n";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("structual"),
+            "error names the bad value: {err}"
+        );
+        assert!(err.contains("line"), "error lists the known set: {err}");
+    }
+
+    #[test]
+    fn validate_accepts_valid_sarif_fingerprints() {
+        for v in ["structural", "line"] {
+            let toml = format!("[report]\nsarif_fingerprint = \"{v}\"\n");
+            let cfg: Config = toml::from_str(&toml).unwrap();
+            assert!(
+                cfg.validate().is_ok(),
+                "should accept sarif_fingerprint={v}"
+            );
+        }
     }
 
     #[test]

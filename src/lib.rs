@@ -101,7 +101,7 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
                 sources.insert(path, src);
             }
             FileOutcome::SkippedGenerated => stats.files_skipped_generated += 1,
-            FileOutcome::Unreadable => {}
+            FileOutcome::Unreadable => stats.files_unreadable += 1,
         }
     }
     stats.units_indexed = units.len();

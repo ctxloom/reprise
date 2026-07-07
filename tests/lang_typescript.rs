@@ -4,49 +4,9 @@
 
 use reprise::config::Config;
 use reprise::lang::Lang;
-use std::fs;
-use std::path::Path;
-use tempfile::TempDir;
 
-fn fp(src: &str, lang: Lang) -> u128 {
-    let units = reprise::units_from_source(src, lang, &Config::default());
-    assert_eq!(units.len(), 1, "expected exactly one unit in:\n{src}");
-    units[0].fingerprint
-}
-
-/// Strongest tier of any group joining files `aa` and `bb`, if any.
-fn pair_tier(sources: &[(&str, &str)]) -> Option<String> {
-    pair_tier_cfg(sources, &Config::default())
-}
-
-fn pair_tier_cfg(sources: &[(&str, &str)], cfg: &Config) -> Option<String> {
-    let dir = TempDir::new().unwrap();
-    for (name, src) in sources {
-        fs::write(dir.path().join(name), src).unwrap();
-    }
-    let report = reprise::scan(dir.path(), cfg).unwrap();
-    report
-        .groups
-        .iter()
-        .filter(|g| {
-            let fs: Vec<_> = g
-                .members
-                .iter()
-                .map(|m| m.file.to_string_lossy().to_string())
-                .collect();
-            fs.iter().any(|f| f.contains("aa.")) && fs.iter().any(|f| f.contains("bb."))
-        })
-        .map(|g| g.tier.to_string())
-        .next()
-}
-
-fn is_test_unit(src: &str, filename: &str) -> bool {
-    let cfg = Config::default();
-    let (units, _) =
-        reprise::unit::extract_file_units(Path::new(filename), src, Lang::TypeScript, &cfg);
-    assert_eq!(units.len(), 1);
-    units[0].is_test
-}
+mod common;
+use common::{fp, is_test_unit, pair_tier, pair_tier_cfg};
 
 // ---------- t1: comments + whitespace ----------
 
@@ -90,6 +50,50 @@ fn ts_index_loop_converges_with_for_of() {
     let a = "function total(xs: number[]): number {\n  let acc = 0;\n  for (let i = 0; i < xs.length; i++) { acc += xs[i]; }\n  return acc;\n}\n";
     let b = "function total(xs: number[]): number {\n  let acc = 0;\n  for (const x of xs) { acc += x; }\n  return acc;\n}\n";
     assert_eq!(fp(a, Lang::TypeScript), fp(b, Lang::TypeScript));
+}
+
+#[test]
+fn ts_index_loop_near_misses_stay_distinct() {
+    // Precision controls for the index-loop→foreach rewrite (mirrors the Rust/Go controls,
+    // e.g. `go_counter_loop_near_misses_stay_distinct_ir`): shapes that are NOT a clean
+    // index-iteration must NOT collapse to the plain `for...of`.
+    let foreach = "function total(xs: number[]): number {\n  let acc = 0;\n  for (const x of xs) { acc += x; }\n  return acc;\n}\n";
+    // (i) non-unit stride (`i += 2`).
+    let stride = "function total(xs: number[]): number {\n  let acc = 0;\n  for (let i = 0; i < xs.length; i += 2) { acc += xs[i]; }\n  return acc;\n}\n";
+    // (ii) the index is used for its own sake (not only as `xs[i]`).
+    let use_index = "function total(xs: number[]): number {\n  let acc = 0;\n  for (let i = 0; i < xs.length; i++) { acc += xs[i] + i; }\n  return acc;\n}\n";
+    // (iii) a DIFFERENT collection is indexed (`ys[i]` while bounded by xs.length).
+    let other = "function total(xs: number[], ys: number[]): number {\n  let acc = 0;\n  for (let i = 0; i < xs.length; i++) { acc += ys[i]; }\n  return acc;\n}\n";
+    assert_ne!(
+        fp(foreach, Lang::TypeScript),
+        fp(stride, Lang::TypeScript),
+        "non-unit stride must not collapse to the for...of"
+    );
+    assert_ne!(
+        fp(foreach, Lang::TypeScript),
+        fp(use_index, Lang::TypeScript),
+        "index used for its own sake must not collapse to the for...of"
+    );
+    assert_ne!(
+        fp(foreach, Lang::TypeScript),
+        fp(other, Lang::TypeScript),
+        "indexing a different collection must not collapse to the for...of"
+    );
+}
+
+#[test]
+fn ts_while_stays_distinct_from_do_while() {
+    // A `while (cond) { body }` checks the guard BEFORE the body; a `do { body } while (cond)`
+    // checks it AFTER (the body always runs at least once). They differ only in guard position,
+    // so a normalizer that canonicalized guard position would wrongly collapse them. Identical
+    // bodies — must stay distinct.
+    let while_top = "function drain(n: number): number {\n  let k = n;\n  let s = 0;\n  while (k > 0) { k -= 2; s += 1; }\n  return s;\n}\n";
+    let do_while = "function drain(n: number): number {\n  let k = n;\n  let s = 0;\n  do { k -= 2; s += 1; } while (k > 0);\n  return s;\n}\n";
+    assert_ne!(
+        fp(while_top, Lang::TypeScript),
+        fp(do_while, Lang::TypeScript),
+        "while (guard-first) must stay distinct from do-while (guard-last)"
+    );
 }
 
 // ---------- arrow → function desugaring (spec §5.2.3) ----------
@@ -217,12 +221,15 @@ fn duplicated_const_arrows_converge() {
 fn ts_test_recognition() {
     let f = "function checkThing(): void {\n  const r = compute(2);\n  expect(r).toBe(3);\n  expect(r).toBeGreaterThan(1);\n}\n";
     assert!(
-        is_test_unit(f, "widget.test.ts"),
+        is_test_unit(f, "widget.test.ts", Lang::TypeScript),
         ".test.ts filename → test"
     );
     assert!(
-        is_test_unit(f, "widget.spec.ts"),
+        is_test_unit(f, "widget.spec.ts", Lang::TypeScript),
         ".spec.ts filename → test"
     );
-    assert!(!is_test_unit(f, "widget.ts"), "plain file → not test");
+    assert!(
+        !is_test_unit(f, "widget.ts", Lang::TypeScript),
+        "plain file → not test"
+    );
 }

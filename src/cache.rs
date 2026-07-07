@@ -58,7 +58,15 @@ pub const GRAMMAR_VERSIONS: &[&str] = &[
 /// and stores the pre-abstraction lowered tree in `raw_trees` (was the canonical
 /// tree), so IR `FileUnits` changed while the plain-unit canonical form (and thus
 /// `ir::kind::SCHEME_VERSION`) stayed put — a one-time global cache regen.
-pub const EXTRACTION_VERSION: u32 = 4;
+///
+/// v5: extraction now caps CST-recursion depth at `normalize::MAX_EXTRACTION_DEPTH` (the
+/// untrusted-input stack-overflow guard), truncating over-deep subtrees and flagging the
+/// unit `parse_degraded`. Pathologically-deep files that *crashed* before can have no valid
+/// cached artifact, but a file nesting between the cap and the (higher) pre-fix overflow
+/// cliff previously extracted a *full* tree and now extracts a truncated one — so its cached
+/// FileUnits could differ from a cold re-extraction. Bumped to keep the D19 hit-≡-cold
+/// invariant: a one-time global cache regen.
+pub const EXTRACTION_VERSION: u32 = 5;
 
 /// Cache key for one source file (D8: the version-keying IS the filename).
 pub fn key(rel_path: &str, content: &str, cfg: &Config) -> u128 {

@@ -77,6 +77,23 @@ impl NormNode {
         self
     }
 
+    /// Clone only the scalar fields (kind/field/label/span), leaving `children`
+    /// empty. The bottom-up detector walks (`src/ir/pass.rs`) do
+    /// `let mut n = node.shallow_clone(); n.children = node.children.iter().map(walk).collect();`
+    /// — a full [`Clone`] there would deep-clone the entire subtree only to discard the
+    /// cloned `children` on the very next line and rebuild them from the recursive map
+    /// (O(subtree) dead allocations per node). This clones just the node's own fields and
+    /// lets the caller populate `children` once; the resulting tree is byte-identical.
+    pub fn shallow_clone(&self) -> NormNode {
+        NormNode {
+            kind: self.kind.clone(),
+            field: self.field.clone(),
+            label: self.label.clone(),
+            span: self.span,
+            children: Vec::new(),
+        }
+    }
+
     /// Normalized token count (DECISIONS.md D1): one token per node.
     pub fn token_count(&self) -> u32 {
         1 + self.children.iter().map(NormNode::token_count).sum::<u32>()

@@ -66,8 +66,11 @@ pub enum Edit {
     NotPush { locus: (u32, u32) },
     /// Merge a nested single-arm, no-else `if a { if b { … } }` into one `if a && b { … }`
     /// (Family C1). Re-derived from the tree at `locus` (the outer `Branch`); reversal re-nests
-    /// the two guards from the recorded depth.
-    GuardMerge { locus: (u32, u32) },
+    /// the two guards from the recorded depth. `op_tok` is the conjunction token to synthesize —
+    /// recorded on the edit (like `CounterIter`/`AbstractIdents` carry witness data) so the
+    /// lang-less applier can REPLAY the language's spelling (`&&` / Python `and`) without a `Lang`
+    /// ever reaching [`apply`]: the detector learns the language, the applier replays the token.
+    GuardMerge { locus: (u32, u32), op_tok: Box<str> },
     /// Drop a redundant `else` after a diverging then-arm and splice its body as siblings
     /// (Family C2). `locus` is the ENCLOSING `Block` (the splice target — a block-level rebuild,
     /// like `LoopExit`); the hoisted else-body rides in the witness so reversal re-wraps it.
@@ -93,7 +96,14 @@ pub fn apply(tree: NormNode, edits: &[Edit], log: &mut TransformLog) -> NormNode
     match first {
         Edit::CommSort { .. } => apply_comm_sort(tree, &mut edits, log),
         Edit::IterProtocol { .. } => apply_iter_protocol(tree, &mut edits, log),
-        Edit::CounterIter { .. } => apply_counter_iter(tree, &mut edits, log),
+        Edit::CounterIter { .. } => {
+            // The counter's liveness check is function-scoped, so `fold_counter_loops` needs the
+            // whole unit `root`. The applier walks/mutates the tree bottom-up (no immutable root
+            // in hand), so snapshot it once at entry — identical to the tree the detector saw, so
+            // both make the same rewrite decisions. Only reached when there IS a counter edit.
+            let root = tree.clone();
+            apply_counter_iter(tree, &root, &mut edits, log)
+        }
         Edit::LoopExit { .. } => apply_loop_exit(tree, &mut edits, log),
         Edit::DropDead { .. } => apply_drop_dead(tree, &mut edits, log),
         Edit::AbstractIdents { .. } => apply_abstract_idents(tree, &mut edits, log),
@@ -169,11 +179,16 @@ fn apply_guard_canonicalize(
             );
         }
     }
-    // C1 · conjunction-merge: a branch-level fold, one edit per merged nest.
-    if let Some(merged) = pass::try_merge_branch(&node) {
-        let Some(Edit::GuardMerge { locus }) = edits.next() else {
+    // C1 · conjunction-merge: a branch-level fold, one edit per merged nest. Mergeability is
+    // SHAPE-ONLY (independent of the token), so peek the shape first, then consume the edit and
+    // REPLAY its recorded `op_tok` — the applier never learns the `Lang`, it just spends the
+    // token the detector wrote down.
+    if pass::is_mergeable_branch(&node) {
+        let Some(Edit::GuardMerge { locus, op_tok }) = edits.next() else {
             unreachable!("apply routed a non-GuardMerge edit into apply_guard_canonicalize");
         };
+        let merged =
+            pass::try_merge_branch(&node, op_tok).expect("mergeability shape checked above");
         if log.enabled() {
             log.record(
                 TransformKind::GuardMerge,
@@ -229,6 +244,18 @@ fn apply_comm_sort(
             .map(|o| apply_comm_sort(o, edits, log))
             .collect();
         if operands.len() >= 2 {
+            let span = node.span;
+            // Recompute the sort to decide whether the detector emitted an edit for
+            // this chain: an identity permutation is already canonical, so the detector
+            // skipped it and there is NO edit to consume (peeking `edits.next()` here
+            // would steal a later chain's edit — the detector and applier must agree on
+            // which chains produce an edit). `to_sexpr` (the sort key) excludes spans,
+            // so this recomputation matches the detector's on the identical operands.
+            let recomputed = pass::sort_perm(&operands);
+            if pass::order_is_identity(&recomputed) {
+                // No reorder, no edit: rebuild in place, preserving the original span.
+                return pass::rebuild_chain(operands, op, node.field, span);
+            }
             let Some(Edit::CommSort { locus, order }) = edits.next() else {
                 unreachable!("apply routed a non-CommSort edit into apply_comm_sort");
             };
@@ -243,7 +270,7 @@ fn apply_comm_sort(
                     Witness::Order(order.clone()),
                 );
             }
-            return pass::rebuild_chain(sorted, op, node.field);
+            return pass::rebuild_chain(sorted, op, node.field, span);
         }
     }
     let mut node = node;
@@ -298,6 +325,7 @@ fn apply_iter_protocol(
 /// the range-protocol loop are the same canonicalization, so they share the event vocabulary.
 fn apply_counter_iter(
     node: NormNode,
+    root: &NormNode,
     edits: &mut std::slice::Iter<'_, Edit>,
     log: &mut TransformLog,
 ) -> NormNode {
@@ -305,10 +333,10 @@ fn apply_counter_iter(
     node.children = node
         .children
         .into_iter()
-        .map(|c| apply_counter_iter(c, edits, log))
+        .map(|c| apply_counter_iter(c, root, edits, log))
         .collect();
     let locus = node.span;
-    for (coll, ivar, _span) in pass::fold_counter_loops(&mut node) {
+    for (coll, ivar, _span) in pass::fold_counter_loops(&mut node, root) {
         let Some(Edit::CounterIter { .. }) = edits.next() else {
             unreachable!("apply routed a non-CounterIter edit into apply_counter_iter");
         };
@@ -336,9 +364,10 @@ fn apply_loop_exit(
         .collect();
     if node.kind.as_ref() == crate::ir::kind::BLOCK {
         let locus = node.span;
-        // `fold_loop_exit` performs the fold in place and reports whether it fired; a
-        // firing block is exactly a detected site, so it consumes one edit.
-        if pass::fold_loop_exit(&mut node) {
+        // `fold_loop_exit` performs the fold in place and reports the fold COUNT (it folds to a
+        // fixpoint, so a nested loop-exit yields more than one). Each fold is exactly one
+        // detected site, so it consumes that many edits — detector and applier stay in lockstep.
+        for _ in 0..pass::fold_loop_exit(&mut node) {
             let Some(Edit::LoopExit { locus: _ }) = edits.next() else {
                 unreachable!("apply routed a non-LoopExit edit into apply_loop_exit");
             };

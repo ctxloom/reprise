@@ -272,11 +272,13 @@ pub(crate) fn is_ir(lang: Lang, cfg: &Config) -> bool {
 fn ir_pass_and_fold(
     expanded: NormNode,
     root_name: &str,
+    lang: Lang,
     cfg: &Config,
 ) -> (NormNode, Vec<RepeatFinding>) {
     let expanded = ir_relower_recursion(expanded, root_name);
     let tree = crate::frontend::run_passes(
         expanded,
+        lang,
         &mut crate::ir::transform::TransformLog::disabled(),
     );
     let mut found: Vec<RepeatFinding> = Vec::new();
@@ -360,7 +362,7 @@ pub fn finish_variant(
     // than the historical `apply_passes`, so a spliced variant converges with the
     // frontend's own canonical form for the equivalent hand-inlined function.
     let (tree, _found) = if is_ir(base.lang, cfg) {
-        ir_pass_and_fold(expanded, &base.name, cfg)
+        ir_pass_and_fold(expanded, &base.name, base.lang, cfg)
     } else {
         pass_and_fold(expanded, base.lang, cfg)
     };
