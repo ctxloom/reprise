@@ -815,6 +815,57 @@ fn main() {
         );
     }
 
+    // ---- optional machine-readable ACCEPT/WEAK dump (set BAKEOFF_DUMP=<path>) ----
+    // The verify-on-union ACCEPT set is the retriever-independent ground truth; main only
+    // prints its size, so this writes the actual pairs (one row per pair, TSV) for a later
+    // stratified precision-labeling pass. Read-only w.r.t. the oracle; gated off by default.
+    if let Ok(dump_path) = std::env::var("BAKEOFF_DUMP") {
+        use std::io::Write;
+        let mut acc_sorted: Vec<(usize, usize)> = accept.iter().copied().collect();
+        acc_sorted.sort_unstable();
+        let mut weak_sorted: Vec<(usize, usize)> = weak.iter().copied().collect();
+        weak_sorted.sort_unstable();
+        let mut out = String::new();
+        out.push_str(&format!(
+            "# reprise bakeoff verify-on-union dump\n# roots={roots:?}\n# n_units={n_units} union_pairs={union_size} accept={} weak={}\n# fields: verdict\\tlang\\tfile_a\\tname_a\\tlspan_a\\ttok_a\\tfp_a\\tfile_b\\tname_b\\tlspan_b\\ttok_b\\tfp_b\n",
+            accept.len(),
+            weak.len()
+        ));
+        let fmt_pair = |verdict: &str, a: usize, b: usize| -> String {
+            let (ua, ub) = (&units[a], &units[b]);
+            format!(
+                "{verdict}\t{:?}\t{}\t{}\t{}-{}\t{}\t{:032x}\t{}\t{}\t{}-{}\t{}\t{:032x}\n",
+                ua.lang,
+                ua.file.display(),
+                ua.name,
+                ua.line_span.0,
+                ua.line_span.1,
+                ua.token_count,
+                ua.fingerprint,
+                ub.file.display(),
+                ub.name,
+                ub.line_span.0,
+                ub.line_span.1,
+                ub.token_count,
+                ub.fingerprint,
+            )
+        };
+        for &(a, b) in &acc_sorted {
+            out.push_str(&fmt_pair("ACCEPT", a, b));
+        }
+        for &(a, b) in &weak_sorted {
+            out.push_str(&fmt_pair("WEAK", a, b));
+        }
+        match std::fs::File::create(&dump_path).and_then(|mut f| f.write_all(out.as_bytes())) {
+            Ok(()) => eprintln!(
+                "[bakeoff] dumped {} ACCEPT + {} WEAK pairs -> {dump_path}",
+                accept.len(),
+                weak.len()
+            ),
+            Err(e) => eprintln!("[bakeoff] DUMP FAILED ({dump_path}): {e}"),
+        }
+    }
+
     // ---- oracle B ----
     let (syn_units, syn_pairs) = build_synthetic(&cfg);
     let syn_run = run_corpus(&syn_units, &cfg);
