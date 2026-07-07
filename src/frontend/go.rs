@@ -354,6 +354,12 @@ fn lower_switch(
         .child_by_field_name("value")
         .and_then(|v| fe.lower_node(v, None, src, log));
     let mut arms = Vec::new();
+    // Go's `default` is a catch-all fallback: it runs only when NO case matches, *regardless of
+    // its source position*. A guard-less arm is the ordered Branch's "always matches" else (§14),
+    // so a mid-list default would make every later real case a dead arm. Collect it and append it
+    // LAST, keeping the real cases in source order — so a `default`-written-first switch converges
+    // with the (semantically identical) `default`-last form and its if-chain. Go allows at most one.
+    let mut default_arm = None;
     let mut c = node.walk();
     for case in node.named_children(&mut c) {
         let (guard, body) = match case.kind() {
@@ -375,11 +381,15 @@ fn lower_switch(
                 }),
                 case_body(fe, case, span, src, log),
             ),
-            "default_case" => (None, case_body(fe, case, span, src, log)),
+            "default_case" => {
+                default_arm = Some(make_arm(None, case_body(fe, case, span, src, log), span));
+                continue;
+            }
             _ => continue,
         };
         arms.push(make_arm(guard, body, span));
     }
+    arms.extend(default_arm);
     make_branch(arms, field, span)
 }
 
@@ -913,6 +923,59 @@ mod tests {
             canon(
                 "func f(a int) int {\n\tif a == 0 {\n\t\treturn g()\n\t} else if a == 1 {\n\t\treturn h()\n\t} else {\n\t\treturn k()\n\t}\n}\n"
             ),
+        );
+    }
+
+    #[test]
+    fn go_default_case_is_ordered_last_regardless_of_source_position() {
+        // A `default` written BEFORE later cases is still a catch-all fallback — Go runs it only
+        // when no case matches, whatever its source position. A guard-less arm is the ordered
+        // Branch's "always matches" else (§14), so a mid-list default would make every later real
+        // case a dead arm. The default is ordered LAST, so a `default`-first switch converges
+        // (byte-identical) with the semantically-identical `default`-last form.
+        let sx = |src: &str| {
+            let (ir, _) = go(src);
+            to_sexpr(&crate::ir::abstract_idents(ir))
+        };
+        let first = "func f(a int) int {\n\tswitch a {\n\tdefault:\n\t\treturn k()\n\tcase 0:\n\t\treturn g()\n\tcase 1:\n\t\treturn h()\n\t}\n}\n";
+        let last = "func f(a int) int {\n\tswitch a {\n\tcase 0:\n\t\treturn g()\n\tcase 1:\n\t\treturn h()\n\tdefault:\n\t\treturn k()\n\t}\n}\n";
+        assert_eq!(
+            sx(first),
+            sx(last),
+            "a source-first `default` must reorder to LAST (converge with default-last)"
+        );
+        // The final arm is the guard-less default; both real cases keep their `==` guards before it.
+        let s = sx(first);
+        let last_arm = s.rfind("Arm@arm").expect("a branch arm");
+        assert!(
+            !s[last_arm..].contains("@guard"),
+            "the final arm must be the guard-less default: {s}"
+        );
+        assert_eq!(
+            s.matches("@guard").count(),
+            2,
+            "both real cases keep a guard: {s}"
+        );
+    }
+
+    #[test]
+    fn go_type_switch_folds_subject_into_a_matches_guard() {
+        // Curiosity-1 regression: the type-switch scrutinee IS exposed under the `value` field
+        // (grammar `type_switch_statement.value: _expression`), so each `case T:` folds to
+        // `matches(subj, T)` — a region-test, NOT a bare lowered type node. A type switch must
+        // therefore stay DISTINCT from a value switch (which folds to `subj == v` equalities).
+        let (ir, _) = go(
+            "func f(x interface{}) int {\n\tswitch x.(type) {\n\tcase int:\n\t\treturn g()\n\tcase string:\n\t\treturn h()\n\t}\n\treturn 0\n}\n",
+        );
+        let s = to_sexpr(&crate::ir::abstract_idents(ir));
+        assert_eq!(
+            s.matches("(Var@callee matches)").count(),
+            2,
+            "each type-case must be a matches(subject, T) guard: {s}"
+        );
+        assert!(
+            !s.contains("(==@op)"),
+            "a type switch is not an equality switch: {s}"
         );
     }
 

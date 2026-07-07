@@ -25,7 +25,13 @@
 /// Bumped to 6 for the Go `for true {}` convergence — a bare `true` condition is now recognized as
 /// the infinite-loop core (no break-guard, mirroring `while true`), so `for true {}` lowers
 /// identically to `for {}` and their canonical output (merkle fingerprint) converges.
-pub const SCHEME_VERSION: u32 = 6;
+/// Bumped to 7 for two IR-frontend lowering fixes that shift canonical output: (1) a Go `switch`
+/// `default` case written before a later `case` is now ordered LAST in the `Branch` (a guard-less
+/// arm is the "always matches" else, so a mid-list default made later real cases dead arms), so a
+/// `default`-first switch converges with the semantically-identical `default`-last form; (2) a Rust
+/// open-start range `..b` now labels `b` as `@right` (the end operand), tracked by the `..`/`..=`
+/// operator position rather than "first named child" — previously `b` was mislabelled `@left`.
+pub const SCHEME_VERSION: u32 = 7;
 
 // ---- structural ----
 pub const UNIT: &str = "Unit";

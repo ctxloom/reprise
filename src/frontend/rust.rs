@@ -489,14 +489,19 @@ fn lower_range(
     log: &mut TransformLog,
 ) -> NormNode {
     let mut children = Vec::new();
-    let mut first = true;
+    // Operand position is fixed by the `..`/`..=` operator token, NOT by "first named child":
+    // an open-START range `..b` has no left operand, so `b` (the only operand, visited *before*
+    // any `@left` was assigned) must still be `@right`. Track whether the op token has been seen —
+    // an operand before it is the start (`@left`), after it the end (`@right`). This gives
+    // `b..`→`@left`, `..b`→`@right`, `a..b`→`@left,@right`; the old "flip on first named child"
+    // mislabelled `..b`'s end operand as the start.
+    let mut seen_op = false;
     let mut cursor = node.walk();
     for c in node.children(&mut cursor) {
         if c.is_named() {
-            let f = if first { "left" } else { "right" };
+            let f = if seen_op { "right" } else { "left" };
             if let Some(n) = fe.lower_node(c, Some(f), src, log) {
                 children.push(n);
-                first = false;
             }
         } else {
             let op_span = (c.start_byte() as u32, c.end_byte() as u32);
@@ -506,6 +511,7 @@ fn lower_range(
                 op_span,
                 Vec::new(),
             ));
+            seen_op = true;
         }
     }
     NormNode::new(kind::BINOP, field, span, children)
@@ -626,6 +632,55 @@ mod tests {
             &edits,
             &mut crate::ir::TransformLog::disabled(),
         ))
+    }
+
+    #[test]
+    fn open_start_range_labels_its_operand_as_the_end() {
+        // Curiosity-4 regression: `..b`'s single operand is the range END → `@right`, its position
+        // fixed by the `..`/`..=` operator token (NOT "first named child" — an open-start range has
+        // no left operand). So `..b` (open start) must stay DISTINCT from `b..` (open end) and from
+        // a bounded `a..b`. The old "flip on first named child" mislabelled `..b`'s end as `@left`.
+        let fp = |src: &str| {
+            let (ir, _) = rust(src);
+            crate::fingerprint::merkle(&crate::ir::abstract_idents(ir))
+        };
+        let end = abs("fn f(b: i32) { let z = ..b; }");
+        assert!(
+            end.contains("(Binop@value (..@op) (Var@right"),
+            "..b end operand must be @right: {end}"
+        );
+        let start = abs("fn f(b: i32) { let z = b..; }");
+        assert!(
+            start.contains("(Binop@value (Var@left"),
+            "b.. start operand must be @left: {start}"
+        );
+        let bounded = abs("fn f(a: i32, b: i32) { let z = a..b; }");
+        assert!(
+            bounded.contains("(Binop@value (Var@left") && bounded.contains("(Var@right"),
+            "a..b must carry both @left and @right: {bounded}"
+        );
+        // The `..=` inclusive form labels identically (operator position, not token identity).
+        assert!(
+            abs("fn f(a: i32, b: i32) { let z = a..=b; }")
+                .contains("(Binop@value (Var@left v0) (..=@op) (Var@right v1))"),
+            "a..=b must label @left/@right"
+        );
+        // A full range `..` has no operands at all.
+        assert!(
+            abs("fn f() { let z = ..; }").contains("(Binop@value (..@op))"),
+            "full range has no operands"
+        );
+        // Fingerprint-level distinctness (the same-language convergence the mislabel risked).
+        assert_ne!(
+            fp("fn f(b: i32) { let z = ..b; }"),
+            fp("fn f(b: i32) { let z = b..; }"),
+            "..b (open start) must stay distinct from b.. (open end)"
+        );
+        assert_ne!(
+            fp("fn f(b: i32) { let z = ..b; }"),
+            fp("fn f(a: i32, b: i32) { let z = a..b; }"),
+            "..b must stay distinct from a..b"
+        );
     }
 
     #[test]
