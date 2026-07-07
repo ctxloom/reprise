@@ -68,6 +68,11 @@ bench-mutations-historical:
 bench-retrieval *ROOTS:
     cargo run --release --example bakeoff -- {{ROOTS}}
 
+# Fetch the opt-in real-world benchmark corpus (benches/corpus submodules,
+# pinned to release tags — see benches/corpus/README.md); not fetched on clone.
+corpus-fetch:
+    git submodule update --init --checkout --depth 1 -- benches/corpus
+
 # Dogfood: the tool scans its own repo (spec §3)
 scan-self:
     cargo run --release -- scan .
