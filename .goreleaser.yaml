@@ -28,17 +28,29 @@ builds:
     command: build
     flags:
       - --release
+      # Cargo.toml is a workspace with additive crates/ members (server-core,
+      # mcp, lsp); disambiguate so the rust builder builds the CLI, not a sub-crate.
+      - --package=reprise
     targets:
       - x86_64-unknown-linux-musl
       - aarch64-unknown-linux-musl
       - x86_64-apple-darwin
       - aarch64-apple-darwin
+      # Windows amd64 only (parity with ctxloom/taskloom/ltk — no aarch64-windows).
+      # -gnu (not -msvc) so zig cc still supplies the cross C toolchain the
+      # tree-sitter grammars need, exactly as it does for the musl/darwin targets.
+      - x86_64-pc-windows-gnu
 
 archives:
   - id: default
     ids:
       - reprise
     formats: [tar.gz]
+    # Windows ships a .zip instead of tar.gz (parity with the Go repos); every
+    # other OS keeps tar.gz. The cask only references the macOS/Linux tar.gz.
+    format_overrides:
+      - goos: windows
+        formats: [zip]
     # reprise_<version>_<os>_<arch>.tar.gz — the URL scheme the generated cask
     # points at (github.com/ctxloom/reprise/releases/download/...).
     name_template: >-
