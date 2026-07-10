@@ -116,11 +116,18 @@ fn default_branch(root: &Path) -> Option<String> {
 
 /// Run a git subcommand in `root`, returning trimmed-nothing stdout on a clean
 /// exit and `None` otherwise. Never panics: a missing git binary is just `None`.
+///
+/// Scrubs GIT_INDEX_FILE/GIT_DIR/GIT_WORK_TREE for the same reason as
+/// `reprise::check::git_cmd`: an inherited value redirects this child at the
+/// CALLER's repo state (e.g. a pre-commit hook's index) instead of `root`.
 fn git(root: &Path, args: &[&str]) -> Option<String> {
     let out = Command::new("git")
         .arg("-C")
         .arg(root)
         .args(args)
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
         .output()
         .ok()?;
     out.status
