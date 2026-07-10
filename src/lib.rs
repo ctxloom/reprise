@@ -170,29 +170,69 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
             .into_par_iter()
             .map(|i| inline::expand_unit(i, &raw_trees[i], &units, &table, config))
             .collect();
+
+        /// Per-unit result of the tail below: `finish_variant` is a full
+        /// re-normalization + merkle, independent per index (reads only
+        /// `units[i]` and this unit's own `exp`, writes nothing shared), so
+        /// it maps in parallel like `FileOutcome` above. The stats fields are
+        /// summed in the sequential fold that follows, over the
+        /// order-preserving `collect()` — identical to the serial form.
+        struct VariantOutcome {
+            ambiguity_skips: u32,
+            calls_inlined: u32,
+            variant: Option<Unit>,
+        }
+        let outcomes: Vec<VariantOutcome> = expansions
+            .into_par_iter()
+            .enumerate()
+            .map(|(i, exp)| {
+                let ambiguity_skips = exp.ambiguity_skips;
+                if exp.calls_inlined == 0 {
+                    return VariantOutcome {
+                        ambiguity_skips,
+                        calls_inlined: 0,
+                        variant: None,
+                    };
+                }
+                let Some(mut variant) = unit::finish_variant(i, &units[i], exp.tree, config) else {
+                    // inlining changed nothing post-normalization
+                    return VariantOutcome {
+                        ambiguity_skips,
+                        calls_inlined: 0,
+                        variant: None,
+                    };
+                };
+                let expanded_fps: Vec<u128> = exp
+                    .expanded_units
+                    .iter()
+                    .map(|&u| units[u].fingerprint)
+                    .collect();
+                if expanded_fps.contains(&variant.fingerprint) {
+                    // D3: a pure wrapper's variant IS its callee
+                    return VariantOutcome {
+                        ambiguity_skips,
+                        calls_inlined: 0,
+                        variant: None,
+                    };
+                }
+                let tag = variant.variant.as_mut().expect("finish_variant tags");
+                tag.chain = exp.chain;
+                tag.expanded_fps = expanded_fps;
+                tag.scc = exp.scc;
+                VariantOutcome {
+                    ambiguity_skips,
+                    calls_inlined: exp.calls_inlined,
+                    variant: Some(variant),
+                }
+            })
+            .collect();
         let mut variants: Vec<Unit> = Vec::new();
-        for (i, exp) in expansions.into_iter().enumerate() {
-            stats.ambiguity_skips += exp.ambiguity_skips as usize;
-            if exp.calls_inlined == 0 {
-                continue;
+        for outcome in outcomes {
+            stats.ambiguity_skips += outcome.ambiguity_skips as usize;
+            stats.calls_inlined += outcome.calls_inlined as usize;
+            if let Some(variant) = outcome.variant {
+                variants.push(variant);
             }
-            let Some(mut variant) = unit::finish_variant(i, &units[i], exp.tree, config) else {
-                continue; // inlining changed nothing post-normalization
-            };
-            let expanded_fps: Vec<u128> = exp
-                .expanded_units
-                .iter()
-                .map(|&u| units[u].fingerprint)
-                .collect();
-            if expanded_fps.contains(&variant.fingerprint) {
-                continue; // D3: a pure wrapper's variant IS its callee
-            }
-            stats.calls_inlined += exp.calls_inlined as usize;
-            let tag = variant.variant.as_mut().expect("finish_variant tags");
-            tag.chain = exp.chain;
-            tag.expanded_fps = expanded_fps;
-            tag.scc = exp.scc;
-            variants.push(variant);
         }
         stats.inline_variants = variants.len(); // ≤1 per unit: the §12 cap
         units.extend(variants);

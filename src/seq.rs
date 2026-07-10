@@ -77,7 +77,7 @@ pub fn lcp_array(tokens: &[u32], sa: &[u32]) -> Vec<u32> {
     lcp
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RegionPair {
     pub unit_a: u32,
     pub tok_a: (usize, usize),
@@ -131,14 +131,34 @@ pub fn maximal_repeats(corpus: &Corpus, min_len: usize) -> Vec<RegionPair> {
             len: l,
         });
     }
-    // Containment dedup per unit pair: keep runs not covered by a longer run.
+    dedup_contained(pairs)
+}
+
+/// Containment dedup per unit pair (spec §5.6): keep runs not covered by a
+/// longer run. Formerly `kept.iter().any(...)` over ALL previously-kept
+/// regions for every candidate — O(pairs × kept) — even though the covering
+/// predicate requires `q.unit_a == p.unit_a && q.unit_b == p.unit_b`, so it
+/// can only ever hold between regions of the SAME unit pair (see the
+/// brute-force oracle kept as a differential-test reference below). Sorting
+/// by `(unit_a, unit_b, Reverse(len))` makes a unit pair's regions
+/// contiguous in `pairs`, and since survivors are appended in that same
+/// order, they land contiguously in `kept` too — so scoping the scan to the
+/// current segment (`kept[segment_start..]`) is behavior-preserving and
+/// drops the unit-pair equality check as redundant (the segment already
+/// guarantees it).
+fn dedup_contained(mut pairs: Vec<RegionPair>) -> Vec<RegionPair> {
     pairs.sort_by_key(|p| (p.unit_a, p.unit_b, std::cmp::Reverse(p.len)));
     let mut kept: Vec<RegionPair> = Vec::new();
+    let mut segment_start = 0usize;
+    let mut current_pair: Option<(u32, u32)> = None;
     for p in pairs {
-        let covered = kept.iter().any(|q| {
-            q.unit_a == p.unit_a
-                && q.unit_b == p.unit_b
-                && q.tok_a.0 <= p.tok_a.0
+        let key = (p.unit_a, p.unit_b);
+        if current_pair != Some(key) {
+            segment_start = kept.len();
+            current_pair = Some(key);
+        }
+        let covered = kept[segment_start..].iter().any(|q| {
+            q.tok_a.0 <= p.tok_a.0
                 && p.tok_a.1 <= q.tok_a.1
                 && q.tok_b.0 <= p.tok_b.0
                 && p.tok_b.1 <= q.tok_b.1
@@ -148,4 +168,78 @@ pub fn maximal_repeats(corpus: &Corpus, min_len: usize) -> Vec<RegionPair> {
         }
     }
     kept
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The original O(pairs × kept) all-pairs scan, kept only here as the
+    /// differential-test oracle for the segment-scoped `dedup_contained`.
+    fn brute_dedup_contained(mut pairs: Vec<RegionPair>) -> Vec<RegionPair> {
+        pairs.sort_by_key(|p| (p.unit_a, p.unit_b, std::cmp::Reverse(p.len)));
+        let mut kept: Vec<RegionPair> = Vec::new();
+        for p in pairs {
+            let covered = kept.iter().any(|q| {
+                q.unit_a == p.unit_a
+                    && q.unit_b == p.unit_b
+                    && q.tok_a.0 <= p.tok_a.0
+                    && p.tok_a.1 <= q.tok_a.1
+                    && q.tok_b.0 <= p.tok_b.0
+                    && p.tok_b.1 <= q.tok_b.1
+            });
+            if !covered {
+                kept.push(p);
+            }
+        }
+        kept
+    }
+
+    #[test]
+    fn dedup_contained_matches_brute_force_oracle() {
+        // Deterministic LCG (no external rand dependency) exercising many
+        // random unit-pair/span shapes against the O(n²) oracle above —
+        // mirrors group.rs's `contained_flags_matches_brute_force_oracle`.
+        struct Lcg(u64);
+        impl Lcg {
+            fn next(&mut self) -> u64 {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                self.0
+            }
+            fn range(&mut self, n: u32) -> u32 {
+                (self.next() % u64::from(n)) as u32
+            }
+        }
+
+        for seed in 0..50u64 {
+            let mut rng = Lcg(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1));
+            let unit_count = 2 + rng.range(3);
+            let pair_count = 4 + rng.range(20);
+            let mut pairs = Vec::new();
+            for _ in 0..pair_count {
+                let ua = rng.range(unit_count);
+                let mut ub = rng.range(unit_count);
+                while ub == ua {
+                    ub = rng.range(unit_count);
+                }
+                let (unit_a, unit_b) = (ua.min(ub), ua.max(ub));
+                let start_a = rng.range(20) as usize;
+                let start_b = rng.range(20) as usize;
+                let len = 1 + rng.range(10) as usize;
+                pairs.push(RegionPair {
+                    unit_a,
+                    tok_a: (start_a, start_a + len),
+                    unit_b,
+                    tok_b: (start_b, start_b + len),
+                    len,
+                });
+            }
+            let expected = brute_dedup_contained(pairs.clone());
+            let actual = dedup_contained(pairs);
+            assert_eq!(actual, expected, "seed {seed}");
+        }
+    }
 }
