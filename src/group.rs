@@ -5,7 +5,10 @@ use crate::config::Config;
 use crate::lang::Lang;
 use crate::report::{Group, Member, Tier};
 use crate::unit::Unit;
+use rayon::prelude::*;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::path::Path;
 
 /// Exact tier (plain units only): returns groups plus their member unit
 /// indices (the indices feed sequence-tier subsumption) and the below-floor
@@ -32,10 +35,11 @@ pub fn build_exact_groups(units: &[Unit], cfg: &Config) -> (Vec<(Group, Vec<usiz
         .filter(|members| members.len() >= 2)
         .collect();
 
+    let contained = contained_flags(units, &raw_groups);
     let kept: Vec<&Vec<usize>> = raw_groups
         .iter()
         .enumerate()
-        .filter(|(i, group)| !is_contained_in_other(units, group, *i, &raw_groups))
+        .filter(|(i, _)| !contained[*i])
         .map(|(_, g)| g)
         .collect();
 
@@ -185,27 +189,114 @@ pub fn substantive_tokens(token_count: u32, boilerplate_mass: u32) -> u32 {
         .max(1)
 }
 
+/// Per-file span index over raw exact-groups' members, built once and shared
+/// across every group's containment check (spec §5.6). Containment can only
+/// ever hold between members that share a file, so bucketing by file collapses
+/// the O(raw_groups²) all-pairs scan down to work proportional to how many
+/// raw-group members actually land in the same file — small even in a
+/// duplication-heavy corpus, since distinct checkouts of the same tree don't
+/// share file paths.
+struct SpanIndex<'u> {
+    // file -> (start, end, owning raw-group index), sorted by start ascending
+    // (ties by end descending, immaterial to correctness — only lets the
+    // `partition_point` prefix end as early as possible).
+    by_file: HashMap<&'u Path, Vec<(u32, u32, usize)>>,
+}
+
+impl<'u> SpanIndex<'u> {
+    fn build(units: &'u [Unit], raw_groups: &[Vec<usize>]) -> Self {
+        let mut by_file: HashMap<&'u Path, Vec<(u32, u32, usize)>> = HashMap::new();
+        for (gi, group) in raw_groups.iter().enumerate() {
+            for &ui in group {
+                let u = &units[ui];
+                by_file.entry(u.file.as_path()).or_default().push((
+                    u.byte_span.0,
+                    u.byte_span.1,
+                    gi,
+                ));
+            }
+        }
+        for spans in by_file.values_mut() {
+            spans.sort_unstable_by_key(|&(start, end, _)| (start, std::cmp::Reverse(end)));
+        }
+        Self { by_file }
+    }
+
+    /// Distinct raw-group indices (sorted, deduped) with a member in `file`
+    /// that properly contains `(start, end)` — mirrors the original pairwise
+    /// check: same file, spans not identical, and non-strict containment on
+    /// both endpoints. `exclude` is the querying group itself (never its own
+    /// container).
+    fn containers(&self, file: &Path, start: u32, end: u32, exclude: usize, out: &mut Vec<usize>) {
+        out.clear();
+        let Some(spans) = self.by_file.get(file) else {
+            return;
+        };
+        // Sorted by start ascending: every candidate outer span has start <=
+        // start, so this prefix is exactly (and only) the containment
+        // candidates left to filter by end.
+        let upper = spans.partition_point(|&(s, _, _)| s <= start);
+        for &(s, e, gi) in &spans[..upper] {
+            if gi != exclude && e >= end && (s, e) != (start, end) {
+                out.push(gi);
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+    }
+}
+
 /// Spec §5.6 subsumption: a group entirely nested inside the members of one
-/// other group (closures inside matching functions) is suppressed.
+/// other group (closures inside matching functions) is suppressed. Formerly an
+/// O(raw_groups²) nested scan (see git history for the brute-force form kept
+/// as a differential-test oracle below); replaced with the per-file
+/// `SpanIndex` since containment is only possible within a shared file. Each
+/// group's flag is independent of every other group's (the check is always
+/// against `raw_groups`, never the filtered survivors), so the flags can be
+/// computed in parallel with no effect on the result.
+fn contained_flags(units: &[Unit], raw_groups: &[Vec<usize>]) -> Vec<bool> {
+    let index = SpanIndex::build(units, raw_groups);
+    raw_groups
+        .par_iter()
+        .enumerate()
+        .map(|(own_index, group)| is_contained_in_other(units, &index, group, own_index))
+        .collect()
+}
+
+/// True if every member of `group` is properly contained (same file, strict
+/// span containment) by SOME member of one other group `h` — possibly a
+/// different `h`-member per `group`-member. Existence-only (spec §5.6 doesn't
+/// pick a "winning" container, it only suppresses), so there is no
+/// order-dependent tie-break to preserve.
 fn is_contained_in_other(
     units: &[Unit],
+    index: &SpanIndex,
     group: &[usize],
     own_index: usize,
-    all: &[Vec<usize>],
 ) -> bool {
-    all.iter().enumerate().any(|(i, outer)| {
-        i != own_index
-            && group.iter().all(|&gi| {
-                let inner = &units[gi];
-                outer.iter().any(|&oi| {
-                    let out = &units[oi];
-                    out.file == inner.file
-                        && out.byte_span != inner.byte_span
-                        && out.byte_span.0 <= inner.byte_span.0
-                        && inner.byte_span.1 <= out.byte_span.1
-                })
-            })
-    })
+    // counts[h] = number of this group's members contained by some member of h;
+    // h qualifies once its count reaches every member.
+    let mut counts: HashMap<usize, u32> = HashMap::new();
+    let mut candidates = Vec::new();
+    for &gi in group {
+        let inner = &units[gi];
+        index.containers(
+            &inner.file,
+            inner.byte_span.0,
+            inner.byte_span.1,
+            own_index,
+            &mut candidates,
+        );
+        // No group at all contains this member => no single outer group can
+        // contain every member (matches the original short-circuit via `.all()`).
+        if candidates.is_empty() {
+            return false;
+        }
+        for &h in &candidates {
+            *counts.entry(h).or_insert(0) += 1;
+        }
+    }
+    counts.values().any(|&c| c as usize == group.len())
 }
 
 /// Cross-tier membership subsumption (user-reported report gap): a group whose
@@ -358,5 +449,138 @@ mod tests {
         let region_sub = mk(Tier::ExactRegion, &["a", "b"]);
         let unit_super = mk(Tier::NearNormalized, &["a", "b", "c"]);
         assert_eq!(dedupe_subset_groups(vec![region_sub, unit_super]).len(), 2);
+    }
+
+    fn mk_unit(file: &str, span: (u32, u32)) -> Unit {
+        Unit {
+            file: PathBuf::from(file),
+            lang: crate::lang::Lang::Rust,
+            name: String::new(),
+            byte_span: span,
+            line_span: (0, 0),
+            token_count: 10,
+            parse_degraded: false,
+            is_test: false,
+            accept_drift: false,
+            fingerprint: 0,
+            tree: crate::tree::NormNode::new("Unit", None, span, Vec::new()),
+            variant: None,
+        }
+    }
+
+    /// The original O(raw_groups²) all-pairs scan, kept only here as the
+    /// differential-test oracle for the `SpanIndex`-based `contained_flags`.
+    fn brute_contained_flags(units: &[Unit], raw_groups: &[Vec<usize>]) -> Vec<bool> {
+        (0..raw_groups.len())
+            .map(|own_index| {
+                let group = &raw_groups[own_index];
+                raw_groups.iter().enumerate().any(|(i, outer)| {
+                    i != own_index
+                        && group.iter().all(|&gi| {
+                            let inner = &units[gi];
+                            outer.iter().any(|&oi| {
+                                let out = &units[oi];
+                                out.file == inner.file
+                                    && out.byte_span != inner.byte_span
+                                    && out.byte_span.0 <= inner.byte_span.0
+                                    && inner.byte_span.1 <= out.byte_span.1
+                            })
+                        })
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn contained_flags_flags_group_nested_in_another_same_file() {
+        // group 0: an outer function spanning most of the file, duplicated in
+        // two files. group 1: a closure nested strictly inside it, also
+        // duplicated in the same two files => group 1 is suppressed.
+        let units = vec![
+            mk_unit("a.rs", (0, 100)), // 0: outer in a.rs
+            mk_unit("b.rs", (0, 100)), // 1: outer in b.rs
+            mk_unit("a.rs", (10, 20)), // 2: inner in a.rs
+            mk_unit("b.rs", (10, 20)), // 3: inner in b.rs
+        ];
+        let raw_groups = vec![vec![0, 1], vec![2, 3]];
+        assert_eq!(contained_flags(&units, &raw_groups), vec![false, true]);
+    }
+
+    #[test]
+    fn contained_flags_requires_same_file() {
+        // The inner span sits inside outer's numeric range but in a DIFFERENT
+        // file — must not count as containment.
+        let units = vec![mk_unit("a.rs", (0, 100)), mk_unit("b.rs", (10, 20))];
+        let raw_groups = vec![vec![0], vec![1]];
+        assert_eq!(contained_flags(&units, &raw_groups), vec![false, false]);
+    }
+
+    #[test]
+    fn contained_flags_ignores_identical_spans() {
+        // Same file, same span, different group: not containment (the
+        // original excludes exact byte_span equality).
+        let units = vec![mk_unit("a.rs", (10, 20)), mk_unit("a.rs", (10, 20))];
+        let raw_groups = vec![vec![0], vec![1]];
+        assert_eq!(contained_flags(&units, &raw_groups), vec![false, false]);
+    }
+
+    #[test]
+    fn contained_flags_needs_every_member_covered() {
+        // group 1 has two members in a.rs; only one is nested inside group
+        // 0's a.rs member, and there is no b.rs container at all — group 1
+        // must NOT be suppressed since not every member is covered.
+        let units = vec![
+            mk_unit("a.rs", (0, 100)), // 0: outer in a.rs only
+            mk_unit("a.rs", (10, 20)), // 1: covered inner in a.rs
+            mk_unit("b.rs", (10, 20)), // 2: uncovered inner in b.rs
+        ];
+        let raw_groups = vec![vec![0], vec![1, 2]];
+        assert_eq!(contained_flags(&units, &raw_groups), vec![false, false]);
+    }
+
+    #[test]
+    fn contained_flags_matches_brute_force_oracle() {
+        // Deterministic LCG (no external rand dependency) exercising many
+        // random file/span/group shapes against the O(n²) oracle above.
+        struct Lcg(u64);
+        impl Lcg {
+            fn next(&mut self) -> u64 {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                self.0
+            }
+            fn range(&mut self, n: u32) -> u32 {
+                (self.next() % u64::from(n)) as u32
+            }
+        }
+
+        for seed in 0..50u64 {
+            let mut rng = Lcg(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1));
+            let file_count = 1 + rng.range(3);
+            let files: Vec<String> = (0..file_count).map(|i| format!("f{i}.rs")).collect();
+
+            let mut units: Vec<Unit> = Vec::new();
+            let mut raw_groups: Vec<Vec<usize>> = Vec::new();
+            let group_count = 2 + rng.range(6);
+            for _ in 0..group_count {
+                let member_count = 2 + rng.range(3);
+                let mut members = Vec::new();
+                for _ in 0..member_count {
+                    let file = &files[rng.range(file_count) as usize];
+                    let start = rng.range(20);
+                    let len = 1 + rng.range(10);
+                    let span = (start, start + len);
+                    units.push(mk_unit(file, span));
+                    members.push(units.len() - 1);
+                }
+                raw_groups.push(members);
+            }
+
+            let expected = brute_contained_flags(&units, &raw_groups);
+            let actual = contained_flags(&units, &raw_groups);
+            assert_eq!(actual, expected, "seed {seed}");
+        }
     }
 }
