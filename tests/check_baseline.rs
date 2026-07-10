@@ -810,3 +810,85 @@ fn accept_drift_pragma_demotes_iu_to_info() {
         report.findings
     );
 }
+
+// ---- git-env-scrub: hook-injected GIT_INDEX_FILE must not leak into
+// reprise's own git children and clobber the CALLER's real index ----
+
+/// `git commit` exports GIT_INDEX_FILE into every hook's environment,
+/// pointing at the committing worktree's REAL index. `reprise check --base`,
+/// on a base-state cache miss, shells out `git worktree add` (BaseWorktree::
+/// add) to materialize a comparison checkout of the base ref. If that
+/// subprocess inherits GIT_INDEX_FILE, its internal checkout writes the base
+/// ref's tree into the CALLER's real index — silently discarding whatever was
+/// staged (a hook's about-to-be-committed change). This drives `reprise`
+/// through its own CLI binary (not `check::run` in-process) with
+/// GIT_INDEX_FILE set on the child, exactly as a git hook would see it, and
+/// asserts the caller's staged state and index file survive byte-for-byte.
+#[test]
+fn hook_injected_git_index_file_does_not_corrupt_caller_index() {
+    let dir = git_repo_with_family();
+    let root = dir.path();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "init"]);
+
+    // Stage an uncommitted change — the CALLER's real staged state a
+    // pre-commit hook would be about to commit.
+    let f0 = root.join("m0.rs");
+    let edited = family_member(0).replace("> 450", "> 999");
+    fs::write(&f0, &edited).unwrap();
+    git(root, &["add", "m0.rs"]);
+
+    let before_diff = git_stdout(root, &["diff", "--cached"]);
+    assert!(!before_diff.trim().is_empty(), "setup: nothing staged");
+
+    // The repo's real index path, exactly what `git commit` exports as
+    // GIT_INDEX_FILE into a pre-commit hook's environment. `git_repo_with_
+    // family` is a plain (non-worktree) repo, so this is simply .git/index.
+    let idx_path = root.join(".git").join("index");
+    assert!(idx_path.is_file(), "expected a plain, non-worktree index");
+    let before_idx = fs::read(&idx_path).unwrap();
+
+    // First run of `check --base HEAD` on a fresh repo is always a base-state
+    // cache miss, so it must exercise BaseWorktree::add. Spawn the actual
+    // `reprise` binary (not the in-process `check::run`) with GIT_INDEX_FILE
+    // set on it, so the test drives real child-process env inheritance.
+    let bin = env!("CARGO_BIN_EXE_reprise");
+    let _ = Command::new(bin)
+        .args(["check"])
+        .arg(root)
+        .args(["--base", "HEAD"])
+        .env("GIT_INDEX_FILE", &idx_path)
+        .output()
+        .unwrap();
+
+    let after_diff = git_stdout(root, &["diff", "--cached"]);
+    let after_idx = fs::read(&idx_path).unwrap();
+
+    assert_eq!(
+        before_diff, after_diff,
+        "caller's staged diff changed — an inherited GIT_INDEX_FILE leaked \
+         into a git child reprise spawned and clobbered the real index"
+    );
+    assert_eq!(
+        before_idx, after_idx,
+        "caller's real index file was overwritten — an inherited \
+         GIT_INDEX_FILE leaked into a git child reprise spawned"
+    );
+}
+
+/// Like `git`, but returns captured stdout instead of asserting on exit
+/// status — used where the test inspects output rather than driving setup.
+fn git_stdout(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .expect("git runs");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
