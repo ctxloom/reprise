@@ -127,6 +127,22 @@ pub fn extract_file_units_keep_raw(path: &Path, src: &str, lang: Lang, cfg: &Con
     if cfg.normalize.normalizer == Normalizer::Ir && crate::frontend::has_ir_frontend(lang) {
         return extract_ir_file_units(path, src, lang, cfg);
     }
+    // `normalizer = "historical"` (or an IR-frontend-less language under `"ir"`, which also
+    // falls to this branch) is about to call `lang.profile()` below (via `pass_and_fold`). C
+    // has no historical `LanguageProfile` (WP-K1a: IR-frontend-only, CLAUDE.md — the
+    // historical per-grammar layer is retired for new languages), so fail loudly here with an
+    // actionable message rather than let `profile()` panic deep in the pipeline. The primary
+    // production entry point (`corpus_units` in `src/lib.rs`) already checks this earlier and
+    // returns a clean `anyhow` error before any file reaches this function; this assert is the
+    // belt-and-suspenders guard for the lower-level extraction APIs (`extract_file_units`,
+    // `units_from_source`) that bypass `corpus_units`.
+    assert!(
+        lang.has_historical_profile(),
+        "reprise: `normalizer = \"historical\"` does not support {lang:?} ({}) — C is \
+         IR-frontend-only; select `normalizer = \"ir\"` (the default) or exclude these files \
+         from the scan",
+        path.display(),
+    );
     let mut out = FileUnits {
         units: Vec::new(),
         repeats: Vec::new(),
@@ -450,6 +466,28 @@ mod tests {
         let units = units_from_source("fn add(a: i32) -> i32 { return a + 1; }", Lang::Rust, &cfg);
         assert_eq!(units.len(), 1);
         assert_ne!(units[0].tree.kind.as_ref(), "Unit");
+    }
+
+    #[test]
+    fn c_has_no_historical_profile_and_ir_is_unaffected() {
+        // C is IR-frontend-only (WP-K1a): `normalizer = "ir"` (the default) works normally...
+        let units = units_from_source("int add(int a) { return a + 1; }", Lang::C, &ir_cfg());
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].tree.kind.as_ref(), "Unit");
+    }
+
+    #[test]
+    #[should_panic(expected = "does not support")]
+    fn c_under_historical_normalizer_fails_loudly_not_silently() {
+        // ...but `normalizer = "historical"` has no `LanguageProfile` for C (CLAUDE.md: the
+        // historical per-grammar layer is retired for new languages) — this must fail LOUDLY
+        // (a clear, actionable panic) rather than silently produce wrong/empty output or let
+        // `Lang::profile()` panic with an unrelated message deep in the pipeline. The primary
+        // production path (`corpus_units` in `src/lib.rs`) catches this earlier with a clean
+        // `anyhow` error instead of a panic — see `c_historical_policy.rs`'s integration test.
+        let mut cfg = Config::default();
+        cfg.normalize.normalizer = Normalizer::Historical;
+        let _ = units_from_source("int add(int a) { return a + 1; }", Lang::C, &cfg);
     }
 
     #[test]

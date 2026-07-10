@@ -37,7 +37,7 @@ struct FindSimilarRequest {
     path: String,
     /// The candidate code — a complete function / method definition.
     snippet: String,
-    /// Language of the snippet: rust | python | typescript | tsx | go | kotlin
+    /// Language of the snippet: rust | python | typescript | tsx | go | kotlin | c
     /// (or the matching file extension, e.g. `rs`).
     lang: String,
 }

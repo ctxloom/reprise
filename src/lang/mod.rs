@@ -24,6 +24,14 @@ pub enum Lang {
     Tsx,
     Go,
     Kotlin,
+    /// C (`.c`/`.h` — `.h` parses as C until C++ support exists, WP-K1a). **IR-frontend
+    /// only**: unlike every other language here, C has no historical `LanguageProfile` and
+    /// none will be written (CLAUDE.md: the historical per-grammar layer is retired for new
+    /// languages) — `profile()` has no real implementation for `C` (see
+    /// [`has_historical_profile`](Lang::has_historical_profile)). `normalizer = "historical"`
+    /// is refused before extraction ever reaches `profile()` for a C file (see
+    /// `unit::extract_file_units_keep_raw` and `corpus_units` in `src/lib.rs`).
+    C,
 }
 
 impl Lang {
@@ -35,6 +43,9 @@ impl Lang {
             "tsx" => Some(Lang::Tsx),
             "go" => Some(Lang::Go),
             "kt" | "kts" => Some(Lang::Kotlin),
+            // `.h` is ambiguous between C and C++ in general, but reprise has no C++
+            // frontend yet — until it does, every `.h` is treated as C (WP-K1a decision).
+            "c" | "h" => Some(Lang::C),
             _ => None,
         }
     }
@@ -47,7 +58,16 @@ impl Lang {
             Lang::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
             Lang::Go => tree_sitter_go::LANGUAGE.into(),
             Lang::Kotlin => tree_sitter_kotlin_ng::LANGUAGE.into(),
+            Lang::C => tree_sitter_c::LANGUAGE.into(),
         }
+    }
+
+    /// Whether [`profile`](Lang::profile) is safe to call for this language — false only for
+    /// `C`. Every historical-path entry point (`unit::extract_file_units_keep_raw`,
+    /// `corpus_units`) must check this (or the equivalent `normalizer = "ir"` capability gate)
+    /// before reaching `profile()`, since `C`'s arm has no real implementation.
+    pub fn has_historical_profile(self) -> bool {
+        !matches!(self, Lang::C)
     }
 
     pub fn profile(self) -> &'static dyn LanguageProfile {
@@ -58,6 +78,17 @@ impl Lang {
             Lang::TypeScript | Lang::Tsx => &typescript::TypeScriptProfile,
             Lang::Go => &go::GoProfile,
             Lang::Kotlin => &kotlin::KotlinProfile,
+            // C is IR-frontend-only (see `has_historical_profile`): every caller reachable in
+            // production checks that gate first (`unit::extract_file_units_keep_raw` asserts
+            // it, and `corpus_units` bails even earlier with a clean error), so this arm is
+            // unreachable there. It stays a clear, named panic — not a silent bad value —
+            // for any lower-level caller that bypasses those guards.
+            Lang::C => panic!(
+                "Lang::C has no historical LanguageProfile (C is IR-frontend-only); this is \
+                 unreachable via `unit::extract_file_units_keep_raw`/`corpus_units`, which \
+                 refuse `normalizer = \"historical\"` for C before calling profile() — if you \
+                 hit this, you bypassed that guard (e.g. via a direct historical-path call)",
+            ),
         }
     }
 
@@ -69,6 +100,7 @@ impl Lang {
             Lang::Tsx => "tsx",
             Lang::Go => "go",
             Lang::Kotlin => "kotlin",
+            Lang::C => "c",
         }
     }
 

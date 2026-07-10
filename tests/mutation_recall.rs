@@ -32,15 +32,34 @@ struct Seed {
     meta: SeedMeta,
 }
 
+/// Whether this bench run is pinned to the historical normalizer (`just bench-mutations-historical`,
+/// `REPRISE_NORMALIZER=historical`) — mirrors [`bench_config`]'s own env read. C has no historical
+/// `LanguageProfile` (`Lang::has_historical_profile` is false — CLAUDE.md retires the per-grammar
+/// historical layer for new languages): `corpus_units`/`scan` refuse `normalizer = "historical"`
+/// outright for any C file (a clean `anyhow` error, by design — see `src/lib.rs`/`src/unit.rs`).
+/// [`load_seeds`] uses this to leave C OUT of the seed set on the historical run, rather than let
+/// every `converges()` call on a C seed error out — the bench harness handling C's no-historical-mode
+/// policy cleanly, per the WP-K1b brief, instead of the historical gate simply failing on C input.
+fn normalizer_is_historical() -> bool {
+    std::env::var("REPRISE_NORMALIZER").as_deref() == Ok("historical")
+}
+
 fn load_seeds() -> Vec<Seed> {
     let mut seeds = Vec::new();
-    for (dir, ext) in [
+    let mut dirs = vec![
         ("rust", "rs"),
         ("python", "py"),
         ("typescript", "ts"),
         ("go", "go"),
         ("kotlin", "kt"),
-    ] {
+    ];
+    // C is IR-frontend-only (WP-K1b) — excluded from the historical run (see
+    // `normalizer_is_historical`'s doc comment), included on every other run (the default IR
+    // path `just bench-mutations`/`bench-mutations-ir`).
+    if !normalizer_is_historical() {
+        dirs.push(("c", "c"));
+    }
+    for (dir, ext) in dirs {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("benches/mutations/seeds")
             .join(dir);

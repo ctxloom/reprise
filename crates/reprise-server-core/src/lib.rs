@@ -14,11 +14,12 @@ use std::process::Command;
 /// Map an MCP/LSP language argument to a `reprise` language.
 ///
 /// Accepts both canonical names (`rust`, `python`, `typescript`, `tsx`, `go`,
-/// `kotlin`) and the file extensions reprise keys on (`rs`, `py`, `ts`, `tsx`,
-/// `go`, `kt`, `kts`), case-insensitively. Returns `None` for anything reprise
-/// does not support so the caller can surface an explicit unsupported-language
-/// error rather than guess. reprise's own `Lang::from_path` is extension-only
-/// and takes a `Path`; this is the string-facing door the servers need.
+/// `kotlin`, `c`) and the file extensions reprise keys on (`rs`, `py`, `ts`,
+/// `tsx`, `go`, `kt`, `kts`, `c`, `h`), case-insensitively. Returns `None` for
+/// anything reprise does not support so the caller can surface an explicit
+/// unsupported-language error rather than guess. reprise's own
+/// `Lang::from_path` is extension-only and takes a `Path`; this is the
+/// string-facing door the servers need.
 pub fn lang_from_str(s: &str) -> Option<Lang> {
     match s.trim().to_ascii_lowercase().as_str() {
         "rust" | "rs" => Some(Lang::Rust),
@@ -27,6 +28,8 @@ pub fn lang_from_str(s: &str) -> Option<Lang> {
         "tsx" => Some(Lang::Tsx),
         "go" => Some(Lang::Go),
         "kotlin" | "kt" | "kts" => Some(Lang::Kotlin),
+        // `.h` parses as C until C++ support exists (mirrors `Lang::from_path`, WP-K1a).
+        "c" | "h" => Some(Lang::C),
         _ => None,
     }
 }
@@ -165,6 +168,8 @@ mod tests {
         assert_eq!(lang_from_str("go"), Some(Lang::Go));
         assert_eq!(lang_from_str("kt"), Some(Lang::Kotlin));
         assert_eq!(lang_from_str("kotlin"), Some(Lang::Kotlin));
+        assert_eq!(lang_from_str("c"), Some(Lang::C));
+        assert_eq!(lang_from_str("h"), Some(Lang::C));
         assert_eq!(lang_from_str("java"), None);
         assert_eq!(lang_from_str(""), None);
     }

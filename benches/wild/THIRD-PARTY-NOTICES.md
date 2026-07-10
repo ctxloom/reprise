@@ -22,9 +22,13 @@ exceptions that do not alter any function body (per the fixture policy in
 - `w7_click_chunkpump/b.py` is the upstream nested `def test` dedented one level
   to stand alone.
 
-All three licenses below (MIT, BSD-3-Clause) permit modification and
+All licenses below (MIT, BSD-3-Clause, GPL-2.0) permit modification and
 redistribution provided the copyright notice and license text are retained —
-which this file and `licenses/` do.
+which this file and `licenses/` do. The `wc*` (C-frontend) excerpts are
+unmodified compilable-unit function bodies copied verbatim from the Linux
+kernel; GPL-2.0's copyleft applies only to the excerpt itself, kept here as a
+test-only fixture (excluded from the published crate, see above) — it does not
+extend to `reprise`'s own BSD-3-Clause-licensed source.
 
 ## Attribution
 
@@ -39,6 +43,8 @@ which this file and `licenses/` do.
 | `w7_click_chunkpump`  | [click](https://github.com/pallets/click)           | BSD-3-Clause (see [`licenses/click-BSD-3-Clause.txt`](licenses/click-BSD-3-Clause.txt)) | © 2014 Pallets | click @ 6ec99f8 — examples/inout/inout.py:6-30, tests/test_testing.py:17-25 (dedented) |
 | `w8_ripgrep_convert`  | [ripgrep](https://github.com/BurntSushi/ripgrep)    | MIT OR Unlicense (see [`licenses/ripgrep-MIT.txt`](licenses/ripgrep-MIT.txt))| © 2015 Andrew Gallant | ripgrep @ 48b0c79 — crates/core/flags/defs.rs:7575-7601 |
 | `w9_ripgrep_cpufeatures`| [ripgrep](https://github.com/BurntSushi/ripgrep)  | MIT OR Unlicense (see [`licenses/ripgrep-MIT.txt`](licenses/ripgrep-MIT.txt))| © 2015 Andrew Gallant | ripgrep @ 48b0c79 — crates/core/flags/doc/version.rs:83-116 |
+| `wc1_ext4_extspaceroot` | [Linux kernel](https://kernel.org) (fs/ext4) | GPL-2.0 (see [`licenses/linux-GPL-2.0.txt`](licenses/linux-GPL-2.0.txt)) | © Linux kernel contributors | linux @ 8cd9520 (v7.1) — fs/ext4/extents.c:303-327 |
+| `wc2_ext4_mbbits`       | [Linux kernel](https://kernel.org) (fs/ext4) | GPL-2.0 (see [`licenses/linux-GPL-2.0.txt`](licenses/linux-GPL-2.0.txt)) | © Linux kernel contributors | linux @ 8cd9520 (v7.1) — fs/ext4/mballoc.c:1865-1881, 1910-1926 |
 
 Dual-licensed projects (ripgrep, serde) are retained here under their **MIT**
 option; the full text of the alternative license is available in each upstream

@@ -1,0 +1,22 @@
+# Mutation metadata for seed1.c (DECISIONS.md D6). Only unit-local identifiers
+# are renamed.
+[rename]
+classify_scores = "collect_report"
+scores = "items"
+count = "len"
+threshold = "cutoff"
+grades = "labels"
+total = "sum_out"
+written = "emitted"
+sum = "acc"
+score = "points"
+i = "idx"
+
+[literals]
+"90" = "85"
+"50" = "40"
+"250" = "400"
+'"excellent"' = '"stellar"'
+'"adequate"' = '"fine"'
+'"poor"' = '"weak"'
+'"aggregate"' = '"summary"'

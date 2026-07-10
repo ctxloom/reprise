@@ -25,6 +25,22 @@ const WILD: &[(&str, &str, usize)] = &[
     ("w9_ripgrep_cpufeatures", "internal-repeat", 1),
 ];
 
+/// C's wild fixtures (WP-K1b), kept OUT of `WILD` on purpose: C has no historical
+/// `LanguageProfile` (`Lang::has_historical_profile` is false — CLAUDE.md retires the
+/// per-grammar historical layer for new languages), so `corpus_units`/`scan` refuse
+/// `normalizer = "historical"` outright for any C file (a clean `anyhow` error, by design —
+/// see `src/lib.rs`/`src/unit.rs`). Mixing a C dir into `WILD` would make
+/// `every_wild_pair_converges_at_its_labeled_tier` (pinned to `Normalizer::Historical`) error
+/// on every run. These two are IR-normalizer-only: a fresh `reprise scan` of the Linux kernel
+/// v7.1 clone's `fs/ext4/` (174 groups; see benches/wild/README.md), picking one clear
+/// exact-tier and one clear near-tier medium-size pair. Checked by
+/// `c_wild_pairs_converge_under_the_ir_normalizer` below, and folded into
+/// `wild_corpus_has_no_untested_fixtures`'s known-directory set alongside `WILD`.
+const WILD_C: &[(&str, &str, usize)] = &[
+    ("wc1_ext4_extspaceroot", "exact-normalized", 2),
+    ("wc2_ext4_mbbits", "near-normalized", 2),
+];
+
 fn wild_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benches/wild")
 }
@@ -131,10 +147,36 @@ fn wild_pairs_converge_under_the_ir_normalizer() {
     );
 }
 
+/// C wild fixtures (`WILD_C`) converge at their labeled tier under the IR normalizer — the
+/// only normalizer C has. Companion to `wild_pairs_converge_under_the_ir_normalizer`, kept as
+/// its own test (rather than folded into `WILD_C`'s entries there) because C has no historical
+/// counterpart to also check, unlike every `WILD` entry.
+#[test]
+fn c_wild_pairs_converge_under_the_ir_normalizer() {
+    let mut cfg = Config::default();
+    cfg.cache.enabled = false;
+    cfg.normalize.normalizer = Normalizer::Ir;
+    for (dir, tier, members) in WILD_C {
+        let root = wild_root().join(dir);
+        assert!(root.is_dir(), "missing wild fixture {dir}");
+        let report = reprise::scan(&root, &cfg)
+            .unwrap_or_else(|e| panic!("IR scan of wild fixture {dir} failed: {e}"));
+        let hit = report
+            .groups
+            .iter()
+            .find(|g| g.tier.to_string() == *tier && g.members.len() >= *members);
+        assert!(
+            hit.is_some(),
+            "wild fixture {dir} no longer converges at {tier} under IR (groups: {:#?})",
+            report.groups
+        );
+    }
+}
+
 /// The fixture table and the on-disk corpus must not drift apart silently.
 #[test]
 fn wild_corpus_has_no_untested_fixtures() {
-    let tested: Vec<&str> = WILD.iter().map(|(d, ..)| *d).collect();
+    let tested: Vec<&str> = WILD.iter().chain(WILD_C).map(|(d, ..)| *d).collect();
     for entry in std::fs::read_dir(wild_root()).unwrap() {
         let entry = entry.unwrap();
         if entry.file_type().unwrap().is_dir() {

@@ -42,6 +42,7 @@ pub const GRAMMAR_VERSIONS: &[&str] = &[
     "tree-sitter-typescript/0.23.2",
     "tree-sitter-go/0.25.0",
     "tree-sitter-kotlin-ng/1.1.0",
+    "tree-sitter-c/0.24.2",
 ];
 
 /// Extraction-logic version: bump on ANY change to what `FileUnits` contains

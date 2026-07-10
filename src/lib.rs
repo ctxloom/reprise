@@ -64,6 +64,25 @@ pub struct CorpusUnits {
 pub fn corpus_units(root: &Path, config: &Config) -> anyhow::Result<CorpusUnits> {
     let files = walk::collect_files(root, config)?;
 
+    // `normalizer = "historical"` has no `LanguageProfile` for C (WP-K1a: C is IR-frontend
+    // only — CLAUDE.md, the historical per-grammar layer is retired for new languages).
+    // Fail loudly, up front, with a clean actionable error — before spending any work — rather
+    // than let a per-file historical extraction reach `Lang::C.profile()` (which panics; see
+    // `lang::Lang::profile`/`unit::extract_file_units_keep_raw`, the lower-level belt-and-
+    // suspenders guard for callers that bypass this entry point).
+    if config.normalize.normalizer == config::Normalizer::Historical
+        && let Some((path, lang)) = files
+            .iter()
+            .find(|(_, lang)| !lang.has_historical_profile())
+    {
+        anyhow::bail!(
+            "`normalizer = \"historical\"` does not support {lang:?} ({}) — C is IR-frontend-\
+             only; select `normalizer = \"ir\"` (the default) or exclude these files from the \
+             scan",
+            path.display(),
+        );
+    }
+
     enum FileOutcome {
         /// (extraction, source text, cache hit)
         Units(unit::FileUnits, String, bool),

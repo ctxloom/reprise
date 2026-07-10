@@ -9,10 +9,12 @@
 //! and the parameter shape are per-language; recursion, node synthesis (break-guard,
 //! arms), literal bucketing, and every pass are shared below.
 
+pub mod c;
 pub mod go;
 pub mod python;
 pub mod rust;
 
+pub use c::{lower_c, lower_c_source};
 pub use go::{lower_go, lower_go_source};
 pub use python::{lower_python, lower_python_source};
 pub use rust::{lower_rust, lower_rust_source};
@@ -119,6 +121,19 @@ pub(crate) trait Frontend {
     /// bit-identical across normalizers. `node` is the raw function-like CST node (parent/sibling
     /// context intact, as in the historical finder), so attribute/decorator lookups match.
     fn unit_is_test(&self, node: Node, src: &str, name: &str, path: &std::path::Path) -> bool;
+
+    /// The unit's display name, read from its root CST node. Default: the grammar's own
+    /// `name` field, true for every root kind fed here so far — Rust `function_item`, Python
+    /// `function_definition`, Go `function_declaration`/`method_declaration` all carry `name`
+    /// directly. C overrides this: its `function_definition` has no `name` field of its own —
+    /// the bound identifier lives on the (possibly pointer-wrapped) nested `function_declarator`
+    /// (`void *foo(...)` → `pointer_declarator{ function_declarator{ declarator: identifier
+    /// "foo", … } }`), so a language whose declarator can be wrapped needs its own lookup.
+    fn unit_name(&self, node: Node, src: &str) -> Option<String> {
+        node.child_by_field_name("name")
+            .and_then(|n| n.utf8_text(src.as_bytes()).ok())
+            .map(String::from)
+    }
 }
 
 // ---- data-driven dispatch table (D-SP4-1b; docs/sp4-grammar-lift-plan.md §4) ----
@@ -311,6 +326,7 @@ pub(crate) fn lower_unit_for(
         Lang::Rust => lower_unit(&rust::Rust, node, src, log),
         Lang::Python => lower_unit(&python::Python, node, src, log),
         Lang::Go => lower_unit(&go::Go, node, src, log),
+        Lang::C => lower_unit(&c::C, node, src, log),
         // Remaining frontends (TS, Kotlin) fall back to an empty unit until built.
         _ => NormNode::new(kind::UNIT, None, span_of(node), Vec::new()),
     }
@@ -326,8 +342,24 @@ fn unit_is_test_for(lang: Lang, node: Node, src: &str, name: &str, path: &std::p
         Lang::Rust => rust::Rust.unit_is_test(node, src, name, path),
         Lang::Python => python::Python.unit_is_test(node, src, name, path),
         Lang::Go => go::Go.unit_is_test(node, src, name, path),
+        Lang::C => c::C.unit_is_test(node, src, name, path),
         _ => false,
     }
+}
+
+/// Dispatch to `lang`'s frontend for [`Frontend::unit_name`] — the same per-language-seam
+/// pattern as [`unit_is_test_for`], needed because [`collect_ir_units`] holds a `Lang`, not a
+/// `&dyn Frontend`. `"<anon>"` for the same "no frontend reaches here" languages
+/// `unit_is_test_for` covers.
+fn unit_name_for(lang: Lang, node: Node, src: &str) -> String {
+    match lang {
+        Lang::Rust => rust::Rust.unit_name(node, src),
+        Lang::Python => python::Python.unit_name(node, src),
+        Lang::Go => go::Go.unit_name(node, src),
+        Lang::C => c::C.unit_name(node, src),
+        _ => None,
+    }
+    .unwrap_or_else(|| "<anon>".to_string())
 }
 
 /// Run the language-agnostic canonicalization passes on a lowered IR tree — the
@@ -397,6 +429,7 @@ fn ir_root_kinds(lang: Lang) -> &'static [&'static str] {
         Lang::Rust => &["function_item"],
         Lang::Python => &["function_definition"],
         Lang::Go => &["function_declaration", "method_declaration"],
+        Lang::C => &["function_definition"],
         _ => &[],
     }
 }
@@ -479,6 +512,7 @@ pub(crate) fn frontend_table(lang: Lang) -> Option<FrontendTable> {
         Lang::Rust => Some((rust::MAP, rust::RESIDUE_KINDS)),
         Lang::Python => Some((python::MAP, python::RESIDUE_KINDS)),
         Lang::Go => Some((go::MAP, go::RESIDUE_KINDS)),
+        Lang::C => Some((c::MAP, c::RESIDUE_KINDS)),
         _ => None,
     }
 }
@@ -526,11 +560,7 @@ fn collect_ir_units(
         let mut log = TransformLog::disabled();
         let raw = lower_unit_for(lang, node, src, &mut log);
         let tree = run_passes(raw.clone(), lang, &mut log);
-        let name = node
-            .child_by_field_name("name")
-            .and_then(|n| n.utf8_text(src.as_bytes()).ok())
-            .unwrap_or("<anon>")
-            .to_string();
+        let name = unit_name_for(lang, node, src);
         let is_test = unit_is_test_for(lang, node, src, &name, path);
         out.push(IrUnit {
             name,
@@ -1608,6 +1638,7 @@ mod grammar_schema_tests {
         (Lang::Rust, "grammar-rust.snap"),
         (Lang::Python, "grammar-python.snap"),
         (Lang::Go, "grammar-go.snap"),
+        (Lang::C, "grammar-c.snap"),
     ];
 
     /// Snapshot each frontend grammar's named-kind + field surface (increment 4). A grammar-crate
@@ -1658,7 +1689,7 @@ mod conformance_gate_tests {
     use tree_sitter::Language;
 
     /// The languages with an IR frontend + table (the gate's scope). TS/Kotlin have no frontend yet.
-    const GATED: &[Lang] = &[Lang::Rust, Lang::Python, Lang::Go];
+    const GATED: &[Lang] = &[Lang::Rust, Lang::Python, Lang::Go, Lang::C];
 
     /// The per-language CST **field** names a table entry threads into its shared helper — the field
     /// half of the (kind, field) coupling. Only the field-parameterized `Lowering` variants carry
@@ -1795,6 +1826,7 @@ mod conformance_gate_tests {
             (Lang::Rust, &["parameter"]),
             (Lang::Python, &["typed_parameter", "default_parameter"]),
             (Lang::Go, &["parameter_declaration"]),
+            (Lang::C, &["parameter_declaration"]),
         ];
         for &(lang, param_kinds) in cases {
             let (kinds, _) = referenced(lang);
