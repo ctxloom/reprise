@@ -76,10 +76,12 @@ pub fn find_similar_json(path: &str, snippet: &str, lang: &str) -> anyhow::Resul
             )
         })?;
 
-    // Same-language corpus, assembled from public API (walk + per-file extract)
-    // rather than by factoring scan() — the corpus accessor is deferred to avoid
-    // colliding with the concurrent IR rework (task inner-envy). No cache reuse
-    // here; the held index (docs/SERVERS.md §6, M5) is the answer if this is slow.
+    // Same-language corpus, via `reprise::corpus_units` — the one sanctioned
+    // walk+cache+extract accessor (docs/SERVERS.md §7 M1, DECISIONS.md D46). This
+    // reuses the D19 per-file cache (a warm hit is byte-identical to a cold
+    // extraction by contract, src/cache.rs), where a hand-rolled walk+extract loop
+    // previously always extracted cold; it returns all-language units, so the
+    // language filter happens here at the call site.
     let ir = cfg.normalize.normalizer == reprise::config::Normalizer::Ir
         && reprise::frontend::has_ir_frontend(lang);
     // The historical `LanguageProfile` is anti_unify's structural oracle ONLY on the historical
@@ -87,22 +89,14 @@ pub fn find_similar_json(path: &str, snippet: &str, lang: &str) -> anyhow::Resul
     // when `!ir`, so the IR case never touches `LanguageProfile` (the profile call vanishes for
     // it); a `historical`/TS/Kotlin scan still supplies it.
     let profile = (!ir).then(|| lang.profile());
+    let corpus = reprise::corpus_units(root, &cfg)?;
     let mut matches: Vec<SimMatch> = Vec::new();
-    for (file, flang) in reprise::walk::collect_files(root, &cfg)? {
-        if flang != lang {
-            continue;
+    for u in &corpus.units {
+        if u.lang != lang || u.token_count < floor {
+            continue; // other-language unit, or below reprise's index floor
         }
-        let Ok(src) = std::fs::read_to_string(&file) else {
-            continue;
-        };
-        let (units, _) = reprise::unit::extract_file_units(&file, &src, flang, &cfg);
-        for u in units {
-            if u.token_count < floor {
-                continue; // below reprise's index floor — never a reportable clone
-            }
-            if let Some(m) = compare(&candidate, &u, profile, ir, &cfg, root) {
-                matches.push(m);
-            }
+        if let Some(m) = compare(&candidate, u, profile, ir, &cfg, root) {
+            matches.push(m);
         }
     }
 
@@ -266,5 +260,38 @@ mod tests {
             m["similarity"].as_f64().unwrap() > 0.8,
             "high similarity: {out}"
         );
+    }
+
+    #[test]
+    fn find_similar_reuses_the_per_file_cache() {
+        // §7 M1 / D46: find_similar must go through `reprise::corpus_units`, the
+        // same D19-cache-aware accessor scan() uses, instead of hand-rolled cold
+        // extraction. Prove both halves of that: the cache actually gets written
+        // (reuse is happening, not just theoretically wired), and the warm-cache
+        // call returns byte-identical JSON to the cold one (reuse changes speed,
+        // never the result).
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path().join("existing.py"), &dup_py("enabled"));
+        let snippet = dup_py("active").replace("def report(", "def summarize(");
+        let root = dir.path().to_str().unwrap();
+
+        let cache_dir = dir.path().join(".reprise").join("cache");
+        assert!(!cache_dir.exists(), "no cache before the first (cold) call");
+
+        let cold = find_similar_json(root, &snippet, "python").unwrap();
+        let entries_after_cold = std::fs::read_dir(&cache_dir)
+            .map(|d| d.count())
+            .unwrap_or(0);
+        assert!(
+            entries_after_cold > 0,
+            "the cold call populates the per-file cache: {cold}"
+        );
+
+        let warm = find_similar_json(root, &snippet, "python").unwrap();
+        assert_eq!(
+            entries_after_cold,
+            std::fs::read_dir(&cache_dir).unwrap().count()
+        );
+        assert_eq!(cold, warm, "warm-cache call returns identical results");
     }
 }

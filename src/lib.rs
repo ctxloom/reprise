@@ -35,9 +35,33 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Instant;
 
-/// Full-repo scan (spec §2 `reprise scan`).
-pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
-    let started = Instant::now();
+/// A walked-and-extracted corpus: every [`Unit`] under `root` (respecting `Config`'s
+/// walk excludes), the parallel pre-normalization `raw_trees` the inliner needs
+/// (index-aligned with the leading *plain* units — `units[..raw_trees.len()]` — since
+/// this accessor covers only extraction; inline-expanded variants are `scan()`'s own
+/// later phase and carry no raw tree), each file's [`unit::InternalRepeat`] findings,
+/// every scanned file's full source text (keyed by the same `PathBuf` a `Unit::file`
+/// carries, for line-span rendering), and the subset of [`report::Stats`] this phase
+/// fills (`files_scanned`, `files_skipped_generated`, `files_unreadable`,
+/// `suppressed_units`, `cache_hits`/`cache_misses`, `units_indexed`,
+/// `parse_degraded_units`, `test_units`) — every other `Stats` field is left at its
+/// `Default` for the caller to fill in as it goes.
+pub struct CorpusUnits {
+    pub units: Vec<Unit>,
+    pub raw_trees: Vec<tree::NormNode>,
+    pub repeats: Vec<unit::InternalRepeat>,
+    pub sources: HashMap<std::path::PathBuf, String>,
+    pub stats: report::Stats,
+}
+
+/// Walk `root` (respecting `config`'s excludes) and extract every unit, reusing the
+/// D19 per-file cache (a warm hit is byte-identical to a cold extraction by contract,
+/// `src/cache.rs`). **This is THE sanctioned way to obtain corpus units** — `scan()`
+/// calls it for its extract half; any other consumer (the frozen-index builder,
+/// reprise-mcp's `find_similar`) must route through here too instead of hand-rolling
+/// a walk+extract loop, so every caller shares one walk/cache/extract path and its
+/// D19 cache-reuse (docs/SERVERS.md §7 M1, DECISIONS.md D46).
+pub fn corpus_units(root: &Path, config: &Config) -> anyhow::Result<CorpusUnits> {
     let files = walk::collect_files(root, config)?;
 
     enum FileOutcome {
@@ -82,7 +106,7 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
 
     let mut units: Vec<Unit> = Vec::new();
     let mut raw_trees: Vec<tree::NormNode> = Vec::new();
-    let mut internal_repeats = Vec::new();
+    let mut repeats = Vec::new();
     let mut sources: HashMap<std::path::PathBuf, String> = HashMap::new();
     let mut stats = report::Stats::default();
     for (path, outcome) in outcomes {
@@ -97,7 +121,7 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
                 }
                 units.append(&mut extracted.units);
                 raw_trees.append(&mut extracted.raw_trees);
-                internal_repeats.append(&mut extracted.repeats);
+                repeats.append(&mut extracted.repeats);
                 sources.insert(path, src);
             }
             FileOutcome::SkippedGenerated => stats.files_skipped_generated += 1,
@@ -107,6 +131,26 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
     stats.units_indexed = units.len();
     stats.parse_degraded_units = units.iter().filter(|u| u.parse_degraded).count();
     stats.test_units = units.iter().filter(|u| u.is_test).count();
+
+    Ok(CorpusUnits {
+        units,
+        raw_trees,
+        repeats,
+        sources,
+        stats,
+    })
+}
+
+/// Full-repo scan (spec §2 `reprise scan`).
+pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
+    let started = Instant::now();
+    let CorpusUnits {
+        mut units,
+        raw_trees,
+        repeats: internal_repeats,
+        sources,
+        mut stats,
+    } = corpus_units(root, config)?;
     let plain_count = units.len();
 
     let mut phase_started = started;
