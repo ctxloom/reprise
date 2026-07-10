@@ -460,7 +460,13 @@ fn tarjan(n: usize, adj: &[Vec<usize>]) -> Vec<usize> {
 }
 
 pub struct Expansion {
-    pub tree: NormNode,
+    /// The spliced tree — `None` iff `calls_inlined == 0` (thin-delegation skip,
+    /// or a real walk that resolved and inlined nothing). The raw-tree clone
+    /// this requires is expensive (M3c: ~55% of units inline zero calls and
+    /// produce no variant, so `lib.rs` discards `tree` unread whenever
+    /// `calls_inlined == 0` — see `any_resolvable_call`, which proves that case
+    /// cheaply, read-only, before paying for the clone).
+    pub tree: Option<NormNode>,
     /// Callee names expanded (deduped, expansion order) — the inline chain.
     pub chain: Vec<String>,
     /// Unit indices of the inlined callees (D3 tautology filter keys).
@@ -471,15 +477,15 @@ pub struct Expansion {
 }
 
 impl Expansion {
-    /// No-op expansion (unit skipped: thin delegation, D37).
-    fn skipped(raw: &NormNode) -> Expansion {
+    /// No-op expansion (unit skipped: thin delegation, D37, or no resolvable call).
+    fn skipped(ambiguity_skips: u32) -> Expansion {
         Expansion {
-            tree: raw.clone(),
+            tree: None,
             chain: Vec::new(),
             expanded_units: Vec::new(),
             scc: false,
             calls_inlined: 0,
-            ambiguity_skips: 0,
+            ambiguity_skips,
         }
     }
 }
@@ -525,7 +531,7 @@ pub fn expand_unit(
     // each other — reprise flagging its own recommended fix (user feedback,
     // D37). Real reimplemented-helper cases have surrounding code.
     if crate::lang::child_field(raw, "body").is_some_and(|b| b.children.len() <= 1) {
-        return Expansion::skipped(raw);
+        return Expansion::skipped(0);
     }
     let scc_partners: HashSet<usize> = match table.def_of_unit.get(&unit_idx) {
         Some(&d) if table.scc_sizes[table.scc_of[d]] >= 2 => (0..table.defs.len())
@@ -550,15 +556,40 @@ pub fn expand_unit(
         calls_inlined: 0,
         ambiguous_sites: HashSet::new(),
     };
+    // M3c: `raw.clone()` used to run unconditionally here, even though ~55% of
+    // units inline zero calls and produce no variant (`lib.rs` discards `tree`
+    // whenever `calls_inlined == 0` — the exact anti-pattern `DefTable::Def.body`
+    // was already fixed for, above). `any_resolvable_call` is a read-only descent
+    // that decides this without owning (or copying) a single node: if it proves no
+    // call in the tree resolves, the real `walk` below is guaranteed to splice
+    // nothing, so the clone is skipped outright.
+    if !any_resolvable_call(raw, &mut ctx) {
+        return Expansion::skipped(ctx.ambiguous_sites.len() as u32);
+    }
     let tree = walk(raw.clone(), &mut ctx);
     Expansion {
-        tree,
+        tree: Some(tree),
         chain: ctx.chain,
         expanded_units: ctx.expanded_units,
         scc: ctx.scc_hit,
         calls_inlined: ctx.calls_inlined,
         ambiguity_skips: ctx.ambiguous_sites.len() as u32,
     }
+}
+
+/// Read-only descent proving whether `node`'s subtree contains at least one call
+/// `resolve_policy` would accept — i.e. whether the real `walk` below could
+/// possibly splice anything. Visits every node (same reach as `walk`, mirrors
+/// `collect_calls`'s traversal), so when no call resolves the search exhausts the
+/// whole tree and `ctx.ambiguous_sites` comes out complete — the zero-clone path
+/// above reports `ambiguity_skips` straight from it. When a call DOES resolve, the
+/// search returns early without visiting the rest; the caller then commits to the
+/// clone + real `walk`, which independently re-derives the full `ambiguous_sites`
+/// (and every other `ctx` field) from its own complete traversal, so the partial
+/// set left behind by an early exit is a harmless subset (`HashSet` insertion is
+/// idempotent) — no reset needed between the two.
+fn any_resolvable_call(node: &NormNode, ctx: &mut Ctx) -> bool {
+    resolve_policy(node, ctx).is_some() || node.children.iter().any(|c| any_resolvable_call(c, ctx))
 }
 
 fn walk(mut node: NormNode, ctx: &mut Ctx) -> NormNode {

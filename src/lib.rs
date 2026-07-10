@@ -213,7 +213,12 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
                         variant: None,
                     };
                 }
-                let Some(mut variant) = unit::finish_variant(i, &units[i], exp.tree, config) else {
+                // calls_inlined > 0 (checked above) guarantees expand_unit produced
+                // a spliced tree (see inline::any_resolvable_call / Expansion::tree).
+                let tree = exp
+                    .tree
+                    .expect("calls_inlined > 0 implies expand_unit produced a tree");
+                let Some(mut variant) = unit::finish_variant(i, &units[i], tree, config) else {
                     // inlining changed nothing post-normalization
                     return VariantOutcome {
                         ambiguity_skips,

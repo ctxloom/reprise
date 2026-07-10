@@ -39,7 +39,12 @@ fn main() {
             units[i].name, units[i].token_count, units[i].fingerprint, exp.calls_inlined, exp.chain
         );
         if exp.calls_inlined > 0 {
-            if let Some(v) = reprise::unit::finish_variant(i, &units[i], exp.tree, &cfg) {
+            if let Some(v) = reprise::unit::finish_variant(
+                i,
+                &units[i],
+                exp.tree.expect("calls_inlined > 0"),
+                &cfg,
+            ) {
                 println!(
                     "  variant tokens={} fp={:032x}",
                     v.token_count, v.fingerprint
