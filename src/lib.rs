@@ -416,10 +416,14 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
         let t = all_test(&indices);
         push_policied(g, t, &mut main, &mut test_groups);
     }
+    // An internal repeat's (file, unit_name) pins a specific enclosing unit;
+    // the previous `units.iter().any(...)` re-scanned every unit per repeat —
+    // O(repeats × units), which dominated the assemble phase at kernel scale
+    // (98% of assemble time on the drivers/net corpus). Index test units by
+    // (file, name) once — same predicate, now an O(1) hash lookup per repeat.
+    let test_unit_keys = test_unit_key_index(&units, internal_repeats.is_empty());
     for r in &internal_repeats {
-        let is_test_repeat = units
-            .iter()
-            .any(|u| u.file == r.file && u.name == r.unit_name && u.is_test);
+        let is_test_repeat = test_unit_keys.contains(&(r.file.as_path(), r.unit_name.as_str()));
         // Spec §2: internal-repeat key = (unit fingerprint, template hash).
         let mut fp_buf = Vec::with_capacity(32);
         fp_buf.extend_from_slice(&r.unit_fp.to_le_bytes());
@@ -604,5 +608,113 @@ fn rank(groups: &mut [Group], prefix: &str) {
     });
     for (i, group) in groups.iter_mut().enumerate() {
         group.id = format!("{prefix}{}", i + 1);
+    }
+}
+
+/// Index of (file, name) pairs belonging to some `is_test` unit — the perf
+/// fix for the internal-repeat test-policy scan in `scan()`, which used to
+/// re-run `units.iter().any(...)` per repeat (O(repeats × units); dominated
+/// the assemble phase at kernel scale). Same predicate, memoized once:
+/// O(units) to build, O(1) per lookup. `skip` (true when there are no
+/// repeats to look up) avoids the O(units) build entirely when it would go
+/// unused.
+fn test_unit_key_index(units: &[Unit], skip: bool) -> HashSet<(&Path, &str)> {
+    if skip {
+        return HashSet::new();
+    }
+    units
+        .iter()
+        .filter(|u| u.is_test)
+        .map(|u| (u.file.as_path(), u.name.as_str()))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn mk_unit(file: &str, name: &str, is_test: bool) -> Unit {
+        Unit {
+            file: PathBuf::from(file),
+            lang: lang::Lang::Rust,
+            name: name.to_string(),
+            byte_span: (0, 0),
+            line_span: (0, 0),
+            token_count: 10,
+            parse_degraded: false,
+            is_test,
+            accept_drift: false,
+            fingerprint: 0,
+            tree: tree::NormNode::new("Unit", None, (0, 0), Vec::new()),
+            variant: None,
+        }
+    }
+
+    /// The original O(units) per-lookup scan, kept only as the
+    /// differential-test oracle for `test_unit_key_index`.
+    fn brute_is_test_repeat(units: &[Unit], file: &Path, name: &str) -> bool {
+        units
+            .iter()
+            .any(|u| u.file == file && u.name == name && u.is_test)
+    }
+
+    #[test]
+    fn test_unit_key_index_matches_brute_force_oracle() {
+        // Deterministic LCG (no external rand dependency), mirroring the
+        // `contained_flags` oracle test in group.rs: many random
+        // file/name/is_test unit shapes, checked against every (file, name)
+        // combination that appears, both hit and miss.
+        struct Lcg(u64);
+        impl Lcg {
+            fn next(&mut self) -> u64 {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                self.0
+            }
+            fn range(&mut self, n: u32) -> u32 {
+                (self.next() % u64::from(n)) as u32
+            }
+        }
+
+        for seed in 0..50u64 {
+            let mut rng = Lcg(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1));
+            let file_count = 1 + rng.range(4);
+            let files: Vec<String> = (0..file_count).map(|i| format!("f{i}.rs")).collect();
+            let name_count = 1 + rng.range(5);
+            let names: Vec<String> = (0..name_count).map(|i| format!("n{i}")).collect();
+
+            let unit_count = rng.range(20);
+            let units: Vec<Unit> = (0..unit_count)
+                .map(|_| {
+                    let file = &files[rng.range(file_count) as usize];
+                    let name = &names[rng.range(name_count) as usize];
+                    let is_test = rng.range(2) == 0;
+                    mk_unit(file, name, is_test)
+                })
+                .collect();
+
+            let index = test_unit_key_index(&units, false);
+
+            // Every (file, name) combination that appears anywhere, not just
+            // among the generated units — exercises misses as well as hits.
+            for file in &files {
+                for name in &names {
+                    let path = Path::new(file.as_str());
+                    let expected = brute_is_test_repeat(&units, path, name);
+                    let actual = index.contains(&(path, name.as_str()));
+                    assert_eq!(actual, expected, "seed {seed} file {file} name {name}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_unit_key_index_skip_is_empty() {
+        let units = vec![mk_unit("a.rs", "n", true)];
+        let index = test_unit_key_index(&units, true);
+        assert!(index.is_empty());
     }
 }
