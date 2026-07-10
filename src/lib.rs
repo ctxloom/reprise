@@ -40,17 +40,27 @@ use std::time::Instant;
 /// (index-aligned with the leading *plain* units — `units[..raw_trees.len()]` — since
 /// this accessor covers only extraction; inline-expanded variants are `scan()`'s own
 /// later phase and carry no raw tree), each file's [`unit::InternalRepeat`] findings,
-/// every scanned file's full source text (keyed by the same `PathBuf` a `Unit::file`
-/// carries, for line-span rendering), and the subset of [`report::Stats`] this phase
-/// fills (`files_scanned`, `files_skipped_generated`, `files_unreadable`,
-/// `suppressed_units`, `cache_hits`/`cache_misses`, `units_indexed`,
-/// `parse_degraded_units`, `test_units`) — every other `Stats` field is left at its
-/// `Default` for the caller to fill in as it goes.
+/// a per-file content digest (xxh3-128 of the bytes read at extraction time, keyed by
+/// the same `PathBuf` a `Unit::file` carries) for consumers that need to re-read a
+/// file's text later and detect whether it changed on disk in the meantime, and the
+/// subset of [`report::Stats`] this phase fills (`files_scanned`,
+/// `files_skipped_generated`, `files_unreadable`, `suppressed_units`,
+/// `cache_hits`/`cache_misses`, `units_indexed`, `parse_degraded_units`, `test_units`,
+/// `total_lines`) — every other `Stats` field is left at its `Default` for the caller
+/// to fill in as it goes.
+///
+/// Full source text is intentionally NOT retained here (it used to be, keyed the same
+/// way) — the only two production consumers (`scan`'s sequence-tier line-span
+/// rendering and its `total_lines` stat) either need just a line count (computed
+/// incrementally below, while the text is already in hand for parsing) or a handful of
+/// on-demand re-reads for the rare files that actually surface in a sequence-tier
+/// finding; `source_digests` lets that re-read detect a mid-scan edit instead of
+/// silently rendering against stale-vs-fresh mismatched content.
 pub struct CorpusUnits {
     pub units: Vec<Unit>,
     pub raw_trees: Vec<tree::NormNode>,
     pub repeats: Vec<unit::InternalRepeat>,
-    pub sources: HashMap<std::path::PathBuf, String>,
+    pub source_digests: HashMap<std::path::PathBuf, u128>,
     pub stats: report::Stats,
 }
 
@@ -84,8 +94,11 @@ pub fn corpus_units(root: &Path, config: &Config) -> anyhow::Result<CorpusUnits>
     }
 
     enum FileOutcome {
-        /// (extraction, source text, cache hit)
-        Units(unit::FileUnits, String, bool),
+        /// (extraction, content digest, line count, cache hit) — the digest and line
+        /// count are cheap-to-compute-now facts derived from the source text while
+        /// it's in hand for parsing; the text itself is not retained (see
+        /// `CorpusUnits` doc comment).
+        Units(unit::FileUnits, u128, usize, bool),
         SkippedGenerated,
         Unreadable,
     }
@@ -106,15 +119,17 @@ pub fn corpus_units(root: &Path, config: &Config) -> anyhow::Result<CorpusUnits>
                         .enabled
                         .then(|| cache::load(cache_root, key, path))
                         .flatten();
+                    let digest = xxhash_rust::xxh3::xxh3_128(src.as_bytes());
+                    let line_count = src.lines().count();
                     match cached {
-                        Some(extracted) => FileOutcome::Units(extracted, src, true),
+                        Some(extracted) => FileOutcome::Units(extracted, digest, line_count, true),
                         None => {
                             let extracted =
                                 unit::extract_file_units_keep_raw(path, &src, *lang, config);
                             if config.cache.enabled {
                                 cache::store(cache_root, key, &extracted);
                             }
-                            FileOutcome::Units(extracted, src, false)
+                            FileOutcome::Units(extracted, digest, line_count, false)
                         }
                     }
                 }
@@ -126,13 +141,14 @@ pub fn corpus_units(root: &Path, config: &Config) -> anyhow::Result<CorpusUnits>
     let mut units: Vec<Unit> = Vec::new();
     let mut raw_trees: Vec<tree::NormNode> = Vec::new();
     let mut repeats = Vec::new();
-    let mut sources: HashMap<std::path::PathBuf, String> = HashMap::new();
+    let mut source_digests: HashMap<std::path::PathBuf, u128> = HashMap::new();
     let mut stats = report::Stats::default();
     for (path, outcome) in outcomes {
         match outcome {
-            FileOutcome::Units(mut extracted, src, cache_hit) => {
+            FileOutcome::Units(mut extracted, digest, line_count, cache_hit) => {
                 stats.files_scanned += 1;
                 stats.suppressed_units += extracted.suppressed;
+                stats.total_lines += line_count;
                 if cache_hit {
                     stats.cache_hits += 1;
                 } else {
@@ -141,7 +157,7 @@ pub fn corpus_units(root: &Path, config: &Config) -> anyhow::Result<CorpusUnits>
                 units.append(&mut extracted.units);
                 raw_trees.append(&mut extracted.raw_trees);
                 repeats.append(&mut extracted.repeats);
-                sources.insert(path, src);
+                source_digests.insert(path, digest);
             }
             FileOutcome::SkippedGenerated => stats.files_skipped_generated += 1,
             FileOutcome::Unreadable => stats.files_unreadable += 1,
@@ -150,12 +166,18 @@ pub fn corpus_units(root: &Path, config: &Config) -> anyhow::Result<CorpusUnits>
     stats.units_indexed = units.len();
     stats.parse_degraded_units = units.iter().filter(|u| u.parse_degraded).count();
     stats.test_units = units.iter().filter(|u| u.is_test).count();
+    // Lever 4: reclaim the ~1.25-1.5x average doubling-growth slack these three
+    // corpus-wide Vecs accumulated via repeated `.append()` above — a fixed-size,
+    // zero-risk win independent of the digest/re-read redesign above.
+    units.shrink_to_fit();
+    raw_trees.shrink_to_fit();
+    repeats.shrink_to_fit();
 
     Ok(CorpusUnits {
         units,
         raw_trees,
         repeats,
-        sources,
+        source_digests,
         stats,
     })
 }
@@ -167,7 +189,7 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
         mut units,
         raw_trees,
         repeats: internal_repeats,
-        sources,
+        source_digests,
         mut stats,
     } = corpus_units(root, config)?;
     let plain_count = units.len();
@@ -260,6 +282,11 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
         }
         stats.inline_variants = variants.len(); // ≤1 per unit: the §12 cap
         units.extend(variants);
+        // Lever 4: `units` just grew ~1.5x (plain + variants) via `extend`'s own
+        // doubling growth; this is its last growth point for the rest of `scan()`,
+        // so reclaim the slack here once rather than carry it through every
+        // downstream tier.
+        units.shrink_to_fit();
     }
     drop(raw_trees);
     phase("inline", &mut stats, Instant::now());
@@ -320,6 +347,15 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
     // ---- sequence tier (per language partition; plain units only) ----
     let mut region_groups: Vec<(Group, bool)> = Vec::new();
     {
+        // Full source text is no longer retained corpus-wide (lever B) — only the
+        // (comparatively rare) files that actually surface in a sequence-tier
+        // finding need their text, so re-read those on demand and memoize per file
+        // for the rest of this block. A mismatch against `source_digests` (file
+        // changed on disk since extraction, or became unreadable) degrades to the
+        // SAME "" fallback `sources.get(..).unwrap_or("")` used to produce for a
+        // path absent from the map — never a panic, never a silent render against
+        // mismatched content.
+        let mut src_cache: HashMap<std::path::PathBuf, String> = HashMap::new();
         let mut langs: Vec<lang::Lang> = units.iter().map(|u| u.lang).collect();
         langs.sort();
         langs.dedup();
@@ -352,9 +388,17 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
                     }
                 }
                 api_excluded.insert(key);
-                let mem = |u: usize, range: (usize, usize)| {
+                let mut mem = |u: usize, range: (usize, usize)| {
                     let unit = &units[u];
-                    let src = sources.get(&unit.file).map(String::as_str).unwrap_or("");
+                    let src: &str = src_cache.entry(unit.file.clone()).or_insert_with(|| {
+                        std::fs::read_to_string(&unit.file)
+                            .ok()
+                            .filter(|text| {
+                                Some(xxhash_rust::xxh3::xxh3_128(text.as_bytes()))
+                                    == source_digests.get(&unit.file).copied()
+                            })
+                            .unwrap_or_default()
+                    });
                     let (mut lo, mut hi) = (u32::MAX, 0u32);
                     for t in range.0..range.1 {
                         let (s, e) = corpus.spans[t];
@@ -542,8 +586,10 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
     // ---- duplication ratios (spec §6.1 metrics; context, not primary
     // evidence) computed over the scanned corpus and the MAIN section only —
     // the actionable, CI-gating findings. Line union stays ≤ total (∈[0,100]);
-    // token mass is the removable-copy count in D1 normalized tokens. D28. ----
-    stats.total_lines = sources.values().map(|src| src.lines().count()).sum();
+    // token mass is the removable-copy count in D1 normalized tokens. D28.
+    // `stats.total_lines` is now filled incrementally in `corpus_units` (lever B),
+    // while each file's text is already in hand for parsing — no longer computed
+    // here from a corpus-wide retained-text map. ----
     stats.total_tokens = units
         .iter()
         .filter(|u| u.variant.is_none())
