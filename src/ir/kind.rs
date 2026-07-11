@@ -105,6 +105,72 @@ pub fn is_native(kind: &str) -> bool {
     matches!(kind, NATIVE_STMT | NATIVE_EXPR | NATIVE_PAT | NATIVE_TYPE)
 }
 
+/// Pre-registered [`crate::intern::Kind`] ids for the canonical vocabulary
+/// (interning-id-conversion WP) — every comparison site against one of these names
+/// (`node.kind == kind::id::LOOP`) compiles to a bare `u16` equality, never a string
+/// compare. The numeric value of each const is its POSITION in [`ALL`] — this is
+/// exactly the order `crate::intern::kind_interner()`'s pre-registration loop walks,
+/// so `Kind::intern(LOOP) == id::LOOP` always holds (pinned by
+/// `canonical_kind_ids_match_pre_registration` below); the consts are never
+/// constructed from a hand-picked number.
+pub mod id {
+    use crate::intern::Kind;
+
+    pub const UNIT: Kind = Kind::from_registered_index(0);
+    pub const BLOCK: Kind = Kind::from_registered_index(1);
+    pub const LOOP: Kind = Kind::from_registered_index(2);
+    pub const BRANCH: Kind = Kind::from_registered_index(3);
+    pub const ARM: Kind = Kind::from_registered_index(4);
+    pub const ASSIGN: Kind = Kind::from_registered_index(5);
+    pub const RETURN: Kind = Kind::from_registered_index(6);
+    pub const BREAK: Kind = Kind::from_registered_index(7);
+    pub const CONTINUE: Kind = Kind::from_registered_index(8);
+    pub const CALL: Kind = Kind::from_registered_index(9);
+    pub const BINOP: Kind = Kind::from_registered_index(10);
+    pub const UNOP: Kind = Kind::from_registered_index(11);
+    pub const INDEX: Kind = Kind::from_registered_index(12);
+    pub const FIELD: Kind = Kind::from_registered_index(13);
+    pub const LAMBDA: Kind = Kind::from_registered_index(14);
+    pub const VAR: Kind = Kind::from_registered_index(15);
+    pub const LIT: Kind = Kind::from_registered_index(16);
+    pub const NATIVE_STMT: Kind = Kind::from_registered_index(17);
+    pub const NATIVE_EXPR: Kind = Kind::from_registered_index(18);
+    pub const NATIVE_PAT: Kind = Kind::from_registered_index(19);
+    pub const NATIVE_TYPE: Kind = Kind::from_registered_index(20);
+    pub const ITER: Kind = Kind::from_registered_index(21);
+}
+
+#[cfg(test)]
+mod id_tests {
+    use super::*;
+
+    #[test]
+    fn canonical_kind_ids_match_pre_registration() {
+        assert_eq!(crate::intern::Kind::intern(UNIT), id::UNIT);
+        assert_eq!(crate::intern::Kind::intern(BLOCK), id::BLOCK);
+        assert_eq!(crate::intern::Kind::intern(LOOP), id::LOOP);
+        assert_eq!(crate::intern::Kind::intern(BRANCH), id::BRANCH);
+        assert_eq!(crate::intern::Kind::intern(ARM), id::ARM);
+        assert_eq!(crate::intern::Kind::intern(ASSIGN), id::ASSIGN);
+        assert_eq!(crate::intern::Kind::intern(RETURN), id::RETURN);
+        assert_eq!(crate::intern::Kind::intern(BREAK), id::BREAK);
+        assert_eq!(crate::intern::Kind::intern(CONTINUE), id::CONTINUE);
+        assert_eq!(crate::intern::Kind::intern(CALL), id::CALL);
+        assert_eq!(crate::intern::Kind::intern(BINOP), id::BINOP);
+        assert_eq!(crate::intern::Kind::intern(UNOP), id::UNOP);
+        assert_eq!(crate::intern::Kind::intern(INDEX), id::INDEX);
+        assert_eq!(crate::intern::Kind::intern(FIELD), id::FIELD);
+        assert_eq!(crate::intern::Kind::intern(LAMBDA), id::LAMBDA);
+        assert_eq!(crate::intern::Kind::intern(VAR), id::VAR);
+        assert_eq!(crate::intern::Kind::intern(LIT), id::LIT);
+        assert_eq!(crate::intern::Kind::intern(NATIVE_STMT), id::NATIVE_STMT);
+        assert_eq!(crate::intern::Kind::intern(NATIVE_EXPR), id::NATIVE_EXPR);
+        assert_eq!(crate::intern::Kind::intern(NATIVE_PAT), id::NATIVE_PAT);
+        assert_eq!(crate::intern::Kind::intern(NATIVE_TYPE), id::NATIVE_TYPE);
+        assert_eq!(crate::intern::Kind::intern(ITER), id::ITER);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

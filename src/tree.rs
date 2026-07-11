@@ -2,21 +2,29 @@
 //! original source — a hard requirement: findings that can't be mapped to
 //! source lines are useless.
 //!
-//! `kind`/`field` are interned (interning WP, session `stark-mixed-front`):
-//! [`crate::intern::Kind`]/[`crate::intern::Field`] are `Deref<Target = str>` +
-//! `AsRef<str>` + `From<&str>`, so every existing string comparison/construction site
-//! keeps compiling and behaving byte-for-byte as before — see
-//! `~/.ctxloom/sessions/stark-mixed-front/interning-preamble.md`.
+//! `kind`/`field` are interned as `u16` ids (interning-id-conversion WP, session
+//! `stark-mixed-front`): [`crate::intern::Kind`]/[`crate::intern::Field`] have NO
+//! `Deref`/`AsRef<str>` — comparison sites must use id equality against a
+//! pre-registered const (`crate::ir::kind::id::LOOP`-style) or a per-module
+//! `LazyLock<Kind>`, never a string compare. `Label::External`/`LitKept` carry a
+//! `u32` [`crate::intern::LSym`] id, resolved only through the scan's
+//! `LabelInterner` — NOT self-contained, so `NormNode`/`Label` can no longer derive
+//! a context-free `Serialize` (a bare id can't resolve to its string without that
+//! interner reachable from the impl, which `serde::Serialize::serialize`'s
+//! signature has no room for). The write side of the D19/pack wire format is
+//! therefore an EXPLICIT, interner-aware conversion — [`NormNode::to_wire`] — that
+//! mirrors the read side's existing [`NormNodeWire::into_real`]; both directions
+//! produce/consume the SAME wire shape as pre-interning (a resolved-string
+//! `NormNodeWire`), so on-disk bytes are unchanged (D19 unaffected, no
+//! `EXTRACTION_VERSION` bump).
 
-use crate::intern::{Field, Kind, LSym};
+use crate::intern::{Field, Kind, LSym, LabelInterner};
 
 /// One node of a normalized unit tree. A unit's token count is its node count:
 /// one normalized token per node in the pre-order serialization (DECISIONS.md D1).
-/// `Serialize` is derived for the on-disk cache (spec §4, DECISIONS.md D8/D19) — it
-/// works transparently through `Kind`/`Field`/`Label`'s own `Serialize` impls, so the
-/// bytes are unchanged from pre-interning. `Deserialize` is NOT derived (see
-/// [`Label`]'s doc comment) — deserialize through [`NormNodeWire`] instead.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+/// No `Serialize` derive (see the module doc) — go through [`NormNode::to_wire`]
+/// for the write side, [`NormNodeWire::into_real`] for the read side.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NormNode {
     /// tree-sitter node kind, or the token text for kept anonymous tokens
     /// (operators), or a synthesized native kind (spec §5.2.3: prefer native kinds).
@@ -30,11 +38,13 @@ pub struct NormNode {
     pub children: Vec<NormNode>,
 }
 
-/// Deserialize-only mirror of [`NormNode`] (see [`LabelWire`]) — field-for-field
-/// identical to the pre-interning `Box<str>`-based shape, so bincode bytes through
-/// this type match byte-for-byte what `#[derive(Deserialize)]` on the OLD `NormNode`
-/// produced.
-#[derive(serde::Deserialize)]
+/// Wire mirror of [`NormNode`] — field-for-field identical to the pre-interning
+/// `Box<str>`-based shape, so bincode bytes through this type are byte-identical to
+/// what the pre-interning `#[derive(Serialize, Deserialize)]` produced (D19
+/// unchanged). `Serialize` (write, via [`NormNode::to_wire`]) and `Deserialize`
+/// (read, via [`Self::into_real`]) both go through this ONE shape — no separate
+/// read/write wire types.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct NormNodeWire {
     pub kind: Box<str>,
     pub field: Option<Box<str>>,
@@ -44,10 +54,7 @@ pub struct NormNodeWire {
 }
 
 impl NormNodeWire {
-    pub fn into_real(
-        self,
-        label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
-    ) -> NormNode {
+    pub fn into_real(self, label_interner: &std::sync::Arc<LabelInterner>) -> NormNode {
         NormNode {
             kind: Kind::intern(&self.kind),
             field: self.field.as_deref().map(Field::intern),
@@ -62,15 +69,32 @@ impl NormNodeWire {
     }
 }
 
-/// `External`/`LitKept` carry an [`LSym`] (interned into the scan's per-scan
-/// `LabelInterner` — see `crate::intern`), not a `Box<str>`. Only `serde::Serialize`
-/// is derived here (works transparently through `LSym`'s own `Serialize`, which
-/// resolves via its embedded interner — no external context needed to serialize).
-/// `Deserialize` is deliberately NOT derived: reconstructing an `LSym` needs the
-/// CURRENT scan's `LabelInterner`, which a context-free `Deserialize` impl cannot
-/// reach. The deserialize path instead goes through `LabelWire` (below) + an explicit
-/// `into_real` conversion — see `cache.rs`.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+impl NormNode {
+    /// Resolve this node (and its whole subtree) to the wire shape — the ids are
+    /// resolved to their strings ONCE here (`Kind`/`Field` via their own
+    /// process-global table, `Label::External`/`LitKept` via `label_interner`),
+    /// never on a comparison path. This is the only place a `NormNode` tree's ids
+    /// get turned back into strings for the D19 cache / scan-scoped pack.
+    pub fn to_wire(&self, label_interner: &LabelInterner) -> NormNodeWire {
+        NormNodeWire {
+            kind: self.kind.as_str().into(),
+            field: self.field.map(|f| f.as_str().into()),
+            label: self.label.as_ref().map(|l| l.to_wire(label_interner)),
+            span: self.span,
+            children: self
+                .children
+                .iter()
+                .map(|c| c.to_wire(label_interner))
+                .collect(),
+        }
+    }
+}
+
+/// `External`/`LitKept` carry an [`LSym`] id (interned into the scan's per-scan
+/// [`LabelInterner`] — see `crate::intern`), not a string. No `Serialize`/
+/// `Deserialize` derive (see the module doc) — go through [`Label::to_wire`] /
+/// [`LabelWire::into_real`].
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Label {
     /// Identifier text before abstraction (transient; must not survive P3).
     Raw(Box<str>),
@@ -86,11 +110,25 @@ pub enum Label {
     LitBucket(Bucket),
 }
 
-/// Deserialize-only mirror of [`Label`], field-for-field identical to the format
-/// `Label` used before interning (`External`/`LitKept` as plain `Box<str>`) — so
-/// bincode bytes through this type are byte-identical to what the pre-interning
-/// `#[derive(Deserialize)]` produced. See [`NormNodeWire`]/`cache.rs`.
-#[derive(serde::Deserialize)]
+impl Label {
+    /// See [`NormNode::to_wire`].
+    pub fn to_wire(&self, label_interner: &LabelInterner) -> LabelWire {
+        match self {
+            Label::Raw(t) => LabelWire::Raw(t.clone()),
+            Label::RawLit(t) => LabelWire::RawLit(t.clone()),
+            Label::External(sym) => LabelWire::External(Box::from(label_interner.resolve(*sym))),
+            Label::Local(n) => LabelWire::Local(*n),
+            Label::LitKept(sym) => LabelWire::LitKept(Box::from(label_interner.resolve(*sym))),
+            Label::LitBucket(b) => LabelWire::LitBucket(*b),
+        }
+    }
+}
+
+/// Wire mirror of [`Label`], field-for-field identical to the format `Label` used
+/// before interning (`External`/`LitKept` as plain `Box<str>`) — so bincode bytes
+/// through this type are byte-identical to the pre-interning derive. See
+/// [`NormNodeWire`]/`cache.rs`.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum LabelWire {
     Raw(Box<str>),
     RawLit(Box<str>),
@@ -104,7 +142,7 @@ impl LabelWire {
     /// Re-intern `External`/`LitKept` text into `label_interner` (the current scan's
     /// interner — a fresh process/scan reconstructing a cache hit gets fresh ids, by
     /// design; see the interning preamble's cache-serde section).
-    pub fn into_real(self, label_interner: &std::sync::Arc<crate::intern::LabelInterner>) -> Label {
+    pub fn into_real(self, label_interner: &std::sync::Arc<LabelInterner>) -> Label {
         match self {
             LabelWire::Raw(t) => Label::Raw(t),
             LabelWire::RawLit(t) => Label::RawLit(t),
@@ -153,6 +191,25 @@ impl NormNode {
         NormNode::new(text, None, span, Vec::new())
     }
 
+    /// Like [`Self::new`], but `kind` is an ALREADY-interned [`Kind`] — the common
+    /// case of rebuilding a node from an existing one's kind (AU template
+    /// rendering, order canonicalization): avoids a pointless resolve-then-
+    /// re-intern round trip through a fresh `&str` (the id is already known).
+    pub fn with_kind(
+        kind: Kind,
+        field: Option<Field>,
+        span: (u32, u32),
+        children: Vec<NormNode>,
+    ) -> Self {
+        NormNode {
+            kind,
+            field,
+            label: None,
+            span,
+            children,
+        }
+    }
+
     pub fn with_label(mut self, label: Label) -> Self {
         self.label = Some(label);
         self
@@ -180,12 +237,32 @@ impl NormNode {
         1 + self.children.iter().map(NormNode::token_count).sum::<u32>()
     }
 
-    /// Take the first child occupying `field`, removing it from `children`.
+    /// Take the first child occupying `field`, removing it from `children`. Interns
+    /// `field` ONCE (not per child — the id comparison across all children is a bare
+    /// `u16` equality; see the interning-id-conversion WP's "runtime strings intern
+    /// once per acquisition, not per comparison" rule. `field` here is always a
+    /// compile-time literal at call sites, but the method itself stays reusable
+    /// rather than requiring every caller to pre-register a `LazyLock`).
     pub fn take_field(&mut self, field: &str) -> Option<NormNode> {
-        let idx = self
-            .children
-            .iter()
-            .position(|c| c.field.as_deref() == Some(field))?;
+        let target = Field::intern(field);
+        let idx = self.children.iter().position(|c| c.field == Some(target))?;
         Some(self.children.remove(idx))
+    }
+}
+
+#[cfg(test)]
+mod size_gate {
+    /// G1 (interning-id-conversion WP, hard invariant): `NormNode` must fit in 64
+    /// bytes. A 16-byte string handle (the prior, WRONG WP's substitution) cannot
+    /// pass this — the point of the gate is exactly that: it is a mechanical proof
+    /// the id conversion actually happened, not just claimed.
+    #[test]
+    fn norm_node_fits_in_64_bytes() {
+        let size = std::mem::size_of::<super::NormNode>();
+        assert!(
+            size <= 64,
+            "NormNode grew to {size} bytes (budget: 64) — the Kind/Field/LSym id \
+             conversion must have been bypassed somewhere"
+        );
     }
 }

@@ -31,6 +31,7 @@ use rayon::prelude::*;
 use reprise::au;
 use reprise::config::{Config, Normalizer};
 use reprise::digest::UnitDigest;
+use reprise::intern::LabelInterner;
 use reprise::lang::Lang;
 use reprise::matchtree::{self, RepData, RetrievalStats, Retriever};
 use reprise::unit::{self, Unit};
@@ -62,10 +63,11 @@ fn build_lang_corpus<'d>(
     digests: &'d [UnitDigest],
     lang: Lang,
     cfg: &Config,
+    li: &LabelInterner,
 ) -> Option<LangCorpus<'d>> {
     // The bake-off races the over-gate (borrowed-substrate) shape — the
     // under-gate path recomputes via the same `rep_substrate` either way.
-    let reps = matchtree::build_reps(units, Some(digests), lang, cfg);
+    let reps = matchtree::build_reps(units, Some(digests), lang, cfg, li);
     if reps.len() < 2 {
         return None;
     }
@@ -75,11 +77,17 @@ fn build_lang_corpus<'d>(
 
 /// The fused per-unit digests (production `digest::compute`) the substrate borrows
 /// from — the bake-off feeds `build_reps` exactly what `scan()` feeds it.
-fn build_digests(units: &[Unit], cfg: &Config) -> Vec<UnitDigest> {
+fn build_digests(units: &[Unit], cfg: &Config, li: &LabelInterner) -> Vec<UnitDigest> {
     units
         .iter()
         .map(|u| {
-            reprise::digest::compute(u.tree.expect_resident(), u.lang, cfg, u.variant.is_none())
+            reprise::digest::compute(
+                u.tree.expect_resident(),
+                u.lang,
+                cfg,
+                u.variant.is_none(),
+                li,
+            )
         })
         .collect()
 }
@@ -408,6 +416,7 @@ fn offset_histogram_passes(a: &RepData, b: &RepData, cfg: &Config) -> bool {
     best >= needed
 }
 
+#[allow(clippy::too_many_arguments)]
 fn verify(
     ua: &Unit,
     ub: &Unit,
@@ -416,6 +425,7 @@ fn verify(
     profile: &'static dyn reprise::lang::LanguageProfile,
     ir: bool,
     cfg: &Config,
+    li: &LabelInterner,
 ) -> Verdict {
     if !size_gate_passes(ua.token_count, ub.token_count, cfg) {
         return Verdict::SizeRej;
@@ -428,6 +438,7 @@ fn verify(
         ub.tree.expect_resident(),
         (!ir).then_some(profile),
         ir,
+        li,
     );
     if outcome.divergence > cfg.thresholds.max_divergence {
         return Verdict::DivRej;
@@ -476,13 +487,18 @@ fn run_retriever(r: &dyn Retriever, lc: &LangCorpus<'_>, cfg: &Config) -> (PairS
     )
 }
 
-fn run_corpus<'d>(units: &[Unit], digests: &'d [UnitDigest], cfg: &Config) -> CorpusRun<'d> {
+fn run_corpus<'d>(
+    units: &[Unit],
+    digests: &'d [UnitDigest],
+    cfg: &Config,
+    li: &LabelInterner,
+) -> CorpusRun<'d> {
     let mut langs_present: Vec<Lang> = units.iter().map(|u| u.lang).collect();
     langs_present.sort();
     langs_present.dedup();
     let langs: Vec<LangCorpus<'d>> = langs_present
         .iter()
-        .filter_map(|&l| build_lang_corpus(units, digests, l, cfg))
+        .filter_map(|&l| build_lang_corpus(units, digests, l, cfg, li))
         .collect();
 
     let mut retr_pairs: HashMap<String, PairSet> = HashMap::new();
@@ -508,7 +524,12 @@ fn run_corpus<'d>(units: &[Unit], digests: &'d [UnitDigest], cfg: &Config) -> Co
 
 /// Verify the union of candidate pairs (verify-on-union oracle A). Returns the ACCEPT and
 /// WEAK positive sets as unit-pair sets.
-fn verify_union(units: &[Unit], run: &CorpusRun<'_>, cfg: &Config) -> (PairSet, PairSet) {
+fn verify_union(
+    units: &[Unit],
+    run: &CorpusRun<'_>,
+    cfg: &Config,
+    li: &LabelInterner,
+) -> (PairSet, PairSet) {
     let mut rep_of_unit: HashMap<usize, (usize, usize)> = HashMap::new();
     for (li, lc) in run.langs.iter().enumerate() {
         for (ri, rep) in lc.reps.iter().enumerate() {
@@ -534,6 +555,7 @@ fn verify_union(units: &[Unit], run: &CorpusRun<'_>, cfg: &Config) -> (PairSet, 
                 lc.lang.profile(),
                 lc.ir,
                 cfg,
+                li,
             )
         })
         .collect();
@@ -656,7 +678,10 @@ struct SynPair {
 
 /// Build the synthetic corpus: every seed + its programmatic (t1/t2) mutants + curated
 /// (t3/t2r/t4) variant files, all langs. Returns the units and the known seed<->mutant pairs.
-fn build_synthetic(cfg: &Config) -> (Vec<Unit>, Vec<SynPair>) {
+fn build_synthetic(
+    cfg: &Config,
+    label_interner: &std::sync::Arc<LabelInterner>,
+) -> (Vec<Unit>, Vec<SynPair>) {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut units: Vec<Unit> = Vec::new();
     let mut pairs: Vec<SynPair> = Vec::new();
@@ -666,7 +691,8 @@ fn build_synthetic(cfg: &Config) -> (Vec<Unit>, Vec<SynPair>) {
     let floor = cfg.min_unit_floor();
     let push_file = |units: &mut Vec<Unit>, name: &str, src: &str, lang: Lang| -> Option<usize> {
         let path = PathBuf::from(format!("syn/{name}"));
-        let (fus, _) = unit::extract_file_units(&path, src, lang, cfg);
+        let (fus, _) =
+            unit::extract_file_units_with_interner(&path, src, lang, cfg, label_interner);
         let start = units.len();
         let mut best: Option<usize> = None;
         for (k, u) in fus.into_iter().enumerate() {
@@ -787,6 +813,10 @@ fn main() {
     cfg.inline.enabled = false; // plain units only
 
     // ---- collect real corpus ----
+    // ONE shared interner for the whole real-corpus `units` vec: every file's units land in
+    // this single Vec and get cross-compared (verify_union -> verify -> au::anti_unify), so
+    // their `Label::External`/`LitKept` LSyms must all resolve against the same interner.
+    let label_interner = reprise::intern::LabelInterner::new();
     let mut units: Vec<Unit> = Vec::new();
     for root in &roots {
         let files = reprise::walk::collect_files(root, &cfg).expect("collect_files");
@@ -797,14 +827,15 @@ fn main() {
             if reprise::walk::is_generated(&src, &cfg) {
                 continue;
             }
-            let (fus, _rep) = unit::extract_file_units(&path, &src, lang, &cfg);
+            let (fus, _rep) =
+                unit::extract_file_units_with_interner(&path, &src, lang, &cfg, &label_interner);
             units.extend(fus);
         }
     }
     let n_units = units.len();
-    let digests = build_digests(&units, &cfg);
-    let run = run_corpus(&units, &digests, &cfg);
-    let (accept, weak) = verify_union(&units, &run, &cfg);
+    let digests = build_digests(&units, &cfg, &label_interner);
+    let run = run_corpus(&units, &digests, &cfg, &label_interner);
+    let (accept, weak) = verify_union(&units, &run, &cfg, &label_interner);
     let names: Vec<String> = retrievers().iter().map(|(n, _)| n.to_string()).collect();
 
     println!(
@@ -892,9 +923,15 @@ fn main() {
     }
 
     // ---- oracle B ----
-    let (syn_units, syn_pairs) = build_synthetic(&cfg);
-    let syn_digests = build_digests(&syn_units, &cfg);
-    let syn_run = run_corpus(&syn_units, &syn_digests, &cfg);
+    // Separate corpus, separate interner: the synthetic seed<->mutant units are never
+    // anti_unify'd against the real corpus (or against each other via anything but opaque
+    // fingerprint/pair-index comparisons), so a distinct interner scoped to just this corpus
+    // is correct — it only needs to be the SAME one across every `build_synthetic`/
+    // `build_digests`/`run_corpus` call that touches `syn_units`.
+    let syn_interner = reprise::intern::LabelInterner::new();
+    let (syn_units, syn_pairs) = build_synthetic(&cfg, &syn_interner);
+    let syn_digests = build_digests(&syn_units, &cfg, &syn_interner);
+    let syn_run = run_corpus(&syn_units, &syn_digests, &cfg, &syn_interner);
     #[derive(Default)]
     struct BClass {
         near: Vec<(usize, usize)>,

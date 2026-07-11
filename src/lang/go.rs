@@ -7,8 +7,74 @@ use super::{
     LanguageProfile, child_field, count_self_calls, is_raw_ident, path_is_testy, raw_name,
     synth_call, synth_ident,
 };
+use crate::intern::{Field, Kind};
 use crate::tree::{Bucket, Label, NormNode};
 use std::path::Path;
+use std::sync::LazyLock;
+
+// ---------------------------------------------------------------------------
+// Interned grammar-kind/field constants (interning-id-conversion WP, mechanism
+// rule 2): every tree-sitter-go node-kind / field-name / operator-token literal
+// this profile compares against gets ONE `LazyLock<Kind>`/`LazyLock<Field>`
+// here, interned once ever, then every comparison site is a bare id equality.
+// A handful of Go's native field names (`"left"`, `"right"`, `"body"`,
+// `"name"`) happen to spell the same as the canonical IR-synthesized field
+// vocabulary (`crate::ir::field::id`) — per that module's doc comment this is
+// harmless textual collision (same shared `Field` table, `Field::intern` is
+// idempotent), so those four use the pre-registered `id::*` consts directly
+// instead of a redundant local static.
+// ---------------------------------------------------------------------------
+
+static IDENTIFIER: LazyLock<Kind> = LazyLock::new(|| Kind::intern("identifier"));
+static FIELD_IDENTIFIER: LazyLock<Kind> = LazyLock::new(|| Kind::intern("field_identifier"));
+static TYPE_IDENTIFIER: LazyLock<Kind> = LazyLock::new(|| Kind::intern("type_identifier"));
+static PACKAGE_IDENTIFIER: LazyLock<Kind> = LazyLock::new(|| Kind::intern("package_identifier"));
+
+static STATEMENT_LIST: LazyLock<Kind> = LazyLock::new(|| Kind::intern("statement_list"));
+static BLOCK: LazyLock<Kind> = LazyLock::new(|| Kind::intern("block"));
+static FOR_STATEMENT: LazyLock<Kind> = LazyLock::new(|| Kind::intern("for_statement"));
+static FOR_CLAUSE: LazyLock<Kind> = LazyLock::new(|| Kind::intern("for_clause"));
+static RANGE_CLAUSE: LazyLock<Kind> = LazyLock::new(|| Kind::intern("range_clause"));
+static CONTINUE_STATEMENT: LazyLock<Kind> = LazyLock::new(|| Kind::intern("continue_statement"));
+static BREAK_STATEMENT: LazyLock<Kind> = LazyLock::new(|| Kind::intern("break_statement"));
+static RETURN_STATEMENT: LazyLock<Kind> = LazyLock::new(|| Kind::intern("return_statement"));
+static EXPRESSION_LIST: LazyLock<Kind> = LazyLock::new(|| Kind::intern("expression_list"));
+static SHORT_VAR_DECLARATION: LazyLock<Kind> =
+    LazyLock::new(|| Kind::intern("short_var_declaration"));
+static VAR_DECLARATION: LazyLock<Kind> = LazyLock::new(|| Kind::intern("var_declaration"));
+static CONST_DECLARATION: LazyLock<Kind> = LazyLock::new(|| Kind::intern("const_declaration"));
+static ASSIGNMENT_STATEMENT: LazyLock<Kind> =
+    LazyLock::new(|| Kind::intern("assignment_statement"));
+static INC_STATEMENT: LazyLock<Kind> = LazyLock::new(|| Kind::intern("inc_statement"));
+static DEC_STATEMENT: LazyLock<Kind> = LazyLock::new(|| Kind::intern("dec_statement"));
+static IF_STATEMENT: LazyLock<Kind> = LazyLock::new(|| Kind::intern("if_statement"));
+static GO_STATEMENT: LazyLock<Kind> = LazyLock::new(|| Kind::intern("go_statement"));
+static DEFER_STATEMENT: LazyLock<Kind> = LazyLock::new(|| Kind::intern("defer_statement"));
+static LABELED_STATEMENT: LazyLock<Kind> = LazyLock::new(|| Kind::intern("labeled_statement"));
+static EXPRESSION_SWITCH_STATEMENT: LazyLock<Kind> =
+    LazyLock::new(|| Kind::intern("expression_switch_statement"));
+static TYPE_SWITCH_STATEMENT: LazyLock<Kind> =
+    LazyLock::new(|| Kind::intern("type_switch_statement"));
+static SEND_STATEMENT: LazyLock<Kind> = LazyLock::new(|| Kind::intern("send_statement"));
+static EXPRESSION_STATEMENT: LazyLock<Kind> =
+    LazyLock::new(|| Kind::intern("expression_statement"));
+static BINARY_EXPRESSION: LazyLock<Kind> = LazyLock::new(|| Kind::intern("binary_expression"));
+static LT_OP: LazyLock<Kind> = LazyLock::new(|| Kind::intern("<"));
+static CALL_EXPRESSION: LazyLock<Kind> = LazyLock::new(|| Kind::intern("call_expression"));
+static INDEX_EXPRESSION: LazyLock<Kind> = LazyLock::new(|| Kind::intern("index_expression"));
+static PARAMETER_DECLARATION: LazyLock<Kind> =
+    LazyLock::new(|| Kind::intern("parameter_declaration"));
+static FUNCTION_DECLARATION: LazyLock<Kind> =
+    LazyLock::new(|| Kind::intern("function_declaration"));
+static VAR_SPEC: LazyLock<Kind> = LazyLock::new(|| Kind::intern("var_spec"));
+static CONST_SPEC: LazyLock<Kind> = LazyLock::new(|| Kind::intern("const_spec"));
+static LITERAL_VALUE: LazyLock<Kind> = LazyLock::new(|| Kind::intern("literal_value"));
+static ARGUMENT_LIST: LazyLock<Kind> = LazyLock::new(|| Kind::intern("argument_list"));
+static PARAMETER_LIST: LazyLock<Kind> = LazyLock::new(|| Kind::intern("parameter_list"));
+static REPEAT: LazyLock<Kind> = LazyLock::new(|| Kind::intern("REPEAT"));
+
+static OPERATOR: LazyLock<Field> = LazyLock::new(|| Field::intern("operator"));
+static KEY: LazyLock<Field> = LazyLock::new(|| Field::intern("key"));
 
 pub struct GoProfile;
 
@@ -25,8 +91,8 @@ impl LanguageProfile for GoProfile {
         false
     }
 
-    fn splice_kind(&self, kind: &str) -> bool {
-        kind == "statement_list"
+    fn splice_kind(&self, kind: Kind) -> bool {
+        kind == *STATEMENT_LIST
     }
 
     fn is_identifier(&self, kind: &str) -> bool {
@@ -58,17 +124,14 @@ impl LanguageProfile for GoProfile {
         )
     }
 
-    fn always_external(&self, kind: &str, _field: Option<&str>, _parent_kind: &str) -> bool {
-        matches!(
-            kind,
-            "field_identifier" | "type_identifier" | "package_identifier"
-        )
+    fn always_external(&self, kind: Kind, _field: Option<Field>, _parent_kind: Kind) -> bool {
+        kind == *FIELD_IDENTIFIER || kind == *TYPE_IDENTIFIER || kind == *PACKAGE_IDENTIFIER
     }
 
     fn collect_declared(&self, root: &NormNode, out: &mut Vec<Box<str>>) {
         fn push_idents(node: &NormNode, out: &mut Vec<Box<str>>) {
             if let Some(Label::Raw(text)) = &node.label
-                && node.kind.as_ref() == "identifier"
+                && node.kind == *IDENTIFIER
             {
                 out.push(text.clone());
             }
@@ -77,34 +140,28 @@ impl LanguageProfile for GoProfile {
             }
         }
         fn walk(node: &NormNode, out: &mut Vec<Box<str>>) {
-            match node.kind.as_ref() {
-                "function_declaration" => {
-                    if let Some(name) = child_field(node, "name")
-                        && let Some(Label::Raw(text)) = &name.label
-                    {
-                        out.push(text.clone());
-                    }
+            if node.kind == *FUNCTION_DECLARATION {
+                if let Some(name) = child_field(node, "name")
+                    && let Some(Label::Raw(text)) = &name.label
+                {
+                    out.push(text.clone());
                 }
-                "parameter_declaration" => {
-                    // `name` is a REPEATED field (`func f(a, b int)` groups both
-                    // under one node) — collect every name, not `child_field`'s
-                    // first-only (undercount → grouped names bound as external).
-                    for name in name_fields(node) {
-                        push_idents(name, out);
-                    }
+            } else if node.kind == *PARAMETER_DECLARATION {
+                // `name` is a REPEATED field (`func f(a, b int)` groups both
+                // under one node) — collect every name, not `child_field`'s
+                // first-only (undercount → grouped names bound as external).
+                for name in name_fields(node) {
+                    push_idents(name, out);
                 }
-                "short_var_declaration" | "range_clause" => {
-                    if let Some(left) = child_field(node, "left") {
-                        push_idents(left, out);
-                    }
+            } else if node.kind == *SHORT_VAR_DECLARATION || node.kind == *RANGE_CLAUSE {
+                if let Some(left) = child_field(node, "left") {
+                    push_idents(left, out);
                 }
-                "var_spec" | "const_spec" => {
-                    // `name` is a REPEATED field here too (`var a, b int`).
-                    for name in name_fields(node) {
-                        push_idents(name, out);
-                    }
+            } else if node.kind == *VAR_SPEC || node.kind == *CONST_SPEC {
+                // `name` is a REPEATED field here too (`var a, b int`).
+                for name in name_fields(node) {
+                    push_idents(name, out);
                 }
-                _ => {}
             }
             for child in &node.children {
                 walk(child, out);
@@ -141,71 +198,64 @@ impl LanguageProfile for GoProfile {
         &["+", "*", "&", "|", "^", "&&", "||", "==", "!="]
     }
 
-    fn binary_fields(
-        &self,
-        kind: &str,
-    ) -> Option<(
-        Option<&'static str>,
-        Option<&'static str>,
-        Option<&'static str>,
-    )> {
-        match kind {
-            "binary_expression" => Some((Some("left"), Some("operator"), Some("right"))),
-            _ => None,
+    fn binary_fields(&self, kind: Kind) -> Option<(Option<Field>, Option<Field>, Option<Field>)> {
+        if kind == *BINARY_EXPRESSION {
+            Some((
+                Some(crate::ir::field::id::LEFT),
+                Some(*OPERATOR),
+                Some(crate::ir::field::id::RIGHT),
+            ))
+        } else {
+            None
         }
     }
 
-    fn sortable_pair_kind(&self, kind: &str) -> Option<&'static str> {
-        match kind {
-            "literal_value" => Some("key"),
-            _ => None,
+    fn sortable_pair_kind(&self, kind: Kind) -> Option<Field> {
+        if kind == *LITERAL_VALUE {
+            Some(*KEY)
+        } else {
+            None
         }
     }
 
-    fn is_list_kind(&self, kind: &str) -> bool {
-        matches!(
-            kind,
-            "block"
-                | "argument_list"
-                | "parameter_list"
-                | "expression_list"
-                | "literal_value"
-                | "REPEAT"
-        )
+    fn is_list_kind(&self, kind: Kind) -> bool {
+        kind == *BLOCK
+            || kind == *ARGUMENT_LIST
+            || kind == *PARAMETER_LIST
+            || kind == *EXPRESSION_LIST
+            || kind == *LITERAL_VALUE
+            || kind == *REPEAT
     }
 
-    fn is_statement_kind(&self, kind: &str) -> bool {
-        matches!(
-            kind,
-            "expression_statement"
-                | "short_var_declaration"
-                | "var_declaration"
-                | "const_declaration"
-                | "assignment_statement"
-                | "inc_statement"
-                | "dec_statement"
-                | "if_statement"
-                | "for_statement"
-                | "return_statement"
-                | "break_statement"
-                | "continue_statement"
-                | "go_statement"
-                | "defer_statement"
-                | "labeled_statement"
-                | "expression_switch_statement"
-                | "type_switch_statement"
-                | "send_statement"
-        )
+    fn is_statement_kind(&self, kind: Kind) -> bool {
+        kind == *EXPRESSION_STATEMENT
+            || kind == *SHORT_VAR_DECLARATION
+            || kind == *VAR_DECLARATION
+            || kind == *CONST_DECLARATION
+            || kind == *ASSIGNMENT_STATEMENT
+            || kind == *INC_STATEMENT
+            || kind == *DEC_STATEMENT
+            || kind == *IF_STATEMENT
+            || kind == *FOR_STATEMENT
+            || kind == *RETURN_STATEMENT
+            || kind == *BREAK_STATEMENT
+            || kind == *CONTINUE_STATEMENT
+            || kind == *GO_STATEMENT
+            || kind == *DEFER_STATEMENT
+            || kind == *LABELED_STATEMENT
+            || kind == *EXPRESSION_SWITCH_STATEMENT
+            || kind == *TYPE_SWITCH_STATEMENT
+            || kind == *SEND_STATEMENT
     }
 
     fn is_loop_core(&self, node: &NormNode) -> bool {
-        node.kind.as_ref() == "for_statement"
+        node.kind == *FOR_STATEMENT
             && node.children.len() == 1
-            && node.children[0].field.as_deref() == Some("body")
+            && node.children[0].field == Some(crate::ir::field::id::BODY)
     }
 
     fn is_continue_stmt(&self, node: &NormNode) -> bool {
-        node.kind.as_ref() == "continue_statement"
+        node.kind == *CONTINUE_STATEMENT
     }
 
     fn unit_is_test(&self, _node: tree_sitter::Node, _src: &str, _name: &str, path: &Path) -> bool {
@@ -221,8 +271,8 @@ impl LanguageProfile for GoProfile {
 
     // ---- Phase 3: inliner hooks (spec §5.4) ----
 
-    fn call_kind(&self) -> &'static str {
-        "call_expression"
+    fn call_kind(&self) -> Kind {
+        *CALL_EXPRESSION
     }
 
     fn inline_params(&self, root: &NormNode) -> Option<Vec<Box<str>>> {
@@ -230,9 +280,9 @@ impl LanguageProfile for GoProfile {
     }
 
     fn return_value<'a>(&self, stmt: &'a NormNode) -> Option<&'a NormNode> {
-        if stmt.kind.as_ref() == "return_statement"
+        if stmt.kind == *RETURN_STATEMENT
             && stmt.children.len() == 1
-            && stmt.children[0].kind.as_ref() == "expression_list"
+            && stmt.children[0].kind == *EXPRESSION_LIST
             && stmt.children[0].children.len() == 1
         {
             return Some(&stmt.children[0].children[0]);
@@ -306,29 +356,32 @@ fn lower(
         .into_iter()
         .map(|c| lower(c, label_interner))
         .collect();
-    if node.kind.as_ref() == "block" {
+    if node.kind == *BLOCK {
         node.children = expand_for_clauses(node.children);
     }
-    if node.kind.as_ref() != "for_statement" {
+    if node.kind != *FOR_STATEMENT {
         return node;
     }
-    let clause = node
+    let clause_kind = node
         .children
         .iter()
-        .find(|c| c.field.as_deref() != Some("body"))
-        .map(|c| c.kind.to_string());
-    match clause.as_deref() {
-        Some("for_clause") => node, // hoisted at block level
-        Some("range_clause") => lower_range(node, label_interner),
-        Some(_) => lower_while_form(node),
-        None => node, // infinite: already the core
+        .find(|c| c.field != Some(crate::ir::field::id::BODY))
+        .map(|c| c.kind);
+    if clause_kind == Some(*FOR_CLAUSE) {
+        node // hoisted at block level
+    } else if clause_kind == Some(*RANGE_CLAUSE) {
+        lower_range(node, label_interner)
+    } else if clause_kind.is_some() {
+        lower_while_form(node)
+    } else {
+        node // infinite: already the core
     }
 }
 
 /// `for cond { body }` → `for { if !(cond) { break }; body }`.
 fn lower_while_form(mut node: NormNode) -> NormNode {
     let span = node.span;
-    let field = node.field.as_deref().map(str::to_owned);
+    let field = node.field.map(|f| f.as_str());
     let Some(mut body) = node.take_field("body") else {
         return node;
     };
@@ -339,7 +392,7 @@ fn lower_while_form(mut node: NormNode) -> NormNode {
     let cond = node.children.remove(cond_idx);
     body.children.insert(0, break_unless(cond));
     body.field = Some("body".into());
-    NormNode::new("for_statement", field.as_deref(), span, vec![body])
+    NormNode::new("for_statement", field, span, vec![body])
 }
 
 /// `for left := range xs { body }` → `for { if !__has_next(xs) break; left = __next(xs); body }`.
@@ -348,15 +401,11 @@ fn lower_range(
     label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
 ) -> NormNode {
     let span = node.span;
-    let field = node.field.as_deref().map(str::to_owned);
+    let field = node.field.map(|f| f.as_str());
     let Some(mut body) = node.take_field("body") else {
         return node;
     };
-    let Some(clause_idx) = node
-        .children
-        .iter()
-        .position(|c| c.kind.as_ref() == "range_clause")
-    else {
+    let Some(clause_idx) = node.children.iter().position(|c| c.kind == *RANGE_CLAUSE) else {
         return node;
     };
     let mut clause = node.children.remove(clause_idx);
@@ -375,7 +424,7 @@ fn lower_range(
     body.children.insert(0, guard);
     body.children.insert(1, bind);
     body.field = Some("body".into());
-    NormNode::new("for_statement", field.as_deref(), span, vec![body])
+    NormNode::new("for_statement", field, span, vec![body])
 }
 
 /// Replace each three-clause `for` (a `for_statement` carrying a `for_clause`)
@@ -383,11 +432,8 @@ fn lower_range(
 fn expand_for_clauses(children: Vec<NormNode>) -> Vec<NormNode> {
     let mut out = Vec::with_capacity(children.len());
     for child in children {
-        let is_three_clause = child.kind.as_ref() == "for_statement"
-            && child
-                .children
-                .iter()
-                .any(|c| c.kind.as_ref() == "for_clause");
+        let is_three_clause =
+            child.kind == *FOR_STATEMENT && child.children.iter().any(|c| c.kind == *FOR_CLAUSE);
         if is_three_clause {
             out.extend(lower_three_clause(child));
         } else {
@@ -402,11 +448,7 @@ fn lower_three_clause(mut node: NormNode) -> Vec<NormNode> {
     let Some(mut body) = node.take_field("body") else {
         return vec![node];
     };
-    let Some(clause_idx) = node
-        .children
-        .iter()
-        .position(|c| c.kind.as_ref() == "for_clause")
-    else {
+    let Some(clause_idx) = node.children.iter().position(|c| c.kind == *FOR_CLAUSE) else {
         return vec![node];
     };
     let mut clause = node.children.remove(clause_idx);
@@ -436,7 +478,7 @@ fn lower_three_clause(mut node: NormNode) -> Vec<NormNode> {
 
 fn rewrite_iteration(mut node: NormNode) -> NormNode {
     node.children = node.children.into_iter().map(rewrite_iteration).collect();
-    if node.kind.as_ref() != "for_statement" {
+    if node.kind != *FOR_STATEMENT {
         return node;
     }
     let Some((ivar, coll)) = index_for_match(&node) else {
@@ -458,20 +500,17 @@ fn rewrite_iteration(mut node: NormNode) -> NormNode {
     let range = NormNode::new("range_clause", None, span, vec![left, right]);
     NormNode::new(
         "for_statement",
-        node.field.as_deref(),
+        node.field.map(|f| f.as_str()),
         span,
         vec![range, body],
     )
 }
 
 fn index_for_match(node: &NormNode) -> Option<(Box<str>, Box<str>)> {
-    let clause = node
-        .children
-        .iter()
-        .find(|c| c.kind.as_ref() == "for_clause")?;
+    let clause = node.children.iter().find(|c| c.kind == *FOR_CLAUSE)?;
     // init: i := 0  (short_var_declaration, left=[i], right=[0])
     let init = child_field(clause, "initializer")?;
-    if init.kind.as_ref() != "short_var_declaration" {
+    if init.kind != *SHORT_VAR_DECLARATION {
         return None;
     }
     let left = child_field(init, "left")?;
@@ -479,7 +518,7 @@ fn index_for_match(node: &NormNode) -> Option<(Box<str>, Box<str>)> {
         return None;
     }
     let ivar = match &left.children[0].label {
-        Some(Label::Raw(t)) if left.children[0].kind.as_ref() == "identifier" => t.clone(),
+        Some(Label::Raw(t)) if left.children[0].kind == *IDENTIFIER => t.clone(),
         _ => return None,
     };
     let right = child_field(init, "right")?;
@@ -490,14 +529,14 @@ fn index_for_match(node: &NormNode) -> Option<(Box<str>, Box<str>)> {
     }
     // cond: i < len(coll)
     let cond = child_field(clause, "condition")?;
-    if cond.kind.as_ref() != "binary_expression" || cond.children.len() != 3 {
+    if cond.kind != *BINARY_EXPRESSION || cond.children.len() != 3 {
         return None;
     }
-    if !is_raw_ident(&cond.children[0], &ivar) || cond.children[1].kind.as_ref() != "<" {
+    if !is_raw_ident(&cond.children[0], &ivar) || cond.children[1].kind != *LT_OP {
         return None;
     }
     let lencall = &cond.children[2];
-    if lencall.kind.as_ref() != "call_expression"
+    if lencall.kind != *CALL_EXPRESSION
         || !child_field(lencall, "function").is_some_and(|f| is_raw_ident(f, "len"))
     {
         return None;
@@ -507,12 +546,12 @@ fn index_for_match(node: &NormNode) -> Option<(Box<str>, Box<str>)> {
         return None;
     }
     let coll = match &args.children[0].label {
-        Some(Label::Raw(t)) if args.children[0].kind.as_ref() == "identifier" => t.clone(),
+        Some(Label::Raw(t)) if args.children[0].kind == *IDENTIFIER => t.clone(),
         _ => return None,
     };
     // update: i++
     let update = child_field(clause, "update")?;
-    if update.kind.as_ref() != "inc_statement" || !is_raw_ident(&update.children[0], &ivar) {
+    if update.kind != *INC_STATEMENT || !is_raw_ident(&update.children[0], &ivar) {
         return None;
     }
     let body = child_field(node, "body")?;
@@ -523,7 +562,7 @@ fn index_for_match(node: &NormNode) -> Option<(Box<str>, Box<str>)> {
 }
 
 fn is_target_index(node: &NormNode, ivar: &str, coll: &str) -> bool {
-    node.kind.as_ref() == "index_expression"
+    node.kind == *INDEX_EXPRESSION
         && child_field(node, "operand").is_some_and(|v| is_raw_ident(v, coll))
         && child_field(node, "index").is_some_and(|s| is_raw_ident(s, ivar))
 }
@@ -540,8 +579,8 @@ fn index_uses_only(node: &NormNode, ivar: &str, coll: &str) -> bool {
 
 fn replace_index(mut node: NormNode, ivar: &str, coll: &str) -> NormNode {
     if is_target_index(&node, ivar, coll) {
-        let field = node.field.as_deref().map(str::to_owned);
-        return synth_ident(ivar, field.as_deref(), node.span);
+        let field = node.field.map(|f| f.as_str());
+        return synth_ident(ivar, field, node.span);
     }
     node.children = node
         .children
@@ -573,7 +612,7 @@ fn lower_recursion(root: NormNode) -> NormNode {
     let Some(body_idx) = root
         .children
         .iter()
-        .position(|c| c.field.as_deref() == Some("body"))
+        .position(|c| c.field == Some(crate::ir::field::id::BODY))
     else {
         return root;
     };
@@ -602,7 +641,7 @@ fn simple_params(root: &NormNode) -> Option<Vec<Box<str>>> {
     let params = child_field(root, "parameters")?;
     let mut out = Vec::new();
     for p in &params.children {
-        if p.kind.as_ref() != "parameter_declaration" {
+        if p.kind != *PARAMETER_DECLARATION {
             return None; // variadic / unnamed: bail
         }
         // `name` is a REPEATED field: `func f(a, b int)` groups both names under
@@ -613,9 +652,7 @@ fn simple_params(root: &NormNode) -> Option<Vec<Box<str>>> {
         let before = out.len();
         for name in name_fields(p) {
             match &name.label {
-                Some(Label::Raw(text)) if name.kind.as_ref() == "identifier" => {
-                    out.push(text.clone())
-                }
+                Some(Label::Raw(text)) if name.kind == *IDENTIFIER => out.push(text.clone()),
                 _ => return None,
             }
         }
@@ -632,11 +669,11 @@ fn simple_params(root: &NormNode) -> Option<Vec<Box<str>>> {
 fn name_fields(node: &NormNode) -> impl Iterator<Item = &NormNode> {
     node.children
         .iter()
-        .filter(|c| c.field.as_deref() == Some("name"))
+        .filter(|c| c.field == Some(crate::ir::field::id::NAME))
 }
 
 fn is_self_call(node: &NormNode, name: &str) -> bool {
-    node.kind.as_ref() == "call_expression"
+    node.kind == *CALL_EXPRESSION
         && child_field(node, "function").is_some_and(|f| is_raw_ident(f, name))
 }
 
@@ -646,13 +683,13 @@ fn rewrite_tail_sites(
     params: &[Box<str>],
     replaced: &mut u32,
 ) -> NormNode {
-    if node.kind.as_ref() == "block" {
+    if node.kind == *BLOCK {
         let mut out = Vec::with_capacity(node.children.len());
         for child in node.children {
             // `return f(...)`: return_statement { expression_list { call } }
-            let is_return_site = child.kind.as_ref() == "return_statement"
+            let is_return_site = child.kind == *RETURN_STATEMENT
                 && child.children.len() == 1
-                && child.children[0].kind.as_ref() == "expression_list"
+                && child.children[0].kind == *EXPRESSION_LIST
                 && child.children[0].children.len() == 1
                 && is_self_call(&child.children[0].children[0], name);
             if is_return_site {
@@ -731,7 +768,7 @@ fn normalize_loop_exit(profile: &GoProfile, mut root: NormNode) -> NormNode {
     let Some(body) = root
         .children
         .iter_mut()
-        .find(|c| c.field.as_deref() == Some("body"))
+        .find(|c| c.field == Some(crate::ir::field::id::BODY))
     else {
         return root;
     };
@@ -741,9 +778,9 @@ fn normalize_loop_exit(profile: &GoProfile, mut root: NormNode) -> NormNode {
     }
     let ret_value: Option<NormNode> = {
         let last = &body.children[n - 1];
-        if last.kind.as_ref() == "return_statement"
+        if last.kind == *RETURN_STATEMENT
             && last.children.len() == 1
-            && last.children[0].kind.as_ref() == "expression_list"
+            && last.children[0].kind == *EXPRESSION_LIST
             && last.children[0].children.len() == 1
         {
             Some(last.children[0].children[0].clone())
@@ -778,9 +815,7 @@ fn replace_breaks(
     }
     let mut i = 0;
     while i < node.children.len() {
-        if node.children[i].kind.as_ref() == "break_statement"
-            && node.children[i].children.is_empty()
-        {
+        if node.children[i].kind == *BREAK_STATEMENT && node.children[i].children.is_empty() {
             let span = node.children[i].span;
             let mut v = value.clone();
             v.field = None;

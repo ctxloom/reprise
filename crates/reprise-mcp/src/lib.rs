@@ -64,24 +64,35 @@ pub fn find_similar_json(path: &str, snippet: &str, lang: &str) -> anyhow::Resul
     let cfg = reprise::Config::load(root)?;
     let floor = cfg.min_unit_floor();
 
-    // Candidate unit from the in-memory snippet (no file on disk). The largest
-    // function-like unit is the candidate when the snippet holds several.
-    let candidate = reprise::units_from_source(snippet, lang, &cfg)
-        .into_iter()
-        .max_by_key(|u| u.token_count)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "no function-like unit found in the snippet for language {}",
-                lang.name()
-            )
-        })?;
-
     // Same-language corpus, via `reprise::corpus_units` — the one sanctioned
     // walk+cache+extract accessor (docs/SERVERS.md §7 M1, DECISIONS.md D46). This
     // reuses the D19 per-file cache (a warm hit is byte-identical to a cold
     // extraction by contract, src/cache.rs), where a hand-rolled walk+extract loop
     // previously always extracted cold; it returns all-language units, so the
     // language filter happens here at the call site.
+    //
+    // Fetched BEFORE the candidate (interning-id-conversion WP): `corpus.label_interner`
+    // is the scan's per-scan interner, and `Label::External`/`LitKept`'s `LSym` ids are
+    // relative to it — comparing them (via `au::anti_unify`, below) against an `LSym`
+    // minted by a DIFFERENT interner is meaningless. The candidate must therefore be
+    // interned into this SAME interner (`units_from_source_with_interner`), not a fresh
+    // throwaway one (`units_from_source`, correct only when nothing is ever compared
+    // against another extraction's trees).
+    let corpus = reprise::corpus_units(root, &cfg)?;
+
+    // Candidate unit from the in-memory snippet (no file on disk). The largest
+    // function-like unit is the candidate when the snippet holds several.
+    let candidate =
+        reprise::unit::units_from_source_with_interner(snippet, lang, &cfg, &corpus.label_interner)
+            .into_iter()
+            .max_by_key(|u| u.token_count)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no function-like unit found in the snippet for language {}",
+                    lang.name()
+                )
+            })?;
+
     let ir = cfg.normalize.normalizer == reprise::config::Normalizer::Ir
         && reprise::frontend::has_ir_frontend(lang);
     // The historical `LanguageProfile` is anti_unify's structural oracle ONLY on the historical
@@ -89,13 +100,20 @@ pub fn find_similar_json(path: &str, snippet: &str, lang: &str) -> anyhow::Resul
     // when `!ir`, so the IR case never touches `LanguageProfile` (the profile call vanishes for
     // it); a `historical`/TS/Kotlin scan still supplies it.
     let profile = (!ir).then(|| lang.profile());
-    let corpus = reprise::corpus_units(root, &cfg)?;
     let mut matches: Vec<SimMatch> = Vec::new();
     for u in &corpus.units {
         if u.lang != lang || u.token_count < floor {
             continue; // other-language unit, or below reprise's index floor
         }
-        if let Some(m) = compare(&candidate, u, profile, ir, &cfg, root) {
+        if let Some(m) = compare(
+            &candidate,
+            u,
+            profile,
+            ir,
+            &cfg,
+            root,
+            &corpus.label_interner,
+        ) {
             matches.push(m);
         }
     }
@@ -131,6 +149,7 @@ fn compare(
     ir: bool,
     cfg: &reprise::Config,
     root: &Path,
+    label_interner: &reprise::intern::LabelInterner,
 ) -> Option<SimMatch> {
     let rel = u
         .file
@@ -168,6 +187,7 @@ fn compare(
         u.tree.expect_resident(),
         profile,
         ir,
+        label_interner,
     );
     if outcome.divergence <= cfg.thresholds.max_divergence
         && outcome.holes.len() as u32 <= cfg.thresholds.max_holes
@@ -180,7 +200,10 @@ fn compare(
             similarity: 1.0 - outcome.divergence,
             divergence: outcome.divergence,
             holes: outcome.holes.len(),
-            template: Some(reprise::au::render_template(&outcome.template)),
+            template: Some(reprise::au::render_template(
+                &outcome.template,
+                label_interner,
+            )),
         })
     } else {
         None

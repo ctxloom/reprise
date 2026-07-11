@@ -8,11 +8,29 @@
 //! binary LCS: a clone whose every statement was lightly edited still aligns.
 
 use crate::fingerprint::{HashMode, merkle, merkle_mode};
+use crate::intern::{Field, Kind, LSym, LabelInterner};
 use crate::lang::LanguageProfile;
 use crate::tree::{Label, NormNode};
 use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::LazyLock;
+
+/// Shared once-interned `Kind`s for literal comparisons this file makes against
+/// grammar/synthetic kind names (interning-id-conversion WP mechanism rule 3: a
+/// `LazyLock<Kind>` interns a compile-time literal ONCE, so every subsequent
+/// comparison is a bare `u16` equality, never a string compare).
+static REPEAT: LazyLock<Kind> = LazyLock::new(|| Kind::intern("REPEAT"));
+static HOLE: LazyLock<Kind> = LazyLock::new(|| Kind::intern("HOLE"));
+static EXPRESSION_STATEMENT: LazyLock<Kind> =
+    LazyLock::new(|| Kind::intern("expression_statement"));
+static BLOCK_LOWER: LazyLock<Kind> = LazyLock::new(|| Kind::intern("block"));
+static ARGUMENTS: LazyLock<Kind> = LazyLock::new(|| Kind::intern("arguments"));
+static ARGUMENT_LIST: LazyLock<Kind> = LazyLock::new(|| Kind::intern("argument_list"));
+static PARAMETERS: LazyLock<Kind> = LazyLock::new(|| Kind::intern("parameters"));
+static LEFT: LazyLock<Field> = LazyLock::new(|| Field::intern("left"));
+static OP: LazyLock<Field> = LazyLock::new(|| Field::intern("op"));
+static RIGHT: LazyLock<Field> = LazyLock::new(|| Field::intern("right"));
 
 #[derive(Debug, Clone)]
 pub struct Hole {
@@ -46,6 +64,15 @@ struct Ctx<'a> {
     /// the per-grammar `LanguageProfile` (whose kinds never appear in an IR tree). Historical
     /// units keep the exact `LanguageProfile` answers, so their AU output is byte-identical.
     ir: bool,
+    /// The scan's per-scan label interner — resolves `Label::External`/`LitKept` `LSym`
+    /// ids for fingerprint hashing ([`merkle`]/[`merkle_mode`]) and for the two fixed
+    /// synthetic-marker comparisons below (`has_next_sym`/`next_sym`).
+    li: &'a LabelInterner,
+    /// `li.intern("__has_next")`/`li.intern("__next")`, computed ONCE per `anti_unify`
+    /// call (not per comparison): `is_synthetic` then compares by bare id equality, never
+    /// re-interning or resolving on its (per-DP-cell-reachable) hot path.
+    has_next_sym: LSym,
+    next_sym: LSym,
     holes: HashMap<(u128, u128), (u32, Hole)>,
     next_hole: u32,
     /// Memo of input-subtree hashes keyed by node ADDRESS: exact merkle +
@@ -70,9 +97,9 @@ impl Ctx<'_> {
         if let Some((exact, vec)) = self.memo.get(&key) {
             return (*exact, Rc::clone(vec));
         }
-        let exact = merkle(node);
+        let exact = merkle(node, self.li);
         let mut hashes = Vec::new();
-        collect_hashes(node, &mut hashes);
+        collect_hashes(node, &mut hashes, self.li);
         hashes.sort_unstable();
         let vec = Rc::new(hashes);
         self.memo.insert(key, (exact, Rc::clone(&vec)));
@@ -85,7 +112,7 @@ impl Ctx<'_> {
     }
 
     fn is_machinery(&mut self, node: &NormNode) -> bool {
-        self.tokens(node) <= 12 && is_synthetic(node)
+        self.tokens(node) <= 12 && is_synthetic(node, self.has_next_sym, self.next_sym)
     }
 
     /// The historical profile — present whenever `ir == false` (its only consumers are the
@@ -99,7 +126,7 @@ impl Ctx<'_> {
     /// The lowered loop core — the IR `Loop` node, or the historical `while True` core.
     fn is_loop_core(&self, node: &NormNode) -> bool {
         if self.ir {
-            node.kind.as_ref() == crate::ir::kind::LOOP
+            node.kind == crate::ir::kind::id::LOOP
         } else {
             self.hist_profile().is_loop_core(node)
         }
@@ -107,9 +134,11 @@ impl Ctx<'_> {
 
     /// A variable-length child list AU aligns with graded Smith-Waterman: IR statement `Block`s,
     /// `Branch` arm-lists, and folded `REPEAT` runs (mirrors [`crate::ir::FoldRules`]).
-    fn is_list_kind(&self, kind: &str) -> bool {
+    fn is_list_kind(&self, kind: Kind) -> bool {
         if self.ir {
-            kind == crate::ir::kind::BLOCK || kind == crate::ir::kind::BRANCH || kind == "REPEAT"
+            kind == crate::ir::kind::id::BLOCK
+                || kind == crate::ir::kind::id::BRANCH
+                || kind == *REPEAT
         } else {
             self.hist_profile().is_list_kind(kind)
         }
@@ -118,16 +147,9 @@ impl Ctx<'_> {
     /// `(left, op, right)` fields of a rebuildable binary kind — the IR `Binop` shape, or the
     /// per-grammar binary kinds.
     #[allow(clippy::type_complexity)]
-    fn binary_fields(
-        &self,
-        kind: &str,
-    ) -> Option<(
-        Option<&'static str>,
-        Option<&'static str>,
-        Option<&'static str>,
-    )> {
+    fn binary_fields(&self, kind: Kind) -> Option<(Option<Field>, Option<Field>, Option<Field>)> {
         if self.ir {
-            (kind == crate::ir::kind::BINOP).then_some((Some("left"), Some("op"), Some("right")))
+            (kind == crate::ir::kind::id::BINOP).then_some((Some(*LEFT), Some(*OP), Some(*RIGHT)))
         } else {
             self.hist_profile().binary_fields(kind)
         }
@@ -137,16 +159,22 @@ impl Ctx<'_> {
 /// Anti-unify two normalized units. `profile` is the historical `LanguageProfile`, required
 /// ONLY when `ir == false` (the historical path's structural predicates); IR-path callers pass
 /// `None` — the canonical-IR kinds answer those predicates directly, so the IR path carries no
-/// `LanguageProfile` dependency. Invariant: `profile.is_some() == !ir`.
+/// `LanguageProfile` dependency. Invariant: `profile.is_some() == !ir`. `li` is the scan's
+/// per-scan `LabelInterner` (interning-id-conversion WP) — resolves `Label` `LSym` ids for
+/// fingerprint hashing and the fixed synthetic-marker comparisons.
 pub fn anti_unify(
     a: &NormNode,
     b: &NormNode,
     profile: Option<&dyn LanguageProfile>,
     ir: bool,
+    li: &LabelInterner,
 ) -> AuOutcome {
     let mut ctx = Ctx {
         profile,
         ir,
+        li,
+        has_next_sym: li.intern("__has_next"),
+        next_sym: li.intern("__next"),
         holes: HashMap::new(),
         next_hole: 0,
         memo: HashMap::new(),
@@ -186,7 +214,7 @@ fn labels_equal(a: &NormNode, b: &NormNode) -> bool {
 /// Rust statements wrap in `expression_statement`; comparisons against the
 /// loop core must look through the wrapper.
 fn unwrap_stmt(node: &NormNode) -> &NormNode {
-    if node.kind.as_ref() == "expression_statement" && node.children.len() == 1 {
+    if node.kind == *EXPRESSION_STATEMENT && node.children.len() == 1 {
         &node.children[0]
     } else {
         node
@@ -197,19 +225,19 @@ fn au(a: &NormNode, b: &NormNode, ctx: &mut Ctx) -> NormNode {
     // REPEAT vs rolled loop core: align the template against the loop body —
     // the guard/bind machinery becomes holes (spec §5.3 canonicalization).
     let (ua, ub) = (unwrap_stmt(a), unwrap_stmt(b));
-    if ua.kind.as_ref() == "REPEAT"
+    if ua.kind == *REPEAT
         && ctx.is_loop_core(ub)
         && let Some(body) = crate::lang::child_field(ub, "body")
     {
         let children = au_list(&ua.children, &body.children, ctx);
-        return NormNode::new("REPEAT", None, a.span, children);
+        return NormNode::with_kind(*REPEAT, None, a.span, children);
     }
-    if ub.kind.as_ref() == "REPEAT"
+    if ub.kind == *REPEAT
         && ctx.is_loop_core(ua)
         && let Some(body) = crate::lang::child_field(ua, "body")
     {
         let children = au_list(&body.children, &ub.children, ctx);
-        return NormNode::new("REPEAT", None, a.span, children);
+        return NormNode::with_kind(*REPEAT, None, a.span, children);
     }
 
     if a.kind != b.kind || !labels_equal(a, b) {
@@ -220,7 +248,7 @@ fn au(a: &NormNode, b: &NormNode, ctx: &mut Ctx) -> NormNode {
     // a matching operator aligns the flattened operand chains, because order
     // canonicalization may have sorted divergent operands differently.
     let is_operator_slot = |n: &NormNode| n.children.is_empty() && n.label.is_none(); // incl. word ops (and/or)
-    if ctx.binary_fields(&a.kind).is_some()
+    if ctx.binary_fields(a.kind).is_some()
         && a.children.len() == 3
         && b.children.len() == 3
         && is_operator_slot(&a.children[1])
@@ -231,17 +259,17 @@ fn au(a: &NormNode, b: &NormNode, ctx: &mut Ctx) -> NormNode {
         }
         let mut ops_a: Vec<&NormNode> = Vec::new();
         let mut ops_b: Vec<&NormNode> = Vec::new();
-        flatten_operands(a, &a.kind.clone(), &a.children[1].kind.clone(), &mut ops_a);
-        flatten_operands(b, &b.kind.clone(), &b.children[1].kind.clone(), &mut ops_b);
+        flatten_operands(a, a.kind, a.children[1].kind, &mut ops_a);
+        flatten_operands(b, b.kind, b.children[1].kind, &mut ops_b);
         if ops_a.len() > 2 || ops_b.len() > 2 || ops_a.len() != ops_b.len() {
             let mut children = vec![a.children[1].clone()];
             children.extend(au_list(&ops_a, &ops_b, ctx));
-            let mut node = NormNode::new(&a.kind, a.field.as_deref(), a.span, children);
+            let mut node = NormNode::with_kind(a.kind, a.field, a.span, children);
             node.label = a.label.clone();
             return node;
         }
     }
-    let children = if ctx.is_list_kind(&a.kind) || a.children.len() != b.children.len() {
+    let children = if ctx.is_list_kind(a.kind) || a.children.len() != b.children.len() {
         au_list(&a.children, &b.children, ctx)
     } else {
         a.children
@@ -250,7 +278,7 @@ fn au(a: &NormNode, b: &NormNode, ctx: &mut Ctx) -> NormNode {
             .map(|(ca, cb)| au(ca, cb, ctx))
             .collect()
     };
-    let mut node = NormNode::new(&a.kind, a.field.as_deref(), a.span, children);
+    let mut node = NormNode::with_kind(a.kind, a.field, a.span, children);
     node.label = a.label.clone();
     node
 }
@@ -376,8 +404,8 @@ fn similarity(a: &NormNode, b: &NormNode, ctx: &mut Ctx) -> f64 {
         // Folded REPEAT and the rolled loop core must PAIR in alignment so the
         // au() special case can compare template against loop body (§5.3).
         let (ua, ub) = (unwrap_stmt(a), unwrap_stmt(b));
-        let repeat_loop = (ua.kind.as_ref() == "REPEAT" && ctx.is_loop_core(ub))
-            || (ub.kind.as_ref() == "REPEAT" && ctx.is_loop_core(ua));
+        let repeat_loop = (ua.kind == *REPEAT && ctx.is_loop_core(ub))
+            || (ub.kind == *REPEAT && ctx.is_loop_core(ua));
         return if repeat_loop { 0.6 } else { 0.0 };
     }
     let (ea, ha) = ctx.node_info(a);
@@ -405,10 +433,10 @@ fn similarity(a: &NormNode, b: &NormNode, ctx: &mut Ctx) -> f64 {
     }
 }
 
-fn collect_hashes(node: &NormNode, out: &mut Vec<u128>) {
-    out.push(merkle_mode(node, HashMode::MaskedAll));
+fn collect_hashes(node: &NormNode, out: &mut Vec<u128>, li: &LabelInterner) {
+    out.push(merkle_mode(node, HashMode::MaskedAll, li));
     for child in &node.children {
-        collect_hashes(child, out);
+        collect_hashes(child, out, li);
     }
 }
 
@@ -419,11 +447,8 @@ fn collect_hashes(node: &NormNode, out: &mut Vec<u128>) {
 /// to `au_list`/`node_info` must outlive the whole `anti_unify` call so the
 /// address-keyed memo stays sound (see `Ctx::memo`). Cloning into a transient
 /// `Vec` — which then frees — is a use-after-free of the memo key.
-fn flatten_operands<'a>(node: &'a NormNode, kind: &str, op: &str, out: &mut Vec<&'a NormNode>) {
-    if node.kind.as_ref() == kind
-        && node.children.len() == 3
-        && node.children[1].kind.as_ref() == op
-    {
+fn flatten_operands<'a>(node: &'a NormNode, kind: Kind, op: Kind, out: &mut Vec<&'a NormNode>) {
+    if node.kind == kind && node.children.len() == 3 && node.children[1].kind == op {
         flatten_operands(&node.children[0], kind, op, out);
         out.push(&node.children[2]);
     } else {
@@ -433,19 +458,22 @@ fn flatten_operands<'a>(node: &'a NormNode, kind: &str, op: &str, out: &mut Vec<
 
 /// See `Ctx::is_machinery`: a small statement that IS lowering machinery
 /// (guard `if !__has_next(..)` / bind `x = __next(..)`), as opposed to real
-/// code containing a lowered loop.
-fn is_synthetic(node: &NormNode) -> bool {
-    if matches!(&node.label, Some(Label::External(s)) if s.as_ref() == "__has_next" || s.as_ref() == "__next")
-    {
+/// code containing a lowered loop. `has_next`/`next` are `li.intern(..)`'d ONCE
+/// per `anti_unify` call (`Ctx::has_next_sym`/`next_sym`) — this compares by bare
+/// id equality, never re-interning or resolving on this (DP-cell-reachable) path.
+fn is_synthetic(node: &NormNode, has_next: LSym, next: LSym) -> bool {
+    if matches!(&node.label, Some(Label::External(s)) if *s == has_next || *s == next) {
         return true;
     }
-    node.children.iter().any(is_synthetic)
+    node.children
+        .iter()
+        .any(|c| is_synthetic(c, has_next, next))
 }
 
 fn is_op_token(node: &NormNode) -> bool {
     node.children.is_empty()
         && node.label.is_none()
-        && !node.kind.chars().any(char::is_alphanumeric)
+        && !node.kind.as_str().chars().any(char::is_alphanumeric)
 }
 
 fn hole(a: &NormNode, b: &NormNode, ctx: &mut Ctx) -> NormNode {
@@ -478,7 +506,7 @@ fn hole(a: &NormNode, b: &NormNode, ctx: &mut Ctx) -> NormNode {
             id
         }
     };
-    NormNode::new("HOLE", a.field.as_deref(), a.span, Vec::new()).with_label(Label::Local(id))
+    NormNode::with_kind(*HOLE, a.field, a.span, Vec::new()).with_label(Label::Local(id))
 }
 
 /// One-sided (or two-sided) gap run → a single hole.
@@ -525,56 +553,55 @@ fn run_hole(gap_a: &[&NormNode], gap_b: &[&NormNode], ctx: &mut Ctx) -> NormNode
             id
         }
     };
-    NormNode::new("HOLE", None, span, Vec::new()).with_label(Label::Local(id))
+    NormNode::with_kind(*HOLE, None, span, Vec::new()).with_label(Label::Local(id))
 }
 
 // ---------- template rendering (pseudo-source, spec §6) ----------
 
 /// Compact pseudo-source rendering of a template. Not a pretty-printer:
-/// structure + labels + ⟨hole⟩ markers, readable enough to judge a finding.
-pub fn render_template(node: &NormNode) -> String {
+/// structure + labels + ⟨hole⟩ markers, readable enough to judge a finding. `li`
+/// resolves `Label::External`/`LitKept` ids (test/report rendering only — never
+/// on a matching comparison path).
+pub fn render_template(node: &NormNode, li: &LabelInterner) -> String {
     let mut out = String::new();
-    render(node, 0, &mut out);
+    render(node, 0, &mut out, li);
     out
 }
 
-fn render(node: &NormNode, indent: usize, out: &mut String) {
-    match node.kind.as_ref() {
-        "HOLE" => {
-            let id = match &node.label {
-                Some(Label::Local(i)) => *i + 1,
-                _ => 0,
-            };
-            out.push_str(&format!("⟨h{id}⟩"));
-            return;
+fn render(node: &NormNode, indent: usize, out: &mut String, li: &LabelInterner) {
+    if node.kind == *HOLE {
+        let id = match &node.label {
+            Some(Label::Local(i)) => *i + 1,
+            _ => 0,
+        };
+        out.push_str(&format!("⟨h{id}⟩"));
+        return;
+    }
+    if node.kind == *REPEAT {
+        out.push_str("repeat× {");
+        for child in &node.children {
+            newline(indent + 1, out);
+            render(child, indent + 1, out, li);
         }
-        "REPEAT" => {
-            out.push_str("repeat× {");
-            for child in &node.children {
-                newline(indent + 1, out);
-                render(child, indent + 1, out);
-            }
-            newline(indent, out);
-            out.push('}');
-            return;
+        newline(indent, out);
+        out.push('}');
+        return;
+    }
+    if node.kind == *BLOCK_LOWER {
+        out.push('{');
+        for child in &node.children {
+            newline(indent + 1, out);
+            render(child, indent + 1, out, li);
         }
-        "block" => {
-            out.push('{');
-            for child in &node.children {
-                newline(indent + 1, out);
-                render(child, indent + 1, out);
-            }
-            newline(indent, out);
-            out.push('}');
-            return;
-        }
-        _ => {}
+        newline(indent, out);
+        out.push('}');
+        return;
     }
     if let Some(label) = &node.label {
         let text = match label {
-            Label::External(s) => s.to_string(),
+            Label::External(s) => li.resolve(*s).to_string(),
             Label::Local(i) => format!("v{i}"),
-            Label::LitKept(s) => s.to_string(),
+            Label::LitKept(s) => li.resolve(*s).to_string(),
             Label::LitBucket(b) => b.name().to_string(),
             Label::Raw(s) | Label::RawLit(s) => s.to_string(),
         };
@@ -582,17 +609,15 @@ fn render(node: &NormNode, indent: usize, out: &mut String) {
         return;
     }
     if node.children.is_empty() {
-        out.push_str(&node.kind);
+        out.push_str(node.kind.as_str());
         return;
     }
-    if let Some(prefix) = kind_keyword(&node.kind) {
+    if let Some(prefix) = kind_keyword(node.kind) {
         out.push_str(prefix);
         out.push(' ');
     }
-    let parenthesized = matches!(
-        node.kind.as_ref(),
-        "arguments" | "argument_list" | "parameters"
-    );
+    let parenthesized =
+        node.kind == *ARGUMENTS || node.kind == *ARGUMENT_LIST || node.kind == *PARAMETERS;
     if parenthesized {
         out.push('(');
     }
@@ -602,7 +627,7 @@ fn render(node: &NormNode, indent: usize, out: &mut String) {
             out.push_str(if parenthesized { ", " } else { " " });
         }
         first = false;
-        render(child, indent, out);
+        render(child, indent, out, li);
     }
     if parenthesized {
         out.push(')');
@@ -616,21 +641,31 @@ fn newline(indent: usize, out: &mut String) {
     }
 }
 
-fn kind_keyword(kind: &str) -> Option<&'static str> {
-    Some(match kind {
-        "if_statement" | "if_expression" => "if",
-        "while_statement" => "while",
-        "loop_expression" => "loop",
-        "return_statement" | "return_expression" => "return",
-        "break_statement" | "break_expression" => "break",
-        "continue_statement" | "continue_expression" => "continue",
-        "else_clause" => "else",
-        "elif_clause" => "elif",
-        "match_expression" => "match",
-        "try_statement" => "try",
-        "not_operator" => "not",
-        "let_declaration" => "let",
-        "function_item" | "function_definition" => "fn",
-        _ => return None,
-    })
+fn kind_keyword(kind: Kind) -> Option<&'static str> {
+    static KEYWORDS: LazyLock<HashMap<Kind, &'static str>> = LazyLock::new(|| {
+        [
+            ("if_statement", "if"),
+            ("if_expression", "if"),
+            ("while_statement", "while"),
+            ("loop_expression", "loop"),
+            ("return_statement", "return"),
+            ("return_expression", "return"),
+            ("break_statement", "break"),
+            ("break_expression", "break"),
+            ("continue_statement", "continue"),
+            ("continue_expression", "continue"),
+            ("else_clause", "else"),
+            ("elif_clause", "elif"),
+            ("match_expression", "match"),
+            ("try_statement", "try"),
+            ("not_operator", "not"),
+            ("let_declaration", "let"),
+            ("function_item", "fn"),
+            ("function_definition", "fn"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (Kind::intern(k), v))
+        .collect()
+    });
+    KEYWORDS.get(&kind).copied()
 }

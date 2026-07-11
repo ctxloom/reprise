@@ -84,13 +84,13 @@ pub fn assert_no_orphan_continue(src: &str, lang: Lang) {
     fn node_count(n: &NormNode) -> usize {
         1 + n.children.iter().map(node_count).sum::<usize>()
     }
-    fn is_continue(n: &NormNode) -> bool {
-        if n.kind.as_ref() != "identifier" {
-            return n.kind.as_ref() == "continue_statement";
+    fn is_continue(n: &NormNode, li: &reprise::intern::LabelInterner) -> bool {
+        if n.kind.as_str() != "identifier" {
+            return n.kind.as_str() == "continue_statement";
         }
         match &n.label {
             Some(Label::Raw(t)) => t.as_ref() == "continue",
-            Some(Label::External(t)) => t.as_ref() == "continue",
+            Some(Label::External(t)) => li.resolve(*t) == "continue",
             _ => false,
         }
     }
@@ -113,26 +113,26 @@ pub fn assert_no_orphan_continue(src: &str, lang: Lang) {
             "while_statement" | "for_statement" | "for_in_statement"
         )
     }
-    fn walk(n: &NormNode, loop_depth: u32) {
-        if is_callable(n.kind.as_ref()) {
+    fn walk(n: &NormNode, loop_depth: u32, li: &reprise::intern::LabelInterner) {
+        if is_callable(n.kind.as_str()) {
             for c in &n.children {
-                walk(c, 0); // a nested callable resets the loop context
+                walk(c, 0, li); // a nested callable resets the loop context
             }
             return;
         }
-        if is_continue(n) {
+        if is_continue(n, li) {
             assert!(
                 loop_depth > 0,
                 "`continue` outside any loop — recursion lowering descended into a nested closure"
             );
         }
-        let depth = if is_loop(n.kind.as_ref()) {
+        let depth = if is_loop(n.kind.as_str()) {
             loop_depth + 1
         } else {
             loop_depth
         };
         for c in &n.children {
-            walk(c, depth);
+            walk(c, depth, li);
         }
     }
 
@@ -151,5 +151,5 @@ pub fn assert_no_orphan_continue(src: &str, lang: Lang) {
     let tree = profile.rewrite_iteration(tree, &label_interner);
     let tree = profile.lower_loops(tree, &label_interner);
     let tree = profile.normalize_loop_exit(tree);
-    walk(&tree, 0);
+    walk(&tree, 0, &label_interner);
 }

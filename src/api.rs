@@ -10,12 +10,14 @@
 //! what §7.4(d) hand-labels — reported in their own section, never failing CI.
 
 use crate::config::Config;
+use crate::intern::{Kind, LabelInterner};
 use crate::ir::kind;
 use crate::lang::{Lang, LanguageProfile, child_field};
 use crate::report::{Group, Tier};
 use crate::tree::{Label, NormNode};
 use crate::unit::{self, Unit};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::LazyLock;
 
 /// Signature element: callee name + control context. Public because the fused
 /// digest pass ([`crate::digest`]) carries each plain unit's call multiset.
@@ -25,13 +27,18 @@ pub type Elem = (Box<str>, u8, bool, bool);
 /// built from, before the corpus-wide IDF/rarity filtering (which stays in
 /// `api_groups_for_lang`, where document frequency exists). Public so the fused
 /// digest pass computes it with the SAME extractor at unit-creation time.
-pub fn call_elems(tree: &NormNode, lang: Lang, cfg: &Config) -> BTreeMap<Elem, u32> {
+pub fn call_elems(
+    tree: &NormNode,
+    lang: Lang,
+    cfg: &Config,
+    li: &LabelInterner,
+) -> BTreeMap<Elem, u32> {
     let shapes = Shapes::for_lang(lang, cfg);
     let mut elems = BTreeMap::new();
     // The unit body's final statement/expression is a tail position, like
     // returns: `return f(x)` and block-tail `f(x)` must agree.
     let tail_node = shapes.tail_node(tree);
-    extract_calls(tree, shapes, Flags::default(), tail_node, &mut elems);
+    extract_calls(tree, shapes, Flags::default(), tail_node, &mut elems, li);
     elems
 }
 
@@ -55,6 +62,7 @@ pub fn find_api_groups(
     cfg: &Config,
     excluded_pairs: &HashSet<(usize, usize)>,
     signatures_emitted: &mut usize,
+    li: &LabelInterner,
 ) -> Vec<Group> {
     if !cfg.api_profile.enabled {
         return Vec::new();
@@ -71,6 +79,7 @@ pub fn find_api_groups(
             cfg,
             excluded_pairs,
             signatures_emitted,
+            li,
         ));
     }
     groups
@@ -83,6 +92,7 @@ fn api_groups_for_lang(
     cfg: &Config,
     excluded_pairs: &HashSet<(usize, usize)>,
     signatures_emitted: &mut usize,
+    li: &LabelInterner,
 ) -> Vec<Group> {
     // Eligible population: plain units at or above the size floor.
     let eligible: Vec<usize> = (0..units.len())
@@ -117,7 +127,7 @@ fn api_groups_for_lang(
         None => eligible
             .par_iter()
             .map(|&i| {
-                let elems = call_elems(units[i].tree.expect_resident(), lang, cfg);
+                let elems = call_elems(units[i].tree.expect_resident(), lang, cfg, li);
                 (i, std::borrow::Cow::Owned(elems))
             })
             .collect(),
@@ -308,26 +318,37 @@ struct Flags {
 
 /// Branch-context kinds across the supported languages; post-normalization
 /// both languages express branching through these.
-fn is_branchy(kind: &str) -> bool {
-    matches!(
-        kind,
-        "if_expression"
-            | "if_statement"
-            | "elif_clause"
-            | "else_clause"
-            | "match_expression"
-            | "match_arm"
-            | "match_statement"
-            | "case_clause"
-            | "try_statement"
-            | "try_expression"
-            | "except_clause"
-            | "conditional_expression"
-    )
+fn is_branchy(kind: Kind) -> bool {
+    static BRANCHY: LazyLock<HashSet<Kind>> = LazyLock::new(|| {
+        [
+            "if_expression",
+            "if_statement",
+            "elif_clause",
+            "else_clause",
+            "match_expression",
+            "match_arm",
+            "match_statement",
+            "case_clause",
+            "try_statement",
+            "try_expression",
+            "except_clause",
+            "conditional_expression",
+        ]
+        .into_iter()
+        .map(Kind::intern)
+        .collect()
+    });
+    BRANCHY.contains(&kind)
 }
 
-fn is_return_kind(kind: &str) -> bool {
-    matches!(kind, "return_expression" | "return_statement")
+fn is_return_kind(kind: Kind) -> bool {
+    static RETURNY: LazyLock<HashSet<Kind>> = LazyLock::new(|| {
+        ["return_expression", "return_statement"]
+            .into_iter()
+            .map(Kind::intern)
+            .collect()
+    });
+    RETURNY.contains(&kind)
 }
 
 /// The tree-shape primitives `extract_calls` reads through, so one extraction serves
@@ -358,10 +379,10 @@ impl Shapes {
         }
     }
 
-    fn call_kind(&self) -> &'static str {
+    fn call_kind(&self) -> Kind {
         match self {
             Shapes::Historical(p) => p.call_kind(),
-            Shapes::Ir => kind::CALL,
+            Shapes::Ir => kind::id::CALL,
         }
     }
 
@@ -376,21 +397,21 @@ impl Shapes {
     fn is_loop(&self, node: &NormNode) -> bool {
         match self {
             Shapes::Historical(p) => p.is_loop_core(node),
-            Shapes::Ir => node.kind.as_ref() == kind::LOOP,
+            Shapes::Ir => node.kind == kind::id::LOOP,
         }
     }
 
     fn is_branch(&self, node: &NormNode) -> bool {
         match self {
-            Shapes::Historical(_) => is_branchy(&node.kind),
-            Shapes::Ir => node.kind.as_ref() == kind::BRANCH,
+            Shapes::Historical(_) => is_branchy(node.kind),
+            Shapes::Ir => node.kind == kind::id::BRANCH,
         }
     }
 
     fn is_return(&self, node: &NormNode) -> bool {
         match self {
-            Shapes::Historical(_) => is_return_kind(&node.kind),
-            Shapes::Ir => node.kind.as_ref() == kind::RETURN,
+            Shapes::Historical(_) => is_return_kind(node.kind),
+            Shapes::Ir => node.kind == kind::id::RETURN,
         }
     }
 
@@ -414,6 +435,7 @@ fn extract_calls(
     flags: Flags,
     tail_node: Option<&NormNode>,
     out: &mut BTreeMap<Elem, u32>,
+    li: &LabelInterner,
 ) {
     let mut here = flags;
     if shapes.is_loop(node) {
@@ -425,32 +447,32 @@ fn extract_calls(
     if shapes.is_return(node) || tail_node.is_some_and(|t| std::ptr::eq(t, node)) {
         here.tail = true;
     }
-    if node.kind.as_ref() == shapes.call_kind()
+    if node.kind == shapes.call_kind()
         && let Some(f) = shapes.callee(node)
-        && let Some(name) = callee_name(f)
+        && let Some(name) = callee_name(f, li)
     {
         *out.entry((name, here.loop_depth, here.in_branch, here.tail))
             .or_insert(0) += 1;
     }
     for child in &node.children {
-        extract_calls(child, shapes, here, tail_node, out);
+        extract_calls(child, shapes, here, tail_node, out, li);
     }
 }
 
 /// Rightmost preserved External name inside a call's function expression:
 /// `f` → f, `x.method` → method, `mod::helper` → helper. Locals (closures)
 /// yield nothing; the loop-lowering synthetics are excluded.
-fn callee_name(function: &NormNode) -> Option<Box<str>> {
+fn callee_name(function: &NormNode, li: &LabelInterner) -> Option<Box<str>> {
     let mut found: Option<Box<str>> = None;
-    fn walk(node: &NormNode, found: &mut Option<Box<str>>) {
-        if let Some(Label::External(name)) = &node.label {
-            *found = Some(name.as_str().into());
+    fn walk(node: &NormNode, found: &mut Option<Box<str>>, li: &LabelInterner) {
+        if let Some(Label::External(sym)) = &node.label {
+            *found = Some(li.resolve(*sym).into());
         }
         for child in &node.children {
-            walk(child, found);
+            walk(child, found, li);
         }
     }
-    walk(function, &mut found);
+    walk(function, &mut found, li);
     match found {
         Some(name) if name.as_ref() == "__has_next" || name.as_ref() == "__next" => None,
         other => other,

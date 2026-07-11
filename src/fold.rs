@@ -8,23 +8,25 @@
 //! with the rolled loop (via the AU special case in `au.rs`).
 
 use crate::fingerprint::{HashMode, merkle_mode};
+use crate::intern::{Kind, LabelInterner};
 use crate::lang::LanguageProfile;
 use crate::tree::{Bucket, Label, NormNode};
 
 /// The two classifications folding needs — which node kinds hold a foldable sibling run,
 /// and which are dispatch arms (fold but don't report, D30). Supplied by a
 /// `LanguageProfile` for the historical path and by canonical-IR predicates for the IR
-/// path, so the fold algorithm itself is written once.
+/// path, so the fold algorithm itself is written once. `Kind`-typed (interning-id-
+/// conversion WP): both impls compare already-converted `NormNode`s.
 pub trait FoldRules {
-    fn is_list_kind(&self, kind: &str) -> bool;
-    fn is_dispatch_arm(&self, kind: &str) -> bool;
+    fn is_list_kind(&self, kind: Kind) -> bool;
+    fn is_dispatch_arm(&self, kind: Kind) -> bool;
 }
 
 impl FoldRules for &dyn LanguageProfile {
-    fn is_list_kind(&self, kind: &str) -> bool {
+    fn is_list_kind(&self, kind: Kind) -> bool {
         LanguageProfile::is_list_kind(*self, kind)
     }
-    fn is_dispatch_arm(&self, kind: &str) -> bool {
+    fn is_dispatch_arm(&self, kind: Kind) -> bool {
         LanguageProfile::is_dispatch_arm(*self, kind)
     }
 }
@@ -46,8 +48,9 @@ pub fn fold_repeats(
     profile: &dyn LanguageProfile,
     min_repeats: usize,
     findings: &mut Vec<RepeatFinding>,
+    li: &LabelInterner,
 ) -> NormNode {
-    fold_repeats_with(node, &profile, min_repeats, findings)
+    fold_repeats_with(node, &profile, min_repeats, findings, li)
 }
 
 /// Fold sibling-run repeats using an explicit [`FoldRules`] — the historical path passes a
@@ -57,21 +60,22 @@ pub fn fold_repeats_with(
     rules: &dyn FoldRules,
     min_repeats: usize,
     findings: &mut Vec<RepeatFinding>,
+    li: &LabelInterner,
 ) -> NormNode {
     let mut node = node;
     node.children = node
         .children
         .into_iter()
-        .map(|c| fold_repeats_with(c, rules, min_repeats, findings))
+        .map(|c| fold_repeats_with(c, rules, min_repeats, findings, li))
         .collect();
-    if !rules.is_list_kind(&node.kind) || node.children.len() < min_repeats {
+    if !rules.is_list_kind(node.kind) || node.children.len() < min_repeats {
         return node;
     }
 
     let hashes: Vec<u128> = node
         .children
         .iter()
-        .map(|c| merkle_mode(c, HashMode::MaskedAll))
+        .map(|c| merkle_mode(c, HashMode::MaskedAll, li))
         .collect();
     let n = node.children.len();
     let mut out: Vec<NormNode> = Vec::with_capacity(n);
@@ -103,7 +107,7 @@ pub fn fold_repeats_with(
                 // Dispatch tables (all template nodes are match/case arms)
                 // fold but are not FINDINGS — an enum→value table is
                 // idiomatic, not actionable duplication (D30).
-                if !template.iter().all(|t| rules.is_dispatch_arm(&t.kind)) {
+                if !template.iter().all(|t| rules.is_dispatch_arm(t.kind)) {
                     findings.push(RepeatFinding {
                         byte_span: (start, end),
                         count: reps as u32,

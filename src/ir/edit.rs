@@ -141,7 +141,7 @@ fn apply_multi_assign(
             log.record(
                 TransformKind::MultiAssign,
                 locus,
-                Witness::Note(to_sexpr(&original).into()),
+                Witness::Note(to_sexpr(&original, log.label_interner()).into()),
             );
         }
     }
@@ -175,7 +175,7 @@ fn apply_guard_canonicalize(
             log.record(
                 TransformKind::DeadElse,
                 locus,
-                Witness::Note(to_sexpr(&hoisted).into()),
+                Witness::Note(to_sexpr(&hoisted, log.label_interner()).into()),
             );
         }
     }
@@ -238,7 +238,7 @@ fn apply_comm_sort(
     if pass::is_commutative_chain(&node) {
         let op = node.children[1].clone();
         let mut operands = Vec::new();
-        pass::flatten_chain(&node, op.kind.as_ref(), &mut operands);
+        pass::flatten_chain(&node, op.kind, &mut operands);
         let operands: Vec<NormNode> = operands
             .into_iter()
             .map(|o| apply_comm_sort(o, edits, log))
@@ -251,7 +251,7 @@ fn apply_comm_sort(
             // would steal a later chain's edit — the detector and applier must agree on
             // which chains produce an edit). `to_sexpr` (the sort key) excludes spans,
             // so this recomputation matches the detector's on the identical operands.
-            let recomputed = pass::sort_perm(&operands);
+            let recomputed = pass::sort_perm(&operands, log.label_interner());
             if pass::order_is_identity(&recomputed) {
                 // No reorder, no edit: rebuild in place, preserving the original span.
                 return pass::rebuild_chain(operands, op, node.field, span);
@@ -295,19 +295,19 @@ fn apply_iter_protocol(
         .collect();
     // Re-identify the site the detector matched (an index `Loop`), consuming one edit
     // in the same post-order so loci stay valid without index-addressing (§6).
-    let matched = (node.kind.as_ref() == crate::ir::kind::LOOP)
+    let matched = (node.kind == crate::ir::kind::id::LOOP)
         .then(|| {
             node.children
                 .iter()
-                .find(|c| c.field.as_deref() == Some("body"))
-                .and_then(pass::index_loop_match)
+                .find(|c| c.field == Some(crate::ir::field::id::BODY))
+                .and_then(|body| pass::index_loop_match(body, log.label_interner()))
         })
         .flatten();
     if matched.is_some() {
         let Some(Edit::IterProtocol { locus, coll, ivar }) = edits.next() else {
             unreachable!("apply routed a non-IterProtocol edit into apply_iter_protocol");
         };
-        pass::rewrite_index_loop(&mut node, ivar, coll, *locus);
+        pass::rewrite_index_loop(&mut node, ivar, coll, *locus, log.label_interner());
         if log.enabled() {
             log.record(
                 TransformKind::IterProtocol,
@@ -362,7 +362,7 @@ fn apply_loop_exit(
         .into_iter()
         .map(|c| apply_loop_exit(c, edits, log))
         .collect();
-    if node.kind.as_ref() == crate::ir::kind::BLOCK {
+    if node.kind == crate::ir::kind::id::BLOCK {
         let locus = node.span;
         // `fold_loop_exit` performs the fold in place and reports the fold COUNT (it folds to a
         // fixpoint, so a nested loop-exit yields more than one). Each fold is exactly one
@@ -390,16 +390,16 @@ fn apply_drop_dead(
         .into_iter()
         .map(|c| apply_drop_dead(c, edits, log))
         .collect();
-    if node.kind.as_ref() == crate::ir::kind::LOOP
+    if node.kind == crate::ir::kind::id::LOOP
         && let Some(body) = node
             .children
             .iter_mut()
-            .find(|c| c.field.as_deref() == Some("body"))
+            .find(|c| c.field == Some(crate::ir::field::id::BODY))
     {
         while body
             .children
             .last()
-            .is_some_and(|c| c.kind.as_ref() == crate::ir::kind::CONTINUE)
+            .is_some_and(|c| c.kind == crate::ir::kind::id::CONTINUE)
         {
             let removed = body.children.pop().expect("checked last() is Some");
             let Some(Edit::DropDead { locus }) = edits.next() else {
@@ -410,7 +410,7 @@ fn apply_drop_dead(
                 log.record(
                     TransformKind::DeadStrip,
                     *locus,
-                    Witness::Note(to_sexpr(&removed).into()),
+                    Witness::Note(to_sexpr(&removed, log.label_interner()).into()),
                 );
             }
         }

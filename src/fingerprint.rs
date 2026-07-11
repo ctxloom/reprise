@@ -6,6 +6,7 @@
 //!   single inserted declaration can't cascade through every later v-index.
 //! - `MaskedAll`: locals AND all literals masked — sibling-run folding (§5.3).
 
+use crate::intern::LabelInterner;
 use crate::tree::{Label, NormNode};
 use xxhash_rust::xxh3::xxh3_128;
 
@@ -28,12 +29,20 @@ pub enum HashMode {
     MaskedAll,
 }
 
-fn push_label(buf: &mut Vec<u8>, label: &Option<Label>, mode: HashMode) {
+/// Push `label`'s hash contribution. `li` resolves `Label::External`/`LitKept`'s
+/// `LSym` id back to its text (fingerprints stay byte-identical to pre-interning:
+/// the RESOLVED string bytes are what get hashed, never the id — see the
+/// interning-id-conversion WP's mechanism rule 4). This is the one place on the
+/// fingerprinting path that touches the label interner; it is NOT a per-node
+/// matching COMPARISON (those compare `Label`/`LSym` by id, upstream of here) —
+/// hashing inherently needs the resolved bytes regardless of `Label`'s in-memory
+/// representation, exactly as it did before this WP.
+fn push_label(buf: &mut Vec<u8>, label: &Option<Label>, mode: HashMode, li: &LabelInterner) {
     match label {
         None => buf.push(b'_'),
-        Some(Label::External(name)) => {
+        Some(Label::External(sym)) => {
             buf.push(b'E');
-            buf.extend_from_slice(name.as_bytes());
+            buf.extend_from_slice(li.resolve(*sym).as_bytes());
         }
         Some(Label::Local(index)) => {
             buf.push(b'L');
@@ -41,11 +50,11 @@ fn push_label(buf: &mut Vec<u8>, label: &Option<Label>, mode: HashMode) {
                 buf.extend_from_slice(&index.to_le_bytes());
             }
         }
-        Some(Label::LitKept(text)) => match mode {
+        Some(Label::LitKept(sym)) => match mode {
             HashMode::MaskedAll => buf.push(b'M'),
             _ => {
                 buf.push(b'K');
-                buf.extend_from_slice(text.as_bytes());
+                buf.extend_from_slice(li.resolve(*sym).as_bytes());
             }
         },
         Some(Label::LitBucket(bucket)) => match mode {
@@ -63,15 +72,20 @@ fn push_label(buf: &mut Vec<u8>, label: &Option<Label>, mode: HashMode) {
     }
 }
 
-fn hash_from_parts(node: &NormNode, mode: HashMode, child_hashes: &[u128]) -> u128 {
+fn hash_from_parts(
+    node: &NormNode,
+    mode: HashMode,
+    child_hashes: &[u128],
+    li: &LabelInterner,
+) -> u128 {
     let mut buf = Vec::with_capacity(64 + 16 * child_hashes.len());
-    buf.extend_from_slice(node.kind.as_bytes());
+    buf.extend_from_slice(node.kind.as_str().as_bytes());
     buf.push(0);
     if let Some(field) = &node.field {
-        buf.extend_from_slice(field.as_bytes());
+        buf.extend_from_slice(field.as_str().as_bytes());
     }
     buf.push(0);
-    push_label(&mut buf, &node.label, mode);
+    push_label(&mut buf, &node.label, mode, li);
     buf.push(0);
     for h in child_hashes {
         buf.extend_from_slice(&h.to_le_bytes());
@@ -79,14 +93,18 @@ fn hash_from_parts(node: &NormNode, mode: HashMode, child_hashes: &[u128]) -> u1
     xxh3_128(&buf)
 }
 
-pub fn merkle_mode(node: &NormNode, mode: HashMode) -> u128 {
-    let child_hashes: Vec<u128> = node.children.iter().map(|c| merkle_mode(c, mode)).collect();
-    hash_from_parts(node, mode, &child_hashes)
+pub fn merkle_mode(node: &NormNode, mode: HashMode, li: &LabelInterner) -> u128 {
+    let child_hashes: Vec<u128> = node
+        .children
+        .iter()
+        .map(|c| merkle_mode(c, mode, li))
+        .collect();
+    hash_from_parts(node, mode, &child_hashes, li)
 }
 
 /// Whole-unit exact structural hash (tier `exact-normalized`).
-pub fn merkle(node: &NormNode) -> u128 {
-    merkle_mode(node, HashMode::Exact)
+pub fn merkle(node: &NormNode, li: &LabelInterner) -> u128 {
+    merkle_mode(node, HashMode::Exact, li)
 }
 
 /// One subtree of the bag inventory: hash + pre-order token offset + size.
@@ -99,10 +117,15 @@ pub struct Subtree {
 }
 
 /// All subtrees ≥ `min_tokens`, in the given mode (spec §5.5.2).
-pub fn subtree_inventory(node: &NormNode, min_tokens: u32, mode: HashMode) -> Vec<Subtree> {
+pub fn subtree_inventory(
+    node: &NormNode,
+    min_tokens: u32,
+    mode: HashMode,
+    li: &LabelInterner,
+) -> Vec<Subtree> {
     let mut out = Vec::new();
     let mut offset = 0u32;
-    walk_inventory(node, min_tokens, mode, &mut offset, &mut out);
+    walk_inventory(node, min_tokens, mode, &mut offset, &mut out, li);
     out
 }
 
@@ -112,17 +135,18 @@ fn walk_inventory(
     mode: HashMode,
     offset: &mut u32,
     out: &mut Vec<Subtree>,
+    li: &LabelInterner,
 ) -> (u128, u32) {
     let my_offset = *offset;
     *offset += 1;
     let mut child_hashes = Vec::with_capacity(node.children.len());
     let mut tokens = 1u32;
     for child in &node.children {
-        let (h, t) = walk_inventory(child, min_tokens, mode, offset, out);
+        let (h, t) = walk_inventory(child, min_tokens, mode, offset, out, li);
         child_hashes.push(h);
         tokens += t;
     }
-    let hash = hash_from_parts(node, mode, &child_hashes);
+    let hash = hash_from_parts(node, mode, &child_hashes, li);
     if tokens >= min_tokens {
         out.push(Subtree {
             hash,

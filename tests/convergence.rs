@@ -315,17 +315,17 @@ fn python_counter_used_after_block_does_not_rewrite_ir() {
     // and the index binding the later `print(i)` reads. The whole-unit scan must see that
     // post-loop use and keep the loop distinct (NO CounterIter edit).
     let live = "def f(xs, cond):\n    if cond:\n        i = 0\n        while i < len(xs):\n            g(xs[i])\n            i += 1\n    print(i)\n";
-    let (ir, _) = reprise::frontend::lower_python_source(live).unwrap();
+    let (ir, log) = reprise::frontend::lower_python_source(live).unwrap();
     assert!(
-        reprise::ir::detect_counter_iter(&ir).is_empty(),
+        reprise::ir::detect_counter_iter(&ir, log.label_interner()).is_empty(),
         "a counter used after its enclosing block must NOT be rewritten to foreach",
     );
     // Control: the SAME loop with the index DEAD after the block still rewrites (one edit) —
     // the whole-unit scan must not stop legitimate rewrites (guards against an over-eager fix).
     let dead = "def f(xs, cond):\n    if cond:\n        i = 0\n        while i < len(xs):\n            g(xs[i])\n            i += 1\n    print(0)\n";
-    let (ir2, _) = reprise::frontend::lower_python_source(dead).unwrap();
+    let (ir2, log2) = reprise::frontend::lower_python_source(dead).unwrap();
     assert_eq!(
-        reprise::ir::detect_counter_iter(&ir2).len(),
+        reprise::ir::detect_counter_iter(&ir2, log2.label_interner()).len(),
         1,
         "a counter dead after its block should still rewrite to foreach",
     );
@@ -577,11 +577,11 @@ fn non_tail_recursion_is_not_lowered_ir() {
     // would bind the inner loop, and the post-order `process(n)` after it would be dropped).
     // Lowering it wrongly wraps the body in a recursion `Loop`; a post-order tree-walk must keep
     // its recursive self-call. `lower_python_source` already runs tail-recursion lowering.
-    let (ir, _) = reprise::frontend::lower_python_source(
+    let (ir, log) = reprise::frontend::lower_python_source(
         "def walk(n):\n    for c in n.children:\n        walk(c)\n    process(n)\n",
     )
     .unwrap();
-    let s = reprise::ir::to_sexpr(&ir);
+    let s = reprise::ir::to_sexpr(&ir, log.label_interner());
     // Exactly ONE Loop (the lowered `for`) — NOT wrapped in an extra recursion loop.
     assert_eq!(
         s.matches("(Loop").count(),
@@ -628,11 +628,14 @@ fn python_guard_merge_uses_and_token_not_ampersand() {
     // askew-taps: a merged Python `if a and c: if b:` nest must synthesize the Python `and`
     // token, never `&&` (which no Python source produces). The nest carries `a and c`, so the
     // token family is derivable locally from the subtree.
-    let (ir, _) = reprise::frontend::lower_python_source(
+    let (ir, log) = reprise::frontend::lower_python_source(
         "def f(a, b, c):\n    if a and c:\n        if b:\n            g()\n",
     )
     .unwrap();
-    let s = reprise::ir::to_sexpr(&reprise::ir::guard_canonicalize(ir, Lang::Python));
+    let s = reprise::ir::to_sexpr(
+        &reprise::ir::guard_canonicalize(ir, Lang::Python),
+        log.label_interner(),
+    );
     assert_eq!(
         s.matches("(Branch").count(),
         1,

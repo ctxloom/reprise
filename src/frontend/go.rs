@@ -348,8 +348,7 @@ fn lower_range_into(
 
 /// The blank identifier `_` (a `Var` labelled `_`) — a range target that binds nothing.
 fn is_blank_target(node: &NormNode) -> bool {
-    node.kind.as_ref() == kind::VAR
-        && matches!(&node.label, Some(Label::Raw(t)) if t.as_ref() == "_")
+    node.kind == kind::id::VAR && matches!(&node.label, Some(Label::Raw(t)) if t.as_ref() == "_")
 }
 
 /// Go `switch`/`type switch` → `Branch{ x@subject, Arm[case, body]… }` (§14). An
@@ -725,7 +724,7 @@ mod tests {
         // is no `TransformKind` for it (adding one would be new vocabulary — out of scope).
         let (ir, log) = go("func f() (int, int) {\n\treturn a, b\n}\n");
         assert_eq!(
-            to_sexpr(&ir),
+            to_sexpr(&ir, log.label_interner()),
             "(Unit (Block@body (Return (Var@value a) (Var@value b))))"
         );
         assert!(
@@ -739,7 +738,7 @@ mod tests {
     fn go_lowers_the_core_subset() {
         let (ir, _log) = go("func add(a int) int {\n\treturn a + 5\n}\n");
         assert_eq!(
-            to_sexpr(&ir),
+            to_sexpr(&ir, _log.label_interner()),
             "(Unit (Var@param a) (Block@body (Return (Binop@value (Var@left a) (+@op) (Lit@right INT)))))"
         );
     }
@@ -747,8 +746,9 @@ mod tests {
     #[test]
     fn go_short_var_decl_is_a_binding_assign() {
         // `:=` declares — target becomes a positional local under abstraction.
-        let (ir, _) = go("func f() {\n\tx := 5\n\tg(x)\n}\n");
-        let s = to_sexpr(&crate::ir::abstract_idents(ir));
+        let (ir, log) = go("func f() {\n\tx := 5\n\tg(x)\n}\n");
+        let li = log.label_interner().clone();
+        let s = to_sexpr(&crate::ir::abstract_idents(ir, &li), &li);
         assert!(
             s.contains("(Assign (Var@target v0) (Lit@value INT))"),
             "{s}"
@@ -760,19 +760,34 @@ mod tests {
     fn keep_list_literals_stay_exact_while_others_bucket() {
         // `0`/`1`/`-1`/`""` are structural (spec §5.2.5) — kept verbatim, so a clone
         // that uses `1` does NOT converge with one that uses `9`.
-        let (one, _) = go("func f() {\n\tg(1)\n}\n");
-        let (nine, _) = go("func f() {\n\tg(9)\n}\n");
-        let (one2, _) = go("func h() {\n\tg(1)\n}\n");
-        let sx = |ir| to_sexpr(&crate::ir::abstract_idents(ir));
-        assert!(sx(one.clone()).contains("(Lit@arg 1)"), "1 not kept");
-        assert!(sx(nine).contains("(Lit@arg INT)"), "9 not bucketed");
-        assert_eq!(sx(one), sx(one2), "two `1` calls must converge");
+        let (one, one_log) = go("func f() {\n\tg(1)\n}\n");
+        let (nine, nine_log) = go("func f() {\n\tg(9)\n}\n");
+        let (one2, one2_log) = go("func h() {\n\tg(1)\n}\n");
+        let sx = |ir, log: &TransformLog| {
+            to_sexpr(
+                &crate::ir::abstract_idents(ir, log.label_interner()),
+                log.label_interner(),
+            )
+        };
+        assert!(
+            sx(one.clone(), &one_log).contains("(Lit@arg 1)"),
+            "1 not kept"
+        );
+        assert!(
+            sx(nine, &nine_log).contains("(Lit@arg INT)"),
+            "9 not bucketed"
+        );
+        assert_eq!(
+            sx(one, &one_log),
+            sx(one2, &one2_log),
+            "two `1` calls must converge"
+        );
     }
 
     #[test]
     fn go_condition_for_and_while_form_records_looplower() {
         let (ir, log) = go("func w() {\n\tfor c() {\n\t\ts()\n\t}\n}\n");
-        let s = to_sexpr(&ir);
+        let s = to_sexpr(&ir, log.label_interner());
         assert!(s.contains("(Loop"), "{s}");
         assert!(s.contains("(Break)"), "no break-guard: {s}");
         assert!(
@@ -785,7 +800,7 @@ mod tests {
     #[test]
     fn go_infinite_for_is_the_bare_loop_core() {
         let (ir, log) = go("func l() {\n\tfor {\n\t\tbreak\n\t}\n}\n");
-        let s = to_sexpr(&ir);
+        let s = to_sexpr(&ir, log.label_interner());
         assert_eq!(s, "(Unit (Block@body (Loop (Block@body (Break)))))");
         // Already canonical — no LoopLower recorded.
         assert!(
@@ -800,8 +815,8 @@ mod tests {
         // `for i := 0; i < n; i++ { s() }` → `i = 0`; `Loop{ break-guard; s(); i = i + 1 }`.
         // Family B (D-IR-14): the `i++` update desugars to the `AugAssign` shape `i = i + 1`,
         // NOT a bare `Unop`, so the loop-counter idiom converges with `i += 1` / `i = i + 1`.
-        let (ir, _) = go("func f(n int) {\n\tfor i := 0; i < n; i++ {\n\t\ts()\n\t}\n}\n");
-        let s = to_sexpr(&ir);
+        let (ir, log) = go("func f(n int) {\n\tfor i := 0; i < n; i++ {\n\t\ts()\n\t}\n}\n");
+        let s = to_sexpr(&ir, log.label_interner());
         // init hoisted as a sibling before the Loop
         assert!(s.contains("(Assign (Var@target"), "no hoisted init: {s}");
         assert!(s.contains("(Loop"), "{s}");
@@ -817,11 +832,16 @@ mod tests {
     fn go_single_range_converges_with_rust_and_python_for() {
         // The shared iterated-loop synthesis makes a single-variable Go `range`
         // structurally identical to a Rust/Python `for`.
-        let abs = |ir| to_sexpr(&crate::ir::abstract_idents(ir));
-        let (g, _) = go("func f() {\n\tfor v := range xs {\n\t\tg(v)\n\t}\n}\n");
-        let (r, _) = lower_rust_source("fn f() { for v in xs { g(v); } }").unwrap();
-        let (p, _) = lower_python_source("def f():\n    for v in xs:\n        g(v)\n").unwrap();
-        let (gs, rs, ps) = (abs(g), abs(r), abs(p));
+        let abs = |ir, log: &TransformLog| {
+            to_sexpr(
+                &crate::ir::abstract_idents(ir, log.label_interner()),
+                log.label_interner(),
+            )
+        };
+        let (g, glog) = go("func f() {\n\tfor v := range xs {\n\t\tg(v)\n\t}\n}\n");
+        let (r, rlog) = lower_rust_source("fn f() { for v in xs { g(v); } }").unwrap();
+        let (p, plog) = lower_python_source("def f():\n    for v in xs:\n        g(v)\n").unwrap();
+        let (gs, rs, ps) = (abs(g, &glog), abs(r, &rlog), abs(p, &plog));
         assert_eq!(gs, rs, "go vs rust");
         assert_eq!(gs, ps, "go vs python");
         assert!(gs.contains("__has_next") && gs.contains("__next"), "{gs}");
@@ -833,12 +853,15 @@ mod tests {
         // `Assign{ i@place, Binop{ i, +, 1 } }` — the loop-counter idiom converges across
         // all three spellings (sexpr AND fingerprint equality).
         let sx = |src: &str| {
-            let (ir, _) = go(src);
-            to_sexpr(&ir)
+            let (ir, log) = go(src);
+            to_sexpr(&ir, log.label_interner())
         };
         let fp = |src: &str| {
-            let (ir, _) = go(src);
-            crate::fingerprint::merkle(&crate::ir::abstract_idents(ir))
+            let (ir, log) = go(src);
+            crate::fingerprint::merkle(
+                &crate::ir::abstract_idents(ir, log.label_interner()),
+                log.label_interner(),
+            )
         };
         let inc = "func f() {\n\ti++\n}\n";
         let compound = "func f() {\n\ti += 1\n}\n";
@@ -883,12 +906,21 @@ mod tests {
         // Family B's cross-language headline: a Go C-style counter loop lowers byte-identically
         // to the Rust `while`-counter equivalent — the `i++` update now matches Rust's `i += 1`
         // (both a `@place` mutation), so the whole loop converges.
-        let abs = |ir| to_sexpr(&crate::ir::abstract_idents(ir));
-        let (g, _) = go("func f(n int) {\n\tfor i := 0; i < n; i++ {\n\t\ts()\n\t}\n}\n");
-        let (r, _) =
+        let abs = |ir, log: &TransformLog| {
+            to_sexpr(
+                &crate::ir::abstract_idents(ir, log.label_interner()),
+                log.label_interner(),
+            )
+        };
+        let (g, glog) = go("func f(n int) {\n\tfor i := 0; i < n; i++ {\n\t\ts()\n\t}\n}\n");
+        let (r, rlog) =
             lower_rust_source("fn f(n: i32) { let mut i = 0; while i < n { s(); i += 1; } }")
                 .unwrap();
-        assert_eq!(abs(g), abs(r), "go counter-for vs rust while-counter");
+        assert_eq!(
+            abs(g, &glog),
+            abs(r, &rlog),
+            "go counter-for vs rust while-counter"
+        );
     }
 
     #[test]
@@ -897,9 +929,12 @@ mod tests {
         // `i = i + 1`), so its target is a mutation (`@place`) — the SAME model Go/Rust use
         // for a re-assignment. Go's `i += 1` and Python's `i += 1` now agree completely:
         // same desugared arithmetic AND the same `@place` target field.
-        let (g, _) = go("func f() {\n\ti += 1\n}\n");
-        let (p, _) = lower_python_source("def f():\n    i += 1\n").unwrap();
-        let (gs, ps) = (to_sexpr(&g), to_sexpr(&p));
+        let (g, glog) = go("func f() {\n\ti += 1\n}\n");
+        let (p, plog) = lower_python_source("def f():\n    i += 1\n").unwrap();
+        let (gs, ps) = (
+            to_sexpr(&g, glog.label_interner()),
+            to_sexpr(&p, plog.label_interner()),
+        );
         // Both desugar to `Assign{ i@place, Binop{ i, +, 1 } }` — byte-identical.
         let want = "(Assign (Var@place i) (Binop@value (Var@left i) (+@op) (Lit@right 1)))";
         assert!(gs.contains(want), "go aug-assign: {gs}");
@@ -908,10 +943,10 @@ mod tests {
 
     #[test]
     fn go_if_else_if_else_is_one_flat_branch_chain() {
-        let (ir, _) = go(
+        let (ir, log) = go(
             "func f(a int) int {\n\tif a > 0 {\n\t\treturn a\n\t} else if a < 0 {\n\t\treturn a\n\t} else {\n\t\treturn a\n\t}\n}\n",
         );
-        let s = to_sexpr(&ir);
+        let s = to_sexpr(&ir, log.label_interner());
         // §14: one flat ordered Branch (else-if spliced in, not nested), 3 arms.
         assert_eq!(s.matches("Branch").count(), 1, "{s}");
         assert_eq!(s.matches("Arm").count(), 3, "{s}");
@@ -921,14 +956,17 @@ mod tests {
     fn go_switch_converges_with_the_equivalent_if_chain() {
         // §14: `switch a { case 0: …; case 1: …; default: … }` ≡ the if-chain of `a == n`.
         let canon = |src: &str| {
-            let (ir, _) = go(src);
-            let tree = crate::ir::abstract_idents(ir);
-            let edits = crate::ir::detect_comm_sort(&tree);
-            to_sexpr(&crate::ir::apply(
-                tree,
-                &edits,
-                &mut crate::ir::TransformLog::disabled(),
-            ))
+            let (ir, log) = go(src);
+            let tree = crate::ir::abstract_idents(ir, log.label_interner());
+            let edits = crate::ir::detect_comm_sort(&tree, log.label_interner());
+            to_sexpr(
+                &crate::ir::apply(
+                    tree,
+                    &edits,
+                    &mut crate::ir::TransformLog::disabled_with(log.label_interner().clone()),
+                ),
+                log.label_interner(),
+            )
         };
         assert_eq!(
             canon(
@@ -948,8 +986,11 @@ mod tests {
         // case a dead arm. The default is ordered LAST, so a `default`-first switch converges
         // (byte-identical) with the semantically-identical `default`-last form.
         let sx = |src: &str| {
-            let (ir, _) = go(src);
-            to_sexpr(&crate::ir::abstract_idents(ir))
+            let (ir, log) = go(src);
+            to_sexpr(
+                &crate::ir::abstract_idents(ir, log.label_interner()),
+                log.label_interner(),
+            )
         };
         let first = "func f(a int) int {\n\tswitch a {\n\tdefault:\n\t\treturn k()\n\tcase 0:\n\t\treturn g()\n\tcase 1:\n\t\treturn h()\n\t}\n}\n";
         let last = "func f(a int) int {\n\tswitch a {\n\tcase 0:\n\t\treturn g()\n\tcase 1:\n\t\treturn h()\n\tdefault:\n\t\treturn k()\n\t}\n}\n";
@@ -978,10 +1019,13 @@ mod tests {
         // (grammar `type_switch_statement.value: _expression`), so each `case T:` folds to
         // `matches(subj, T)` — a region-test, NOT a bare lowered type node. A type switch must
         // therefore stay DISTINCT from a value switch (which folds to `subj == v` equalities).
-        let (ir, _) = go(
+        let (ir, log) = go(
             "func f(x interface{}) int {\n\tswitch x.(type) {\n\tcase int:\n\t\treturn g()\n\tcase string:\n\t\treturn h()\n\t}\n\treturn 0\n}\n",
         );
-        let s = to_sexpr(&crate::ir::abstract_idents(ir));
+        let s = to_sexpr(
+            &crate::ir::abstract_idents(ir, log.label_interner()),
+            log.label_interner(),
+        );
         assert_eq!(
             s.matches("(Var@callee matches)").count(),
             2,
@@ -995,8 +1039,11 @@ mod tests {
 
     #[test]
     fn go_selector_is_field_with_external_name() {
-        let (ir, _) = go("func f() {\n\treturn obj.Field\n}\n");
-        let s = to_sexpr(&crate::ir::abstract_idents(ir));
+        let (ir, log) = go("func f() {\n\treturn obj.Field\n}\n");
+        let s = to_sexpr(
+            &crate::ir::abstract_idents(ir, log.label_interner()),
+            log.label_interner(),
+        );
         assert!(s.contains("(Field"), "{s}");
         assert!(
             s.contains("(Var@name Field)"),
@@ -1009,7 +1056,7 @@ mod tests {
         let (ir, log) = go(
             "func gcd(a int, b int) int {\n\tif b == 0 {\n\t\treturn a\n\t}\n\treturn gcd(b, a)\n}\n",
         );
-        let s = to_sexpr(&ir);
+        let s = to_sexpr(&ir, log.label_interner());
         assert!(s.contains("(Loop"), "no loop: {s}");
         assert!(s.contains("(Continue)"), "no continue: {s}");
         assert!(

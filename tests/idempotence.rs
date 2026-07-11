@@ -149,22 +149,23 @@ fn ir_loop_exit_folds_to_fixpoint_and_is_idempotent() {
     // own output changes NOTHING, and the nested break-form converges with the early-return form.
     use reprise::frontend::lower_rust_source;
     use reprise::ir::{normalize_loop_exit, to_sexpr};
-    let (ir, _) = lower_rust_source(
+    let (ir, log) = lower_rust_source(
         "fn f() -> i32 { loop { loop { h(); if c() { break; } } break; } return 5; }",
     )
     .unwrap();
+    let li = log.label_interner();
     let once = normalize_loop_exit(ir);
     let twice = normalize_loop_exit(once.clone());
     assert_eq!(
-        to_sexpr(&once),
-        to_sexpr(&twice),
+        to_sexpr(&once, li),
+        to_sexpr(&twice, li),
         "the loop-exit fold must reach a fixpoint in one pass (idempotent tree shape)"
     );
-    let (hand, _) =
+    let (hand, hand_log) =
         lower_rust_source("fn f() -> i32 { loop { loop { h(); if c() { return 5; } } } }").unwrap();
     assert_eq!(
-        to_sexpr(&once),
-        to_sexpr(&normalize_loop_exit(hand)),
+        to_sexpr(&once, li),
+        to_sexpr(&normalize_loop_exit(hand), hand_log.label_interner()),
         "the nested break-then-return must converge with the hand-written early-return form"
     );
 }

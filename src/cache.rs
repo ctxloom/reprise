@@ -145,7 +145,16 @@ pub fn load(
 }
 
 /// Best-effort write; failures (read-only root, races) are silently ignored.
-pub fn store(root: &Path, key: u128, value: &FileUnits) {
+/// `label_interner` is the CURRENT scan's per-scan interner (interning-id-
+/// conversion WP) — `value`'s `Label::External`/`LitKept` ids resolve through it
+/// into the wire's plain strings ([`FileUnits::to_wire`]); the D19 bytes this
+/// produces are unchanged from pre-interning (ids never touch disk).
+pub fn store(
+    root: &Path,
+    key: u128,
+    value: &FileUnits,
+    label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+) {
     let dir = root.join(".reprise").join("cache");
     if std::fs::create_dir_all(&dir).is_err() {
         return;
@@ -156,7 +165,8 @@ pub fn store(root: &Path, key: u128, value: &FileUnits) {
     if !ignore.exists() {
         let _ = std::fs::write(&ignore, "*\n");
     }
-    let Ok(bytes) = bincode::serialize(value) else {
+    let wire = value.to_wire(label_interner);
+    let Ok(bytes) = bincode::serialize(&wire) else {
         return;
     };
     // Write-then-rename so a concurrent reader never sees a torn entry.
@@ -196,7 +206,7 @@ mod tests {
         );
         assert!(!original.units.is_empty(), "fixture produced no units");
         let k = key("f.go", src, &cfg);
-        store(root, k, &original);
+        store(root, k, &original, &write_interner);
 
         let read_interner = crate::intern::LabelInterner::new();
         let reloaded = load(root, k, path, &read_interner).expect("cache hit");

@@ -111,31 +111,14 @@ impl std::ops::Deref for TreeRef<'_> {
     }
 }
 
-/// Serialize shim keeping `Unit`'s D19 cache bytes EXACTLY as they were when
-/// `tree` was a bare `NormNode` (P4: no `EXTRACTION_VERSION` bump — verified
-/// against a real pre-change cache blob by tests/cache_compat.rs). `Unit`
-/// reaches the wire only via the D19 cache, which stores strictly pre-spill
-/// units, so `Resident` is the only serializable state; the deserialize
-/// direction lives on [`UnitWire`] (interning WP), whose `into_real` always
-/// reconstructs `Resident`.
-mod tree_slot_wire {
-    use super::TreeSlot;
-    use serde::{Serialize, Serializer};
-
-    pub fn serialize<S: Serializer>(slot: &TreeSlot, s: S) -> Result<S::Ok, S::Error> {
-        match slot {
-            TreeSlot::Resident(tree) => tree.serialize(s),
-            TreeSlot::Spilled(_) => Err(serde::ser::Error::custom(
-                "a spilled tree reached the cache wire — units are cached strictly pre-spill",
-            )),
-        }
-    }
-}
-
-/// `Deserialize` is NOT derived (see `tree::Label`'s doc comment: `NormNode`'s own
-/// `Deserialize` isn't derived either, since `Label::External`/`LitKept` need the
-/// current scan's `LabelInterner`) — deserialize through [`UnitWire`] instead.
-#[derive(Debug, Clone, serde::Serialize)]
+/// No `Serialize` derive (interning-id-conversion WP: `NormNode`'s `Label::
+/// External`/`LitKept` ids can't resolve to strings without the scan's
+/// `LabelInterner`, which a context-free derive can't reach) — go through
+/// [`Unit::to_wire`] for the write side, [`UnitWire::into_real`] for the read
+/// side. `Unit` reaches the wire only via the D19 cache, which stores strictly
+/// pre-spill units, so `Resident` is the only encodable state (`to_wire` panics
+/// on `Spilled`, matching the prior `tree_slot_wire` shim's behavior).
+#[derive(Debug, Clone)]
 pub struct Unit {
     pub file: PathBuf,
     pub lang: Lang,
@@ -151,14 +134,42 @@ pub struct Unit {
     pub fingerprint: u128,
     /// The canonical tree (resident, or spilled to the scan pack over the
     /// memory gate). On the D19 wire this is a bare `NormNode`, unchanged.
-    #[serde(serialize_with = "tree_slot_wire::serialize")]
     pub tree: TreeSlot,
     /// Some for inline-expanded variants; None for plain units.
     pub variant: Option<VariantTag>,
 }
 
-/// Deserialize-only mirror of [`Unit`] — see [`crate::tree::NormNodeWire`].
-#[derive(serde::Deserialize)]
+impl Unit {
+    /// See [`crate::tree::NormNode::to_wire`]. Panics if `tree` was spilled — a
+    /// spilled tree reaching the cache wire is a pipeline-ordering bug (units are
+    /// cached strictly pre-spill; see the type doc).
+    pub fn to_wire(&self, label_interner: &crate::intern::LabelInterner) -> UnitWire {
+        let tree = self
+            .tree
+            .resident()
+            .expect("a spilled tree reached the cache wire — units are cached strictly pre-spill")
+            .to_wire(label_interner);
+        UnitWire {
+            file: self.file.clone(),
+            lang: self.lang,
+            name: self.name.clone(),
+            byte_span: self.byte_span,
+            line_span: self.line_span,
+            token_count: self.token_count,
+            parse_degraded: self.parse_degraded,
+            is_test: self.is_test,
+            accept_drift: self.accept_drift,
+            fingerprint: self.fingerprint,
+            tree,
+            variant: self.variant.clone(),
+        }
+    }
+}
+
+/// Wire mirror of [`Unit`] — see [`crate::tree::NormNodeWire`]. `Serialize`
+/// (write, via [`Unit::to_wire`]) and `Deserialize` (read, via
+/// [`Self::into_real`]) both go through this one shape.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct UnitWire {
     pub file: PathBuf,
     pub lang: Lang,
@@ -211,10 +222,10 @@ pub struct InternalRepeat {
 /// inliner's definition table (spec §5.4: the table is built from raw trees
 /// so recursion lowering can fire on SCC-expanded variants).
 ///
-/// `Deserialize` is NOT derived — see [`Unit`]'s doc comment; deserialize through
-/// [`FileUnitsWire`], which `cache::load` does (re-interning `Label` text into the
-/// current scan's `LabelInterner`).
-#[derive(serde::Serialize)]
+/// No `Serialize` derive — see [`Unit`]'s doc comment; go through
+/// [`FileUnits::to_wire`] for the write side, [`FileUnitsWire::into_real`] for the
+/// read side (`cache::load`/`cache::store`), re-interning/resolving `Label` text
+/// against the current scan's `LabelInterner`.
 pub struct FileUnits {
     pub units: Vec<Unit>,
     pub repeats: Vec<InternalRepeat>,
@@ -225,8 +236,29 @@ pub struct FileUnits {
     pub suppressed: usize,
 }
 
-/// Deserialize-only mirror of [`FileUnits`] — see [`crate::tree::NormNodeWire`].
-#[derive(serde::Deserialize)]
+impl FileUnits {
+    /// See [`Unit::to_wire`].
+    pub fn to_wire(&self, label_interner: &crate::intern::LabelInterner) -> FileUnitsWire {
+        FileUnitsWire {
+            units: self
+                .units
+                .iter()
+                .map(|u| u.to_wire(label_interner))
+                .collect(),
+            repeats: self.repeats.clone(),
+            raw_trees: self
+                .raw_trees
+                .iter()
+                .map(|t| t.to_wire(label_interner))
+                .collect(),
+            suppressed: self.suppressed,
+        }
+    }
+}
+
+/// Wire mirror of [`FileUnits`] — see [`crate::tree::NormNodeWire`]. `Serialize`
+/// (write) and `Deserialize` (read) both go through this one shape.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct FileUnitsWire {
     pub units: Vec<UnitWire>,
     pub repeats: Vec<InternalRepeat>,
@@ -348,7 +380,7 @@ pub fn extract_file_units_keep_raw(
         let raw_tree =
             std::mem::replace(&mut raw.tree, NormNode::new("", None, (0, 0), Vec::new()));
         let (tree, found) = pass_and_fold(raw_tree.clone(), lang, cfg, label_interner);
-        let unit = unit_from_tree(path, lang, &raw, tree, accept_drift);
+        let unit = unit_from_tree(path, lang, &raw, tree, accept_drift, label_interner);
         for f in found {
             // Report a run only when the duplicated mass clears the sequence floor.
             if f.template_tokens * f.count >= cfg.thresholds.min_seq_tokens {
@@ -405,8 +437,9 @@ fn extract_ir_file_units(
             &crate::ir::FoldRules,
             cfg.thresholds.fold_min_repeats as usize,
             &mut found,
+            label_interner,
         );
-        let fingerprint = fingerprint::merkle(&tree);
+        let fingerprint = fingerprint::merkle(&tree, label_interner);
         let token_count = tree.token_count();
         for f in found {
             // Report a run only when the duplicated mass clears the sequence floor.
@@ -465,6 +498,29 @@ pub fn extract_file_units(
     (f.units, f.repeats)
 }
 
+/// Like [`extract_file_units`], but against a CALLER-SUPPLIED interner —
+/// required whenever the returned units' trees will be compared (fingerprint
+/// equality, [`crate::au::anti_unify`], sexpr equality, anything reading
+/// `Label::External`/`LitKept`) against units from a DIFFERENT
+/// `extract_file_units`-family call. Post interning-id-conversion, an `LSym` is
+/// a bare per-scan id (not a self-contained, content-comparable handle): two
+/// independently-scoped throwaway interners (as plain [`extract_file_units`]
+/// each mints) can assign colliding-but-unrelated ids to unrelated text, so
+/// comparing labels across them is a real bug, not just imprecision.
+/// `extract_file_units`/`units_from_source` themselves stay signature-stable
+/// (single-tree callers, e.g. `reprise-mcp`, are the common case and are
+/// unaffected either way).
+pub fn extract_file_units_with_interner(
+    path: &Path,
+    src: &str,
+    lang: Lang,
+    cfg: &Config,
+    label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+) -> (Vec<Unit>, Vec<InternalRepeat>) {
+    let f = extract_file_units_keep_raw(path, src, lang, cfg, label_interner);
+    (f.units, f.repeats)
+}
+
 fn pass_and_fold(
     tree: NormNode,
     lang: Lang,
@@ -478,6 +534,7 @@ fn pass_and_fold(
         lang.profile(),
         cfg.thresholds.fold_min_repeats as usize,
         &mut found,
+        label_interner,
     );
     (tree, found)
 }
@@ -510,6 +567,7 @@ fn ir_pass_and_fold(
         &crate::ir::FoldRules,
         cfg.thresholds.fold_min_repeats as usize,
         &mut found,
+        label_interner,
     );
     (tree, found)
 }
@@ -520,19 +578,21 @@ fn ir_pass_and_fold(
 /// on the lowered body before the passes. Needs the unit's own name + simple param
 /// names — both still present as `Raw` labels on the lowered tree.
 fn ir_relower_recursion(mut unit: NormNode, name: &str) -> NormNode {
+    let param_field = crate::intern::Field::intern("param");
     let mut params: Vec<Box<str>> = Vec::new();
     for c in &unit.children {
-        if c.field.as_deref() == Some("param") {
+        if c.field == Some(param_field) {
             match &c.label {
                 Some(Label::Raw(t)) => params.push(t.clone()),
                 _ => return unit, // a non-simple param: the frontend would not lower either
             }
         }
     }
+    let body_field = crate::intern::Field::intern("body");
     let Some(idx) = unit
         .children
         .iter()
-        .position(|c| c.field.as_deref() == Some("body"))
+        .position(|c| c.field == Some(body_field))
     else {
         return unit;
     };
@@ -553,6 +613,7 @@ fn unit_from_tree(
     raw: &RawUnit,
     tree: NormNode,
     accept_drift: bool,
+    label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
 ) -> Unit {
     Unit {
         file: path.to_path_buf(),
@@ -564,7 +625,7 @@ fn unit_from_tree(
         parse_degraded: raw.parse_degraded,
         is_test: raw.is_test,
         accept_drift,
-        fingerprint: fingerprint::merkle(&tree),
+        fingerprint: fingerprint::merkle(&tree, label_interner),
         tree: TreeSlot::Resident(tree),
         variant: None,
     }
@@ -590,7 +651,7 @@ pub fn finish_variant(
     } else {
         pass_and_fold(expanded, base.lang, cfg, label_interner)
     };
-    let fingerprint = fingerprint::merkle(&tree);
+    let fingerprint = fingerprint::merkle(&tree, label_interner);
     if fingerprint == base.fingerprint {
         return None;
     }
@@ -635,6 +696,17 @@ pub fn units_from_source(src: &str, lang: Lang, cfg: &Config) -> Vec<Unit> {
     extract_file_units(Path::new("memory.in"), src, lang, cfg).0
 }
 
+/// Like [`units_from_source`], but against a caller-supplied interner — see
+/// [`extract_file_units_with_interner`]'s doc comment for when this is required.
+pub fn units_from_source_with_interner(
+    src: &str,
+    lang: Lang,
+    cfg: &Config,
+    label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+) -> Vec<Unit> {
+    extract_file_units_with_interner(Path::new("memory.in"), src, lang, cfg, label_interner).0
+}
+
 pub fn byte_to_line(src: &str, byte: u32) -> u32 {
     let byte = (byte as usize).min(src.len());
     src.as_bytes()[..byte]
@@ -662,7 +734,7 @@ mod tests {
         assert_eq!(cfg.normalize.normalizer, Normalizer::Ir);
         let units = units_from_source("fn add(a: i32) -> i32 { return a + 1; }", Lang::Rust, &cfg);
         assert_eq!(units.len(), 1);
-        assert_eq!(units[0].tree.expect_resident().kind.as_ref(), "Unit");
+        assert_eq!(units[0].tree.expect_resident().kind.as_str(), "Unit");
     }
 
     #[test]
@@ -673,7 +745,7 @@ mod tests {
         cfg.normalize.normalizer = Normalizer::Historical;
         let units = units_from_source("fn add(a: i32) -> i32 { return a + 1; }", Lang::Rust, &cfg);
         assert_eq!(units.len(), 1);
-        assert_ne!(units[0].tree.expect_resident().kind.as_ref(), "Unit");
+        assert_ne!(units[0].tree.expect_resident().kind.as_str(), "Unit");
     }
 
     #[test]
@@ -681,7 +753,7 @@ mod tests {
         // C is IR-frontend-only (WP-K1a): `normalizer = "ir"` (the default) works normally...
         let units = units_from_source("int add(int a) { return a + 1; }", Lang::C, &ir_cfg());
         assert_eq!(units.len(), 1);
-        assert_eq!(units[0].tree.expect_resident().kind.as_ref(), "Unit");
+        assert_eq!(units[0].tree.expect_resident().kind.as_str(), "Unit");
     }
 
     #[test]
@@ -707,13 +779,13 @@ mod tests {
             &ir_cfg(),
         );
         assert_eq!(units.len(), 1);
-        assert_eq!(units[0].tree.expect_resident().kind.as_ref(), "Unit");
+        assert_eq!(units[0].tree.expect_resident().kind.as_str(), "Unit");
     }
 
     #[test]
     fn ir_path_folds_internal_repeats() {
         fn has_repeat(n: &NormNode) -> bool {
-            n.kind.as_ref() == "REPEAT" || n.children.iter().any(has_repeat)
+            n.kind.as_str() == "REPEAT" || n.children.iter().any(has_repeat)
         }
         let cfg = ir_cfg();
         // A run of ≥3 identical statements folds to a REPEAT (proves fold is wired on the

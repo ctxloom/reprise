@@ -110,6 +110,7 @@ pub fn find_near_groups(
     stats: &mut RetrievalStats,
     exact_pairs: &HashSet<(usize, usize)>,
     tree_pack: Option<&crate::pack::Pack<crate::tree::NormNode>>,
+    li: &crate::intern::LabelInterner,
 ) -> Vec<NearGroup> {
     let mut groups = Vec::new();
     let langs: HashSet<Lang> = units.iter().map(|u| u.lang).collect();
@@ -124,6 +125,7 @@ pub fn find_near_groups(
             stats,
             exact_pairs,
             tree_pack,
+            li,
         ));
     }
     groups
@@ -144,6 +146,7 @@ pub fn build_reps<'d>(
     digests: Option<&'d [crate::digest::UnitDigest]>,
     lang: Lang,
     cfg: &Config,
+    li: &crate::intern::LabelInterner,
 ) -> Vec<RepData<'d>> {
     let floor = cfg.min_unit_floor();
     // One representative per exact fingerprint (exact tiers own equal units;
@@ -169,7 +172,7 @@ pub fn build_reps<'d>(
         None => eligible
             .par_iter()
             .map(|&idx| {
-                let (bag_set, offsets) = rep_substrate(units[idx].tree.expect_resident(), cfg);
+                let (bag_set, offsets) = rep_substrate(units[idx].tree.expect_resident(), cfg, li);
                 RepData {
                     unit_idx: idx,
                     bag_set: std::borrow::Cow::Owned(bag_set),
@@ -191,11 +194,15 @@ pub type SubtreeOffsets = Vec<SubtreeOffsetsEntry>;
 /// from its canonical tree. Lifted verbatim out of [`build_reps`] so the fused digest
 /// pass ([`crate::digest`]) and `build_reps` share the ONE implementation (the digest
 /// invariant: existing functions, never a reimplementation).
-pub fn rep_substrate(tree: &crate::tree::NormNode, cfg: &Config) -> (Vec<u128>, SubtreeOffsets) {
+pub fn rep_substrate(
+    tree: &crate::tree::NormNode,
+    cfg: &Config,
+    li: &crate::intern::LabelInterner,
+) -> (Vec<u128>, SubtreeOffsets) {
     // Histogram offsets use a finer inventory (floor 3) than the bag
     // (small units would otherwise starve the vote count); the bag
     // itself keeps the §9 floor.
-    let inv: Vec<Subtree> = fingerprint::subtree_inventory(tree, 3, HashMode::MaskedLocals);
+    let inv: Vec<Subtree> = fingerprint::subtree_inventory(tree, 3, HashMode::MaskedLocals, li);
     // Pre-order depth per node offset (same numbering as `walk_inventory`:
     // node before children), so each subtree's root depth is `depths[offset]`.
     let depth_by_offset = preorder_depths(tree);
@@ -235,6 +242,7 @@ fn near_groups_for_lang(
     stats: &mut RetrievalStats,
     exact_pairs: &HashSet<(usize, usize)>,
     tree_pack: Option<&crate::pack::Pack<crate::tree::NormNode>>,
+    li: &crate::intern::LabelInterner,
 ) -> Vec<NearGroup> {
     let ir = crate::unit::is_ir(lang, cfg);
     // The historical `LanguageProfile` is anti_unify's structural oracle ONLY on the historical
@@ -250,7 +258,7 @@ fn near_groups_for_lang(
         t = std::time::Instant::now();
     };
 
-    let reps = build_reps(units, digests, lang, cfg);
+    let reps = build_reps(units, digests, lang, cfg, li);
     if reps.len() < 2 {
         return Vec::new();
     }
@@ -328,7 +336,7 @@ fn near_groups_for_lang(
         // them, and dropping them returns the memory bound to the LRU.
         let ta = units[ua].tree.materialize(tree_pack);
         let tb = units[ub].tree.materialize(tree_pack);
-        let outcome = au::anti_unify(&ta, &tb, profile, ir);
+        let outcome = au::anti_unify(&ta, &tb, profile, ir, li);
         if outcome.divergence > cfg.thresholds.max_divergence {
             return Verify::DivergenceRejected;
         }
@@ -455,13 +463,14 @@ fn near_groups_for_lang(
     mark("verify");
     // ---- union-find into clone classes ----
     let mut out = Vec::new();
-    out.extend(build_groups(accepted, Tier::NearNormalized, units));
+    out.extend(build_groups(accepted, Tier::NearNormalized, units, li));
     out.extend(build_groups(
         inline_best.into_values().collect(),
         Tier::InlineAssisted,
         units,
+        li,
     ));
-    out.extend(build_groups(weak, Tier::WeakSimilarity, units));
+    out.extend(build_groups(weak, Tier::WeakSimilarity, units, li));
     out
 }
 
@@ -954,7 +963,12 @@ fn active_filters(cfg: &Config) -> Vec<(&'static str, Filter)> {
         .collect()
 }
 
-fn build_groups(pairs: Vec<VerifiedPair>, tier: Tier, units: &[Unit]) -> Vec<NearGroup> {
+fn build_groups(
+    pairs: Vec<VerifiedPair>,
+    tier: Tier,
+    units: &[Unit],
+    li: &crate::intern::LabelInterner,
+) -> Vec<NearGroup> {
     if pairs.is_empty() {
         return Vec::new();
     }
@@ -1030,10 +1044,10 @@ fn build_groups(pairs: Vec<VerifiedPair>, tier: Tier, units: &[Unit]) -> Vec<Nea
             NearGroup {
                 member_units,
                 tier,
-                template: au::render_template(&best.template),
-                template_hash: fingerprint::merkle(&best.template),
+                template: au::render_template(&best.template, li),
+                template_hash: fingerprint::merkle(&best.template, li),
                 template_tokens: best.template_tokens,
-                template_boilerplate: crate::ir::substance::boilerplate_mass(&best.template),
+                template_boilerplate: crate::ir::substance::boilerplate_mass(&best.template, li),
                 divergence: acc.max_div,
                 inline_chains: acc.chains,
             }

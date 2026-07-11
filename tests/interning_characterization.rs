@@ -117,7 +117,8 @@ fn d19_blob_bytes_are_stable() {
         &label_interner,
     );
     assert!(!file_units.units.is_empty(), "fixture produced no units");
-    let bytes = bincode::serialize(&file_units).expect("serialize FileUnits");
+    let bytes =
+        bincode::serialize(&file_units.to_wire(&label_interner)).expect("serialize FileUnits");
     let digest = xxh3_128(&bytes);
     assert_eq!(
         (bytes.len(), format!("{digest:032x}")),
@@ -148,7 +149,8 @@ fn cache_roundtrip_survives_a_fresh_label_interner() {
         &write_interner,
     );
     assert!(!original.units.is_empty(), "fixture produced no units");
-    let bytes = bincode::serialize(&original).expect("serialize FileUnits");
+    let bytes =
+        bincode::serialize(&original.to_wire(&write_interner)).expect("serialize FileUnits");
 
     // A fresh interner — as if this were a brand new process reusing a warm D19 cache
     // (the MCP-server-longevity property: no shared state with `write_interner`).
@@ -168,15 +170,31 @@ fn cache_roundtrip_survives_a_fresh_label_interner() {
             "fingerprint changed across the cache roundtrip for unit `{}`",
             o.name
         );
+        // Interning-id-conversion WP: `o`/`r` come from genuinely INDEPENDENT
+        // interners (that's the point of this test — a fresh process reusing a
+        // warm cache), so `o.tree == r.tree` is no longer a valid comparison
+        // (`LSym` is a bare per-scan id, not content-comparable across scans — see
+        // `intern::LSym`'s doc comment). Compare the RESOLVED content instead (each
+        // side through its own interner): this is the actual property the D19
+        // hit-≡-cold contract needs — the cache roundtrip must not lose or change
+        // any observable information, whatever the internal id numbering is.
         assert_eq!(
-            o.tree, r.tree,
-            "tree not structurally equal across the cache roundtrip for unit `{}` \
-             (LSym equality is content-based, so a fresh interner must not matter)",
+            reprise::ir::to_sexpr(o.tree.expect_resident(), &write_interner),
+            reprise::ir::to_sexpr(r.tree.expect_resident(), &read_interner),
+            "tree not content-equal across the cache roundtrip for unit `{}`",
             o.name
         );
     }
     assert_eq!(
-        original.raw_trees, reloaded.raw_trees,
-        "raw_trees not structurally equal across the cache roundtrip"
+        original.raw_trees.len(),
+        reloaded.raw_trees.len(),
+        "raw_trees count changed across the cache roundtrip"
     );
+    for (o, r) in original.raw_trees.iter().zip(reloaded.raw_trees.iter()) {
+        assert_eq!(
+            reprise::ir::to_sexpr(o, &write_interner),
+            reprise::ir::to_sexpr(r, &read_interner),
+            "raw_trees not content-equal across the cache roundtrip"
+        );
+    }
 }

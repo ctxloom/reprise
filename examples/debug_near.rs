@@ -14,8 +14,22 @@ fn main() {
     } else {
         Lang::Python
     };
-    let ua = &reprise::units_from_source(&read(&args[1]), lang, &cfg)[0];
-    let ub = &reprise::units_from_source(&read(&args[2]), lang, &cfg)[0];
+    // Interning-id-conversion WP: `ua`/`ub` must share ONE `LabelInterner` — they get
+    // anti-unified against each other below, which compares `Label`s directly (an
+    // `LSym` id is meaningless across two independently-scoped interners).
+    let label_interner = reprise::intern::LabelInterner::new();
+    let ua = &reprise::unit::units_from_source_with_interner(
+        &read(&args[1]),
+        lang,
+        &cfg,
+        &label_interner,
+    )[0];
+    let ub = &reprise::unit::units_from_source_with_interner(
+        &read(&args[2]),
+        lang,
+        &cfg,
+        &label_interner,
+    )[0];
     println!(
         "A: {} tokens={} fp={:x}",
         ua.name, ua.token_count, ua.fingerprint
@@ -33,6 +47,7 @@ fn main() {
             u.tree.expect_resident(),
             cfg.thresholds.bag_min_subtree_tokens,
             HashMode::MaskedLocals,
+            &label_interner,
         )
     };
     let (ia, ib) = (inv(ua), inv(ub));
@@ -59,6 +74,7 @@ fn main() {
         ub.tree.expect_resident(),
         profile,
         ir,
+        &label_interner,
     );
     println!(
         "AU: divergence={:.3} (max {}), holes={} (max {}), factorable={}",
@@ -79,6 +95,6 @@ fn main() {
     }
     println!(
         "template:\n{}",
-        reprise::au::render_template(&outcome.template)
+        reprise::au::render_template(&outcome.template, &label_interner)
     );
 }

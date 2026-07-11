@@ -379,13 +379,13 @@ pub fn run_passes(tree: NormNode, lang: Lang, log: &mut TransformLog) -> NormNod
     //     `detect_comm_sort` (A1 orients asymmetric comparisons and A2's De Morgan synthesizes
     //     fresh `&&`/`||` chains, both of which comm-sort then sorts).
     // `detect_comm_sort` must therefore stay post-abstraction and last-but-one.
-    let iter = crate::ir::pass::detect_iter_protocol(&tree);
+    let iter = crate::ir::pass::detect_iter_protocol(&tree, log.label_interner());
     let tree = crate::ir::edit::apply(tree, &iter, log);
     // The C-style counter loop (block-level `i=0` + `while i<len(coll)` + `i=i+1`) is the same
     // iteration as the range form — rewritten here to the identical canonical foreach shape, so
     // Go counter ≡ Go range ≡ Rust foreach ≡ Rust while-index. Disjoint from `detect_iter_protocol`
     // (a counter loop has no `__next` bind; a range loop has no init sibling), so it runs adjacent.
-    let counter = crate::ir::pass::detect_counter_iter(&tree);
+    let counter = crate::ir::pass::detect_counter_iter(&tree, log.label_interner());
     let tree = crate::ir::edit::apply(tree, &counter, log);
     let loop_exit = crate::ir::pass::detect_loop_exit(&tree);
     let tree = crate::ir::edit::apply(tree, &loop_exit, log);
@@ -402,7 +402,7 @@ pub fn run_passes(tree: NormNode, lang: Lang, log: &mut TransformLog) -> NormNod
     let tree = crate::ir::edit::apply(tree, &abstract_idents, log);
     let boolean = crate::ir::pass::detect_boolean_normalize(&tree);
     let tree = crate::ir::edit::apply(tree, &boolean, log);
-    let comm_sort = crate::ir::pass::detect_comm_sort(&tree);
+    let comm_sort = crate::ir::pass::detect_comm_sort(&tree, log.label_interner());
     let tree = crate::ir::edit::apply(tree, &comm_sort, log);
     let dead = crate::ir::pass::detect_dead(&tree);
     crate::ir::edit::apply(tree, &dead, log)
@@ -1006,7 +1006,7 @@ pub(crate) fn matches_guard(
     let mut subj = subject.clone();
     subj.field = Some("arg".into());
     // Keep a bare-capture pattern's own `@target` (a binding); else it rides as `@arg`.
-    if pat.field.as_deref() != Some("target") {
+    if pat.field != Some(crate::ir::field::id::TARGET) {
         pat.field = Some("arg".into());
     }
     NormNode::new(kind::CALL, Some("guard"), span, vec![callee, subj, pat])
@@ -1074,10 +1074,12 @@ pub(crate) fn lower_pattern(
 }
 
 pub(crate) fn bind_pattern_idents(node: &mut NormNode) {
-    if node.field.as_deref() == Some("type") {
+    static TYPE_FIELD: std::sync::LazyLock<crate::intern::Field> =
+        std::sync::LazyLock::new(|| crate::intern::Field::intern("type"));
+    if node.field == Some(*TYPE_FIELD) {
         return; // a type annotation inside the pattern is not a binding
     }
-    if node.kind.as_ref() == kind::VAR && matches!(node.label, Some(Label::Raw(_))) {
+    if node.kind == kind::id::VAR && matches!(node.label, Some(Label::Raw(_))) {
         node.field = Some("target".into());
     }
     for c in &mut node.children {
@@ -1195,7 +1197,7 @@ pub(crate) fn lower_for(
             call_ext("__has_next", iter.clone(), span, log.label_interner()),
             span,
         );
-        if pat.kind.as_ref() == kind::VAR {
+        if pat.kind == kind::id::VAR {
             // Simple element var (`for x in xs`): bind it directly to `__next`.
             let bind = make_assign(
                 pat,
@@ -1350,7 +1352,7 @@ pub(crate) fn lower_if(
 /// expression (`0 => g()`) matches the `Block` an `if` consequence (`if … { g() }`) lowers
 /// to — the last piece that lets value-`match` arms converge with if-chain arms.
 pub(crate) fn block_wrap(mut body: NormNode, span: (u32, u32)) -> NormNode {
-    if body.kind.as_ref() == kind::BLOCK {
+    if body.kind == kind::id::BLOCK {
         return body;
     }
     body.field = None;
@@ -1363,7 +1365,7 @@ pub(crate) fn block_wrap(mut body: NormNode, span: (u32, u32)) -> NormNode {
 /// equivalent flat `match`/`switch`. A plain `else` block becomes the trivial-guard arm.
 pub(crate) fn push_else_arm(arms: &mut Vec<NormNode>, else_body: Option<NormNode>) {
     match else_body {
-        Some(b) if b.kind.as_ref() == kind::BRANCH => arms.extend(b.children),
+        Some(b) if b.kind == kind::id::BRANCH => arms.extend(b.children),
         Some(b) => {
             let span = b.span;
             arms.push(make_arm(None, Some(b), span));
@@ -1473,7 +1475,7 @@ mod tests {
         let cst = parser.parse(src, None).unwrap();
         let root_kind = ir_root_kinds(lang)[0];
         let func = find_kind(cst.root_node(), root_kind, 0).expect("a unit");
-        crate::ir::to_sexpr(&normalize(lang, func, src, log))
+        crate::ir::to_sexpr(&normalize(lang, func, src, log), log.label_interner())
     }
 
     /// The full-pipeline canonical form of `src`'s first Rust unit (disabled sink).

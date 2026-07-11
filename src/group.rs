@@ -19,6 +19,7 @@ pub fn build_exact_groups(
     units: &[Unit],
     digests: Option<&[crate::digest::UnitDigest]>,
     cfg: &Config,
+    li: &crate::intern::LabelInterner,
 ) -> (Vec<(Group, Vec<usize>)>, u32) {
     let mut below_floor = 0u32;
     let mut buckets: BTreeMap<(Lang, u128), Vec<usize>> = BTreeMap::new();
@@ -69,7 +70,7 @@ pub fn build_exact_groups(
                         // and walked directly, exactly as before the memory work.
                         substantive_tokens(
                             token_count,
-                            unit_boilerplate(digests, indices[0], &units[indices[0]]),
+                            unit_boilerplate(digests, indices[0], &units[indices[0]], li),
                         ),
                     ),
                     note: None,
@@ -94,6 +95,7 @@ pub fn build_inline_exact_groups(
     units: &[Unit],
     digests: Option<&[crate::digest::UnitDigest]>,
     cfg: &Config,
+    li: &crate::intern::LabelInterner,
 ) -> Vec<(Group, Vec<usize>)> {
     let mut buckets: BTreeMap<(Lang, u128), Vec<usize>> = BTreeMap::new();
     for (idx, unit) in units.iter().enumerate() {
@@ -147,7 +149,7 @@ pub fn build_inline_exact_groups(
                     // representative, which is why variants carry this field too.
                     substantive_tokens(
                         token_count,
-                        unit_boilerplate(digests, members[0], &units[members[0]]),
+                        unit_boilerplate(digests, members[0], &units[members[0]], li),
                     ),
                 ),
                 note: None,
@@ -166,10 +168,15 @@ pub fn build_inline_exact_groups(
 /// fused digest over the memory gate, or computed from the resident tree under it
 /// (the SAME `ir::substance::boilerplate_mass` either way — the digest is pinned
 /// to it by tests/digest_oracle.rs).
-fn unit_boilerplate(digests: Option<&[crate::digest::UnitDigest]>, idx: usize, unit: &Unit) -> u32 {
+fn unit_boilerplate(
+    digests: Option<&[crate::digest::UnitDigest]>,
+    idx: usize,
+    unit: &Unit,
+    li: &crate::intern::LabelInterner,
+) -> u32 {
     match digests {
         Some(d) => d[idx].boilerplate_mass,
-        None => crate::ir::substance::boilerplate_mass(unit.tree.expect_resident()),
+        None => crate::ir::substance::boilerplate_mass(unit.tree.expect_resident(), li),
     }
 }
 

@@ -238,9 +238,9 @@ fn ts_switch_break_is_not_rewritten_as_loop_return() {
 
     fn switch_keeps_break(n: &reprise::tree::NormNode) -> bool {
         fn has_break(n: &reprise::tree::NormNode) -> bool {
-            n.kind.as_ref() == "break_statement" || n.children.iter().any(has_break)
+            n.kind.as_str() == "break_statement" || n.children.iter().any(has_break)
         }
-        (n.kind.as_ref() == "switch_statement" && has_break(n))
+        (n.kind.as_str() == "switch_statement" && has_break(n))
             || n.children.iter().any(switch_keeps_break)
     }
     assert!(

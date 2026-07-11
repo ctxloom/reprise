@@ -27,10 +27,10 @@ const SEP_BASE: u32 = u32::MAX / 2;
 /// One unit's sequence stream: (content hash, byte span) per node, pre-order — the
 /// exact per-unit slice [`build_corpus`] assembles. Public so the fused digest pass
 /// ([`crate::digest`]) computes it with the SAME serializer at unit-creation time.
-pub fn unit_stream(tree: &NormNode) -> Vec<(u64, (u32, u32))> {
+pub fn unit_stream(tree: &NormNode, li: &crate::intern::LabelInterner) -> Vec<(u64, (u32, u32))> {
     let mut out = Vec::new();
     let mut buf = String::with_capacity(64);
-    serialize(tree, &mut buf, &mut out);
+    serialize(tree, &mut buf, &mut out, li);
     out
 }
 
@@ -72,24 +72,29 @@ pub fn build_corpus(streams: &[&[(u64, (u32, u32))]]) -> Corpus {
     corpus
 }
 
-fn serialize(node: &NormNode, buf: &mut String, out: &mut Vec<(u64, (u32, u32))>) {
+fn serialize(
+    node: &NormNode,
+    buf: &mut String,
+    out: &mut Vec<(u64, (u32, u32))>,
+    li: &crate::intern::LabelInterner,
+) {
     buf.clear();
-    buf.push_str(&node.kind);
+    buf.push_str(node.kind.as_str());
     buf.push('\u{1f}');
     if let Some(field) = &node.field {
-        buf.push_str(field);
+        buf.push_str(field.as_str());
     }
     buf.push('\u{1f}');
     match &node.label {
         None => {}
-        Some(Label::External(s)) => {
+        Some(Label::External(sym)) => {
             buf.push('E');
-            buf.push_str(s);
+            buf.push_str(li.resolve(*sym));
         }
         Some(Label::Local(_)) => buf.push('L'), // masked (D4)
-        Some(Label::LitKept(s)) => {
+        Some(Label::LitKept(sym)) => {
             buf.push('K');
-            buf.push_str(s);
+            buf.push_str(li.resolve(*sym));
         }
         Some(Label::LitBucket(b)) => {
             buf.push('B');
@@ -102,6 +107,6 @@ fn serialize(node: &NormNode, buf: &mut String, out: &mut Vec<(u64, (u32, u32))>
     }
     out.push((xxhash_rust::xxh3::xxh3_64(buf.as_bytes()), node.span));
     for child in &node.children {
-        serialize(child, buf, out);
+        serialize(child, buf, out, li);
     }
 }

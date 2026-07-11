@@ -20,31 +20,59 @@ use reprise::pack::{Pack, resolve_pack_dir};
 use reprise::tree::NormNode;
 use std::sync::Arc;
 
-fn tree_of(src: &str) -> NormNode {
+/// Interning-id-conversion WP: `label_interner` must be the SAME instance used to
+/// build the tree via [`tree_pack`]'s codec below — an `LSym` id is only meaningful
+/// relative to the interner that minted it, so a tree built by one interner and
+/// stored/loaded through a pack wired to a DIFFERENT one would panic (or silently
+/// resolve garbage) on `Label::External`/`LitKept`.
+fn tree_of(src: &str, label_interner: &Arc<reprise::intern::LabelInterner>) -> NormNode {
     let cfg = Config::default();
-    let units = reprise::unit::units_from_source(src, Lang::Rust, &cfg);
+    let units =
+        reprise::unit::units_from_source_with_interner(src, Lang::Rust, &cfg, label_interner);
     assert_eq!(units.len(), 1, "fixture must extract exactly one unit");
     units.into_iter().next().unwrap().tree.into_resident()
 }
 
 /// A tree pack wired exactly as `scan()` wires it post-interning: values decode
 /// through the wire type and re-intern labels via a per-scan `LabelInterner`.
-/// `dir` is the pack's backing directory (kept alive by the caller).
-fn tree_pack(lru_bytes: u64, shards: usize, dir: &std::path::Path) -> Pack<NormNode> {
-    let interner = reprise::intern::LabelInterner::new();
-    Pack::with_decoder(lru_bytes, shards, dir, move |bytes| {
-        let wire: reprise::tree::NormNodeWire =
-            bincode::deserialize(bytes).expect("pack tree decodes");
-        wire.into_real(&interner)
-    })
+/// `dir` is the pack's backing directory (kept alive by the caller). `label_interner`
+/// is the SAME interner the caller used to build the trees it will `store()` here
+/// (see `tree_of`'s doc comment) — this mirrors `scan()`'s real wiring (`src/lib.rs`),
+/// where the tree pack's codec always shares the scan's one `label_interner`.
+fn tree_pack(
+    lru_bytes: u64,
+    shards: usize,
+    dir: &std::path::Path,
+    label_interner: &Arc<reprise::intern::LabelInterner>,
+) -> Pack<NormNode> {
+    let encode_interner = Arc::clone(label_interner);
+    let decode_interner = Arc::clone(label_interner);
+    Pack::with_codec(
+        lru_bytes,
+        shards,
+        dir,
+        move |node: &NormNode| {
+            let wire = node.to_wire(&encode_interner);
+            bincode::serialize(&wire).expect("pack tree serializes")
+        },
+        move |bytes| {
+            let wire: reprise::tree::NormNodeWire =
+                bincode::deserialize(bytes).expect("pack tree decodes");
+            wire.into_real(&decode_interner)
+        },
+    )
     .expect("pack")
 }
 
 #[test]
 fn roundtrip_tree_is_structurally_equal() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let pack: Pack<NormNode> = tree_pack(1 << 20, 4, dir.path());
-    let t = tree_of("fn add(a: i32, b: i32) -> i32 { return a + b; }");
+    let label_interner = reprise::intern::LabelInterner::new();
+    let pack: Pack<NormNode> = tree_pack(1 << 20, 4, dir.path(), &label_interner);
+    let t = tree_of(
+        "fn add(a: i32, b: i32) -> i32 { return a + b; }",
+        &label_interner,
+    );
     let key = pack.store(&t).expect("store");
     let loaded = pack.load(key);
     assert_eq!(*loaded, t, "loaded tree != stored tree");
@@ -64,8 +92,9 @@ fn roundtrip_seq_stream() {
 #[test]
 fn byte_identical_values_dedup_to_one_entry() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let pack: Pack<NormNode> = tree_pack(1 << 20, 4, dir.path());
-    let t = tree_of("fn f(x: u32) -> u32 { return x * 3; }");
+    let label_interner = reprise::intern::LabelInterner::new();
+    let pack: Pack<NormNode> = tree_pack(1 << 20, 4, dir.path(), &label_interner);
+    let t = tree_of("fn f(x: u32) -> u32 { return x * 3; }", &label_interner);
     let k1 = pack.store(&t).expect("store");
     let bytes_after_first = pack.stored_bytes();
     let k2 = pack.store(&t.clone()).expect("store");
@@ -87,7 +116,9 @@ fn fingerprint_equal_but_byte_different_trees_get_distinct_keys() {
     // silently alias distinct trees; this pins the invariant.
     let cfg = Config::default();
     let src = "fn f(a: i32) -> i32 { return a + 1; }\n\nfn g(a: i32) -> i32 { return a + 1; }\n";
-    let units = reprise::unit::units_from_source(src, Lang::Rust, &cfg);
+    let label_interner = reprise::intern::LabelInterner::new();
+    let units =
+        reprise::unit::units_from_source_with_interner(src, Lang::Rust, &cfg, &label_interner);
     assert_eq!(units.len(), 2);
     assert_eq!(
         units[0].fingerprint, units[1].fingerprint,
@@ -99,7 +130,7 @@ fn fingerprint_equal_but_byte_different_trees_get_distinct_keys() {
         "fixture trees must differ in bytes (spans)"
     );
     let dir = tempfile::tempdir().expect("tempdir");
-    let pack: Pack<NormNode> = tree_pack(1 << 20, 4, dir.path());
+    let pack: Pack<NormNode> = tree_pack(1 << 20, 4, dir.path(), &label_interner);
     let ka = pack.store(units[0].tree.expect_resident()).expect("store");
     let kb = pack.store(units[1].tree.expect_resident()).expect("store");
     assert_ne!(

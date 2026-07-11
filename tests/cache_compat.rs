@@ -19,24 +19,29 @@ const BLOB: &[u8] = include_bytes!("fixtures/cache_compat/fileunits_e84d4b5.bin"
 /// Deserialize the e84d4b5 blob through the interning WP's wire path (the only
 /// deserialize path since `FileUnits` stopped deriving `Deserialize`),
 /// re-interning labels into a fresh per-scan interner — exactly what
-/// `cache::load` does.
-fn load_blob() -> FileUnits {
+/// `cache::load` does. Returns the interner too (interning-id-conversion WP):
+/// `FileUnits` no longer self-serializes (an id-based `LSym` can't resolve
+/// without it), so a caller that re-serializes what it loaded must feed back
+/// the SAME interner instance via `to_wire`.
+fn load_blob() -> (FileUnits, std::sync::Arc<reprise::intern::LabelInterner>) {
     let wire: FileUnitsWire =
         bincode::deserialize(BLOB).expect("e84d4b5-format cache blob no longer deserializes");
     let interner = reprise::intern::LabelInterner::new();
-    wire.into_real(&interner)
+    let fu = wire.into_real(&interner);
+    (fu, interner)
 }
 
 #[test]
 fn e84d4b5_cache_blob_deserializes_and_roundtrips_byte_identically() {
     // Deserialize compatibility: the old-format bytes must still load.
-    let fu = load_blob();
+    let (fu, interner) = load_blob();
     // Serialize compatibility: re-serializing what we loaded must reproduce the
     // e84d4b5 bytes exactly — proves the current serializer (through both the
     // interning WP's resolve-to-string serde AND this WP's TreeSlot shim) still
     // writes the old wire format (no silent D19 format drift, no
     // EXTRACTION_VERSION bump needed).
-    let re = bincode::serialize(&fu).expect("re-serialize");
+    let wire = fu.to_wire(&interner);
+    let re = bincode::serialize(&wire).expect("re-serialize");
     assert_eq!(
         re.as_slice(),
         BLOB,
@@ -48,10 +53,16 @@ fn e84d4b5_cache_blob_deserializes_and_roundtrips_byte_identically() {
 #[test]
 fn e84d4b5_cache_blob_matches_a_fresh_extraction() {
     // Semantic compatibility (the D19 hit-≡-cold contract): the cached units must
-    // equal a fresh extraction of the same committed source.
-    let fu = load_blob();
+    // equal a fresh extraction of the same committed source. Both sides MUST share
+    // one `LabelInterner` (interning-id-conversion WP): `Label::External`/`LitKept`'s
+    // `LSym` is a bare per-scan id, and two independently-scoped interners assign
+    // different ids to the same string when it's first touched in a different
+    // traversal order — comparing across them would spuriously fail even when the
+    // trees are semantically identical. A SHARED interner is content-addressed (the
+    // same string always resolves to the same id, whichever side interns it first),
+    // so this makes the comparison meaningful again.
+    let (fu, interner) = load_blob();
     let src = include_str!("fixtures/cache_compat/blobsrc.rs");
-    let interner = reprise::intern::LabelInterner::new();
     let fresh = reprise::unit::extract_file_units_keep_raw(
         Path::new("blobsrc.rs"),
         src,

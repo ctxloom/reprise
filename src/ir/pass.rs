@@ -4,17 +4,20 @@
 //! binding-field position (`param`/`target`) — so there is no per-language
 //! `collect_declared` hook; the pass is fully language-agnostic.
 
+use crate::intern::{Field, Kind, LabelInterner};
 use crate::ir::edit::Edit;
+use crate::ir::field;
 use crate::ir::kind;
 use crate::ir::transform::{TransformKind, TransformLog, Witness};
 use crate::lang::Lang;
 use crate::tree::{Label, NormNode};
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, LazyLock};
 
 /// Fields whose `Var` occupant is a binding site (a declared local). Grows as the
 /// IR grows (match-arm binds, for-pattern binds) — still structural, never per-grammar.
-fn is_bind_field(field: Option<&str>) -> bool {
-    matches!(field, Some("param") | Some("target"))
+fn is_bind_field(field: Option<Field>) -> bool {
+    matches!(field, Some(f) if f == field::id::PARAM || f == field::id::TARGET)
 }
 
 /// Spec §5.2.4 identifier abstraction as a detect/emit pass (D-IR-12): declared locals
@@ -47,20 +50,34 @@ pub fn detect_abstract_idents(root: &NormNode) -> Vec<Edit> {
 /// Convenience over the seam for callers that only want the abstracted tree (tests): a
 /// disabled sink discards the (hash-excluded) event, so the tree is byte-identical to the
 /// recording path. Not itself a mutator — it routes through [`crate::ir::edit::apply`].
-pub fn abstract_idents(root: NormNode) -> NormNode {
+///
+/// Takes the scan's `LabelInterner` (interning-id-conversion WP): [`apply_abstract_idents`]
+/// (via [`relabel_from_map`]) mints a FRESH `Label::External` for every non-declared name,
+/// through whatever interner the disabled sink carries. A `TransformLog::disabled()` built
+/// with its OWN throwaway interner (the pre-WP shape of this wrapper) would mint those
+/// externals into an interner the CALLER has no handle to — any later resolve of the
+/// returned tree (`to_sexpr`, `fingerprint::merkle`, `boilerplate_mass`, …) against a
+/// DIFFERENT interner then panics (or silently resolves the wrong string; interning
+/// preamble rule 5). Building the sink `_with` the caller's own `li` keeps the newly-minted
+/// externals resolvable through it.
+pub fn abstract_idents(root: NormNode, li: &Arc<LabelInterner>) -> NormNode {
     let edits = detect_abstract_idents(&root);
-    crate::ir::edit::apply(root, &edits, &mut TransformLog::disabled())
+    crate::ir::edit::apply(
+        root,
+        &edits,
+        &mut TransformLog::disabled_with(Arc::clone(li)),
+    )
 }
 
 /// Whether any `Raw` `Var` remains — i.e. relabelling would change the tree.
 fn contains_raw_var(node: &NormNode) -> bool {
-    (node.kind.as_ref() == kind::VAR && matches!(node.label, Some(Label::Raw(_))))
+    (node.kind == kind::id::VAR && matches!(node.label, Some(Label::Raw(_))))
         || node.children.iter().any(contains_raw_var)
 }
 
 fn collect_declared(node: &NormNode, out: &mut HashSet<Box<str>>) {
-    if node.kind.as_ref() == kind::VAR
-        && is_bind_field(node.field.as_deref())
+    if node.kind == kind::id::VAR
+        && is_bind_field(node.field)
         && let Some(Label::Raw(t)) = &node.label
     {
         out.insert(t.clone());
@@ -76,7 +93,7 @@ fn relabel(
     order: &mut HashMap<Box<str>, u32>,
     label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
 ) {
-    if node.kind.as_ref() == kind::VAR
+    if node.kind == kind::id::VAR
         && let Some(Label::Raw(t)) = node.label.clone()
     {
         node.label = Some(if declared.contains(&t) {
@@ -100,7 +117,7 @@ pub(crate) fn relabel_from_map(
     locals: &HashMap<&str, u32>,
     label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
 ) {
-    if node.kind.as_ref() == kind::VAR
+    if node.kind == kind::id::VAR
         && let Some(Label::Raw(t)) = node.label.clone()
     {
         node.label = Some(match locals.get(t.as_ref()) {
@@ -119,9 +136,11 @@ const COMMUTATIVE: &[&str] = &["+", "*", "&", "|", "^", "==", "!=", "&&", "||", 
 /// A 3-child `Binop` on a commutative operator — the shape [`detect_comm_sort`]
 /// canonicalizes and [`crate::ir::edit::apply`] reorders.
 pub(crate) fn is_commutative_chain(node: &NormNode) -> bool {
-    node.kind.as_ref() == kind::BINOP
+    static COMMUTATIVE_KINDS: std::sync::LazyLock<Vec<Kind>> =
+        std::sync::LazyLock::new(|| COMMUTATIVE.iter().map(|s| Kind::intern(s)).collect());
+    node.kind == kind::id::BINOP
         && node.children.len() == 3
-        && COMMUTATIVE.contains(&node.children[1].kind.as_ref())
+        && COMMUTATIVE_KINDS.contains(&node.children[1].kind)
 }
 
 /// Spec §5.2.6 on the IR: describe the canonical sort of every commutative operator
@@ -133,9 +152,15 @@ pub(crate) fn is_commutative_chain(node: &NormNode) -> bool {
 /// s-expression the pipeline canonicalizes at this point. Language-agnostic — the
 /// operator token is canonical in the IR. Unsound for floats / operator overloading
 /// (accepted; the output is a report).
-pub fn detect_comm_sort(node: &NormNode) -> Vec<Edit> {
+///
+/// Needs a `LabelInterner` (interning-id-conversion WP) because the sort key is the
+/// tree's rendered s-expression (`sort_perm`), which must resolve `Label::External`/
+/// `LitKept` `LSym`s back to their text — the SAME interner that built `node`, never a
+/// fresh one (a fresh interner has no entries for `node`'s ids and `resolve` would
+/// panic; see the interning preamble's rule 5 and `intern.rs`'s module doc).
+pub fn detect_comm_sort(node: &NormNode, li: &LabelInterner) -> Vec<Edit> {
     let mut edits = Vec::new();
-    comm_sort_edits(node, &mut edits);
+    comm_sort_edits(node, &mut edits, li);
     edits
 }
 
@@ -143,14 +168,17 @@ pub fn detect_comm_sort(node: &NormNode) -> Vec<Edit> {
 /// keying the enclosing chain off their s-expressions (a nested chain must settle first
 /// — mirrors the historical pass's post-order recursion), emit one edit per chain, and
 /// return the canonicalized subtree so a caller can compute its own sort key.
-fn comm_sort_edits(node: &NormNode, out: &mut Vec<Edit>) -> NormNode {
+fn comm_sort_edits(node: &NormNode, out: &mut Vec<Edit>, li: &LabelInterner) -> NormNode {
     if is_commutative_chain(node) {
         let op = node.children[1].clone();
         let mut operands = Vec::new();
-        flatten_chain(node, op.kind.as_ref(), &mut operands);
-        let operands: Vec<NormNode> = operands.iter().map(|o| comm_sort_edits(o, out)).collect();
+        flatten_chain(node, op.kind, &mut operands);
+        let operands: Vec<NormNode> = operands
+            .iter()
+            .map(|o| comm_sort_edits(o, out, li))
+            .collect();
         if operands.len() >= 2 {
-            let order = sort_perm(&operands);
+            let order = sort_perm(&operands, li);
             let sorted: Vec<NormNode> = order
                 .iter()
                 .map(|&i| operands[i as usize].clone())
@@ -174,7 +202,7 @@ fn comm_sort_edits(node: &NormNode, out: &mut Vec<Edit>) -> NormNode {
     n.children = node
         .children
         .iter()
-        .map(|c| comm_sort_edits(c, out))
+        .map(|c| comm_sort_edits(c, out, li))
         .collect();
     n
 }
@@ -183,19 +211,19 @@ fn comm_sort_edits(node: &NormNode, out: &mut Vec<Edit>) -> NormNode {
 /// `perm[k]` is the pre-sort index of the operand now at position `k`. Stable (ties
 /// keep source order), matching the historical `sort_by_cached_key`; recorded as the
 /// witness so reversal restores the original order (D-IR-9).
-pub(crate) fn sort_perm(operands: &[NormNode]) -> Vec<u32> {
-    let keys: Vec<String> = operands.iter().map(crate::ir::render::to_sexpr).collect();
+pub(crate) fn sort_perm(operands: &[NormNode], li: &LabelInterner) -> Vec<u32> {
+    let keys: Vec<String> = operands
+        .iter()
+        .map(|o| crate::ir::render::to_sexpr(o, li))
+        .collect();
     let mut perm: Vec<u32> = (0..operands.len() as u32).collect();
     perm.sort_by(|&a, &b| keys[a as usize].cmp(&keys[b as usize]));
     perm
 }
 
 /// Collect operands of a same-operator commutative chain (left-assoc), field-stripped.
-pub(crate) fn flatten_chain(node: &NormNode, op: &str, out: &mut Vec<NormNode>) {
-    if node.kind.as_ref() == kind::BINOP
-        && node.children.len() == 3
-        && node.children[1].kind.as_ref() == op
-    {
+pub(crate) fn flatten_chain(node: &NormNode, op: Kind, out: &mut Vec<NormNode>) {
+    if node.kind == kind::id::BINOP && node.children.len() == 3 && node.children[1].kind == op {
         flatten_chain(&node.children[0], op, out);
         let mut rhs = node.children[2].clone();
         rhs.field = None;
@@ -316,9 +344,9 @@ fn reduce_top(node: NormNode, steps: &mut Vec<BoolStep>) -> NormNode {
 /// The reduction A2 applies to a `Unop{ !, x }`, decided from `x`'s already-normalized shape.
 enum NotReduction {
     /// `x` is a comparison — invert the operator (operands unchanged).
-    Invert(&'static str),
+    Invert(Kind),
     /// `x` is a `&&`/`||` chain — De Morgan (flip the operator, negate both operands).
-    DeMorgan(&'static str),
+    DeMorgan(Kind),
     /// `x` is itself `!y` — collapse the double negation to `y`.
     DoubleNeg,
 }
@@ -359,11 +387,11 @@ fn push_not(node: NormNode, red: NotReduction, steps: &mut Vec<BoolStep>) -> Nor
             let l = it.next().expect("binop left");
             let op = it.next().expect("binop op");
             let r = it.next().expect("binop right");
-            let op = NormNode::new(flip, Some("op"), op.span, Vec::new());
+            let op = NormNode::with_kind(flip, Some(field::id::OP), op.span, Vec::new());
             // Negate each operand and push inward (De Morgan recurses on both sides).
             let nl = reduce_top(negate(l), steps);
             let nr = reduce_top(negate(r), steps);
-            let mut b = NormNode::new(kind::BINOP, None, span, vec![nl, op, nr]);
+            let mut b = NormNode::with_kind(kind::id::BINOP, None, span, vec![nl, op, nr]);
             b.field = field;
             b
         }
@@ -378,18 +406,19 @@ fn push_not(node: NormNode, red: NotReduction, steps: &mut Vec<BoolStep>) -> Nor
 
 /// The operand of a logical negation `Unop{ !, x }` (the `@operand` child), else `None`.
 fn not_operand(node: &NormNode) -> Option<&NormNode> {
-    if node.kind.as_ref() != kind::UNOP {
+    static BANG: LazyLock<Kind> = LazyLock::new(|| Kind::intern("!"));
+    if node.kind != kind::id::UNOP {
         return None;
     }
     let is_not = node
         .children
         .iter()
-        .any(|c| c.field.as_deref() == Some("op") && c.kind.as_ref() == "!");
+        .any(|c| c.field == Some(field::id::OP) && c.kind == *BANG);
     is_not
         .then(|| {
             node.children
                 .iter()
-                .find(|c| c.field.as_deref() == Some("operand"))
+                .find(|c| c.field == Some(field::id::OPERAND))
         })
         .flatten()
 }
@@ -399,7 +428,7 @@ fn take_operand(mut node: NormNode) -> NormNode {
     let idx = node
         .children
         .iter()
-        .position(|c| c.field.as_deref() == Some("operand"))
+        .position(|c| c.field == Some(field::id::OPERAND))
         .expect("unop operand");
     node.children.remove(idx)
 }
@@ -407,83 +436,104 @@ fn take_operand(mut node: NormNode) -> NormNode {
 /// Wrap `node` in a logical negation `Unop{ !, node }`, hoisting `node`'s field onto the Unop
 /// so the wrapper sits in the same operand position (`@left`/`@right`).
 fn negate(mut node: NormNode) -> NormNode {
+    static BANG: LazyLock<Kind> = LazyLock::new(|| Kind::intern("!"));
     let span = node.span;
     let field = node.field.take();
-    node.field = Some("operand".into());
-    let bang = NormNode::new("!", Some("op"), span, Vec::new());
-    let mut u = NormNode::new(kind::UNOP, None, span, vec![bang, node]);
+    node.field = Some(field::id::OPERAND);
+    let bang = NormNode::with_kind(*BANG, Some(field::id::OP), span, Vec::new());
+    let mut u = NormNode::with_kind(kind::id::UNOP, None, span, vec![bang, node]);
     u.field = field;
     u
 }
 
 /// `(left, operator-token, right)` of a 3-child `Binop`, else `None`.
-fn binop_parts(node: &NormNode) -> Option<(&NormNode, &str, &NormNode)> {
-    (node.kind.as_ref() == kind::BINOP && node.children.len() == 3).then(|| {
-        (
-            &node.children[0],
-            node.children[1].kind.as_ref(),
-            &node.children[2],
-        )
-    })
+fn binop_parts(node: &NormNode) -> Option<(&NormNode, Kind, &NormNode)> {
+    (node.kind == kind::id::BINOP && node.children.len() == 3)
+        .then(|| (&node.children[0], node.children[1].kind, &node.children[2]))
 }
 
 /// Replace a `Binop`'s operator token in place (operands + their fields unchanged) — the
 /// shared mutation for A2's comparison inversion (`!(a<b)` keeps `a`,`b`, flips `<`→`>=`).
-fn set_binop_op(mut node: NormNode, new_op: &str) -> NormNode {
+fn set_binop_op(mut node: NormNode, new_op: Kind) -> NormNode {
     let op_span = node.children[1].span;
-    node.children[1] = NormNode::new(new_op, Some("op"), op_span, Vec::new());
+    node.children[1] = NormNode::with_kind(new_op, Some(field::id::OP), op_span, Vec::new());
     node
 }
 
 /// The operator token of a 3-child `Binop` (`children[1]`), else `None`.
-fn binop_op(node: &NormNode) -> Option<&str> {
-    (node.kind.as_ref() == kind::BINOP && node.children.len() == 3)
-        .then(|| node.children[1].kind.as_ref())
+fn binop_op(node: &NormNode) -> Option<Kind> {
+    (node.kind == kind::id::BINOP && node.children.len() == 3).then(|| node.children[1].kind)
 }
 
 /// `>` → `<`, `>=` → `<=` — the non-canonical orientations A1 flips (operands swap too).
-fn orient_flip(op: &str) -> Option<&'static str> {
-    match op {
-        ">" => Some("<"),
-        ">=" => Some("<="),
-        _ => None,
+fn orient_flip(op: Kind) -> Option<Kind> {
+    static LT: LazyLock<Kind> = LazyLock::new(|| Kind::intern("<"));
+    static LE: LazyLock<Kind> = LazyLock::new(|| Kind::intern("<="));
+    static GT: LazyLock<Kind> = LazyLock::new(|| Kind::intern(">"));
+    static GE: LazyLock<Kind> = LazyLock::new(|| Kind::intern(">="));
+    if op == *GT {
+        Some(*LT)
+    } else if op == *GE {
+        Some(*LE)
+    } else {
+        None
     }
 }
 
 /// Comparison inversion under negation (A2): `<`↔`>=`, `>`↔`<=`, `==`↔`!=` (operands kept).
-fn invert_cmp(op: &str) -> Option<&'static str> {
-    Some(match op {
-        "<" => ">=",
-        "<=" => ">",
-        ">" => "<=",
-        ">=" => "<",
-        "==" => "!=",
-        "!=" => "==",
-        _ => return None,
+fn invert_cmp(op: Kind) -> Option<Kind> {
+    static LT: LazyLock<Kind> = LazyLock::new(|| Kind::intern("<"));
+    static LE: LazyLock<Kind> = LazyLock::new(|| Kind::intern("<="));
+    static GT: LazyLock<Kind> = LazyLock::new(|| Kind::intern(">"));
+    static GE: LazyLock<Kind> = LazyLock::new(|| Kind::intern(">="));
+    static EQ: LazyLock<Kind> = LazyLock::new(|| Kind::intern("=="));
+    static NE: LazyLock<Kind> = LazyLock::new(|| Kind::intern("!="));
+    Some(if op == *LT {
+        *GE
+    } else if op == *LE {
+        *GT
+    } else if op == *GT {
+        *LE
+    } else if op == *GE {
+        *LT
+    } else if op == *EQ {
+        *NE
+    } else if op == *NE {
+        *EQ
+    } else {
+        return None;
     })
 }
 
 /// De Morgan operator flip (A2): `&&`↔`||` (and the Python-canonical `and`↔`or`).
-fn demorgan_flip(op: &str) -> Option<&'static str> {
-    Some(match op {
-        "&&" => "||",
-        "||" => "&&",
-        "and" => "or",
-        "or" => "and",
-        _ => return None,
+fn demorgan_flip(op: Kind) -> Option<Kind> {
+    static AND_SYM: LazyLock<Kind> = LazyLock::new(|| Kind::intern("&&"));
+    static OR_SYM: LazyLock<Kind> = LazyLock::new(|| Kind::intern("||"));
+    static AND_WORD: LazyLock<Kind> = LazyLock::new(|| Kind::intern("and"));
+    static OR_WORD: LazyLock<Kind> = LazyLock::new(|| Kind::intern("or"));
+    Some(if op == *AND_SYM {
+        *OR_SYM
+    } else if op == *OR_SYM {
+        *AND_SYM
+    } else if op == *AND_WORD {
+        *OR_WORD
+    } else if op == *OR_WORD {
+        *AND_WORD
+    } else {
+        return None;
     })
 }
 
 /// Swap a `Binop`'s operands (keeping the canonical `@left`/`@right` fields) and set its
 /// operator token — the shared mutation for a `CmpOrient` (and A2's comparison inversion).
-fn swap_binop(mut node: NormNode, new_op: &str) -> NormNode {
+fn swap_binop(mut node: NormNode, new_op: Kind) -> NormNode {
     let mut it = std::mem::take(&mut node.children).into_iter();
     let mut left = it.next().expect("binop left");
     let op = it.next().expect("binop op");
     let mut right = it.next().expect("binop right");
-    left.field = Some("right".into());
-    right.field = Some("left".into());
-    let op = NormNode::new(new_op, Some("op"), op.span, Vec::new());
+    left.field = Some(field::id::RIGHT);
+    right.field = Some(field::id::LEFT);
+    let op = NormNode::with_kind(new_op, Some(field::id::OP), op.span, Vec::new());
     node.children = vec![right, op, left];
     node
 }
@@ -554,11 +604,11 @@ pub(crate) fn try_merge_branch(node: &NormNode, op_tok: &str) -> Option<NormNode
     let span = node.span;
     let guard = and_guard(outer_guard.clone(), inner_guard.clone(), span, op_tok);
     let mut body = inner_body.clone();
-    body.field = Some("body".into());
-    let arm = NormNode::new(kind::ARM, Some("arm"), span, vec![guard, body]);
-    Some(NormNode::new(
-        kind::BRANCH,
-        node.field.as_deref(),
+    body.field = Some(field::id::BODY);
+    let arm = NormNode::with_kind(kind::id::ARM, Some(field::id::ARM), span, vec![guard, body]);
+    Some(NormNode::with_kind(
+        kind::id::BRANCH,
+        node.field,
         span,
         vec![arm],
     ))
@@ -578,40 +628,38 @@ pub(crate) fn is_mergeable_branch(node: &NormNode) -> bool {
 /// shape (an `else` on either branch, or extra statements around the inner `if`).
 fn merge_branch_parts(node: &NormNode) -> Option<(&NormNode, &NormNode, &NormNode)> {
     let outer_arm = single_guarded_arm(node)?;
-    let outer_guard = arm_field(outer_arm, "guard")?;
-    let outer_body = arm_field(outer_arm, "body")?;
-    if outer_body.kind.as_ref() != kind::BLOCK || outer_body.children.len() != 1 {
+    let outer_guard = arm_field(outer_arm, field::id::GUARD)?;
+    let outer_body = arm_field(outer_arm, field::id::BODY)?;
+    if outer_body.kind != kind::id::BLOCK || outer_body.children.len() != 1 {
         return None;
     }
     let inner_arm = single_guarded_arm(&outer_body.children[0])?;
-    let inner_guard = arm_field(inner_arm, "guard")?;
-    let inner_body = arm_field(inner_arm, "body")?;
+    let inner_guard = arm_field(inner_arm, field::id::GUARD)?;
+    let inner_body = arm_field(inner_arm, field::id::BODY)?;
     Some((outer_guard, inner_guard, inner_body))
 }
 
 /// The sole `Arm` of a single-arm, no-else `Branch` (an `if` with no `else`): the branch has
 /// exactly one arm and that arm carries a `@guard`. Else `None`.
 fn single_guarded_arm(branch: &NormNode) -> Option<&NormNode> {
-    if branch.kind.as_ref() != kind::BRANCH || branch.children.len() != 1 {
+    if branch.kind != kind::id::BRANCH || branch.children.len() != 1 {
         return None;
     }
     let arm = &branch.children[0];
-    (arm.kind.as_ref() == kind::ARM && arm_field(arm, "guard").is_some()).then_some(arm)
+    (arm.kind == kind::id::ARM && arm_field(arm, field::id::GUARD).is_some()).then_some(arm)
 }
 
 /// The child of an `Arm` occupying `field` (`guard` / `body`).
-fn arm_field<'a>(arm: &'a NormNode, field: &str) -> Option<&'a NormNode> {
-    arm.children
-        .iter()
-        .find(|c| c.field.as_deref() == Some(field))
+fn arm_field(arm: &NormNode, field: Field) -> Option<&NormNode> {
+    arm.children.iter().find(|c| c.field == Some(field))
 }
 
 /// Build a conjunction guard `Binop{ l <op> r }@guard` — byte-identical to how a source
 /// `if l <op> r` lowers, so the merged nest converges with the hand-written conjunction. `op_tok`
 /// is the language's AND spelling ([`Lang::conjunction_token`]), replayed from the recorded edit.
 fn and_guard(mut l: NormNode, mut r: NormNode, span: (u32, u32), op_tok: &str) -> NormNode {
-    l.field = Some("left".into());
-    r.field = Some("right".into());
+    l.field = Some(field::id::LEFT);
+    r.field = Some(field::id::RIGHT);
     let op = NormNode::new(op_tok, Some("op"), span, Vec::new());
     NormNode::new(kind::BINOP, Some("guard"), span, vec![l, op, r])
 }
@@ -624,7 +672,7 @@ fn and_guard(mut l: NormNode, mut r: NormNode, span: (u32, u32), op_tok: &str) -
 /// else-bodies in order (the witnesses that let reversal re-wrap them); empty ⇒ nothing folded.
 /// A no-op on non-`Block` nodes, so the walk can call it at every node.
 pub(crate) fn fold_dead_else(block: &mut NormNode) -> Vec<NormNode> {
-    if block.kind.as_ref() != kind::BLOCK {
+    if block.kind != kind::id::BLOCK {
         return Vec::new();
     }
     let mut hoisted = Vec::new();
@@ -647,21 +695,21 @@ pub(crate) fn fold_dead_else(block: &mut NormNode) -> Vec<NormNode> {
 /// `(the then-only branch, the else body)`. `None` for any other shape (an `else if` chain,
 /// a non-diverging then-arm, or no else) — where dropping the else would be unsound.
 fn split_redundant_else(branch: &NormNode) -> Option<(NormNode, NormNode)> {
-    if branch.kind.as_ref() != kind::BRANCH || branch.children.len() != 2 {
+    if branch.kind != kind::id::BRANCH || branch.children.len() != 2 {
         return None;
     }
     let then_arm = &branch.children[0];
     let else_arm = &branch.children[1];
     // then-arm: a guarded `if` whose body provably diverges.
-    arm_field(then_arm, "guard")?;
-    if !diverges(arm_field(then_arm, "body")?) {
+    arm_field(then_arm, field::id::GUARD)?;
+    if !diverges(arm_field(then_arm, field::id::BODY)?) {
         return None;
     }
     // else-arm: a plain `else` (trivial guard) — not an `else if` (which would carry a guard).
-    if arm_field(else_arm, "guard").is_some() {
+    if arm_field(else_arm, field::id::GUARD).is_some() {
         return None;
     }
-    let else_body = arm_field(else_arm, "body")?.clone();
+    let else_body = arm_field(else_arm, field::id::BODY)?.clone();
     let mut trimmed = branch.clone();
     trimmed.children.truncate(1); // keep only the then-arm
     Some((trimmed, else_body))
@@ -670,7 +718,7 @@ fn split_redundant_else(branch: &NormNode) -> Option<(NormNode, NormNode)> {
 /// The statements an else body contributes when spliced as siblings: a `Block`'s children
 /// (the else statements), or the body itself as a lone statement.
 fn else_stmts(else_body: NormNode) -> Vec<NormNode> {
-    if else_body.kind.as_ref() == kind::BLOCK {
+    if else_body.kind == kind::id::BLOCK {
         else_body.children
     } else {
         vec![else_body]
@@ -681,7 +729,7 @@ fn else_stmts(else_body: NormNode) -> Vec<NormNode> {
 /// `Branch` that is total (has an else) and all of whose arm bodies diverge. Pure, detector-side
 /// — the soundness precondition for C2's redundant-else drop, reusable by future §13-rung-2 work.
 pub(crate) fn diverges(body: &NormNode) -> bool {
-    let last = if body.kind.as_ref() == kind::BLOCK {
+    let last = if body.kind == kind::id::BLOCK {
         body.children.last()
     } else {
         Some(body)
@@ -689,17 +737,20 @@ pub(crate) fn diverges(body: &NormNode) -> bool {
     let Some(last) = last else {
         return false;
     };
-    match last.kind.as_ref() {
-        kind::RETURN | kind::BREAK | kind::CONTINUE => true,
-        kind::BRANCH => {
-            let arms = &last.children;
-            !arms.is_empty()
-                && arms.iter().any(|a| arm_field(a, "guard").is_none()) // total (has an else)
-                && arms
-                    .iter()
-                    .all(|a| arm_field(a, "body").is_some_and(diverges))
-        }
-        _ => false,
+    if last.kind == kind::id::RETURN
+        || last.kind == kind::id::BREAK
+        || last.kind == kind::id::CONTINUE
+    {
+        true
+    } else if last.kind == kind::id::BRANCH {
+        let arms = &last.children;
+        !arms.is_empty()
+            && arms.iter().any(|a| arm_field(a, field::id::GUARD).is_none()) // total (has an else)
+            && arms
+                .iter()
+                .all(|a| arm_field(a, field::id::BODY).is_some_and(diverges))
+    } else {
+        false
     }
 }
 
@@ -721,16 +772,16 @@ pub fn detect_dead(node: &NormNode) -> Vec<Edit> {
 fn dead_edits(node: &NormNode, out: &mut Vec<Edit>) -> NormNode {
     let mut n = node.shallow_clone();
     n.children = node.children.iter().map(|c| dead_edits(c, out)).collect();
-    if n.kind.as_ref() == kind::LOOP
+    if n.kind == kind::id::LOOP
         && let Some(body) = n
             .children
             .iter_mut()
-            .find(|c| c.field.as_deref() == Some("body"))
+            .find(|c| c.field == Some(field::id::BODY))
     {
         while body
             .children
             .last()
-            .is_some_and(|c| c.kind.as_ref() == kind::CONTINUE)
+            .is_some_and(|c| c.kind == kind::id::CONTINUE)
         {
             let removed = body.children.pop().expect("checked last() is Some");
             out.push(Edit::DropDead {
@@ -769,7 +820,7 @@ fn loop_exit_edits(node: &NormNode, out: &mut Vec<Edit>) -> NormNode {
         .iter()
         .map(|c| loop_exit_edits(c, out))
         .collect();
-    if n.kind.as_ref() == kind::BLOCK {
+    if n.kind == kind::id::BLOCK {
         let locus = n.span;
         for _ in 0..fold_loop_exit(&mut n) {
             out.push(Edit::LoopExit { locus });
@@ -801,8 +852,8 @@ pub(crate) fn fold_loop_exit(block: &mut NormNode) -> u32 {
         return 0;
     }
     let last = &block.children[n - 1];
-    let is_return_value = last.kind.as_ref() == kind::RETURN && last.children.len() == 1;
-    if !is_return_value || block.children[n - 2].kind.as_ref() != kind::LOOP {
+    let is_return_value = last.kind == kind::id::RETURN && last.children.len() == 1;
+    if !is_return_value || block.children[n - 2].kind != kind::id::LOOP {
         return 0;
     }
     let value = block.children[n - 1].children[0].clone();
@@ -817,7 +868,7 @@ pub(crate) fn fold_loop_exit(block: &mut NormNode) -> u32 {
     if let Some(loop_body) = block.children.last_mut().and_then(|lp| {
         lp.children
             .iter_mut()
-            .find(|c| c.field.as_deref() == Some("body"))
+            .find(|c| c.field == Some(field::id::BODY))
     }) {
         folds += fold_loop_exit(loop_body);
     }
@@ -825,16 +876,16 @@ pub(crate) fn fold_loop_exit(block: &mut NormNode) -> u32 {
 }
 
 fn replace_breaks(node: &mut NormNode, value: &NormNode, replaced: &mut u32, top: bool) {
-    if !top && node.kind.as_ref() == kind::LOOP {
+    if !top && node.kind == kind::id::LOOP {
         return; // a nested loop owns its own breaks
     }
     let mut i = 0;
     while i < node.children.len() {
-        if node.children[i].kind.as_ref() == kind::BREAK && node.children[i].children.is_empty() {
+        if node.children[i].kind == kind::id::BREAK && node.children[i].children.is_empty() {
             let span = node.children[i].span;
             let mut v = value.clone();
-            v.field = Some("value".into());
-            node.children[i] = NormNode::new(kind::RETURN, None, span, vec![v]);
+            v.field = Some(field::id::VALUE);
+            node.children[i] = NormNode::with_kind(kind::id::RETURN, None, span, vec![v]);
             *replaced += 1;
         } else {
             replace_breaks(&mut node.children[i], value, replaced, false);
@@ -850,28 +901,34 @@ fn replace_breaks(node: &mut NormNode, value: &NormNode, replaced: &mut u32, top
 /// swap the range iterator for `xs` in both protocol calls and replace `xs[i]` with `i`.
 /// Runs on `Raw` labels (before abstraction). Only the range/len *matcher* is
 /// language-shaped (Rust `0..xs.len()` vs Python `range(len(xs))`); the rewrite is shared.
-pub fn detect_iter_protocol(node: &NormNode) -> Vec<Edit> {
+///
+/// Needs a `LabelInterner`: the matcher reads `Label::External`/`LitKept` text
+/// (`__next`/`__has_next`, a kept `0` literal) that may already be present pre-abstraction
+/// (kept-list literals and frontend-synthesized protocol calls intern at construction, not
+/// at `abstract_idents` time) — the SAME interner that built `node`, per the interning
+/// preamble's rule 5.
+pub fn detect_iter_protocol(node: &NormNode, li: &LabelInterner) -> Vec<Edit> {
     let mut edits = Vec::new();
-    iter_protocol_edits(node, &mut edits);
+    iter_protocol_edits(node, &mut edits, li);
     edits
 }
 
 /// Bottom-up companion to [`detect_iter_protocol`]: rewrite inner loops before matching this
 /// one (mirrors the historical post-order recursion) and return the rewritten subtree, so a
 /// nested rewrite settles first and the walk stays in step with the applier.
-fn iter_protocol_edits(node: &NormNode, out: &mut Vec<Edit>) -> NormNode {
+fn iter_protocol_edits(node: &NormNode, out: &mut Vec<Edit>, li: &LabelInterner) -> NormNode {
     let mut n = node.shallow_clone();
     n.children = node
         .children
         .iter()
-        .map(|c| iter_protocol_edits(c, out))
+        .map(|c| iter_protocol_edits(c, out, li))
         .collect();
-    let matched = (n.kind.as_ref() == kind::LOOP)
+    let matched = (n.kind == kind::id::LOOP)
         .then(|| {
             n.children
                 .iter()
-                .find(|c| c.field.as_deref() == Some("body"))
-                .and_then(index_loop_match)
+                .find(|c| c.field == Some(field::id::BODY))
+                .and_then(|body| index_loop_match(body, li))
         })
         .flatten();
     if let Some((ivar, coll, span)) = matched {
@@ -880,15 +937,27 @@ fn iter_protocol_edits(node: &NormNode, out: &mut Vec<Edit>) -> NormNode {
             coll: coll.clone(),
             ivar: ivar.clone(),
         });
-        rewrite_index_loop(&mut n, &ivar, &coll, span);
+        rewrite_index_loop(&mut n, &ivar, &coll, span, li);
     }
     n
 }
 
 /// Convenience over the seam (tests): disabled sink → identical tree. See [`abstract_idents`].
-pub fn rewrite_iteration(node: NormNode) -> NormNode {
-    let edits = detect_iter_protocol(&node);
-    crate::ir::edit::apply(node, &edits, &mut TransformLog::disabled())
+///
+/// Unlike most of this module's other "disabled sink" convenience wrappers, this one must
+/// NOT build its own throwaway `TransformLog::disabled()`: the APPLY side re-identifies the
+/// matched loop via [`index_loop_match`]/`retarget_iterator`, which read the tree's EXISTING
+/// `Label::External` protocol-call names (`__has_next`/`__next`) — the same read `li` already
+/// serves the detect side. A fresh, unrelated interner has no entries for those ids and
+/// `LabelInterner::resolve` would panic (interning preamble rule 5) — so the disabled sink is
+/// built `_with` the SAME `li` the caller passed in.
+pub fn rewrite_iteration(node: NormNode, li: &Arc<LabelInterner>) -> NormNode {
+    let edits = detect_iter_protocol(&node, li);
+    crate::ir::edit::apply(
+        node,
+        &edits,
+        &mut TransformLog::disabled_with(Arc::clone(li)),
+    )
 }
 
 /// The shared iteration-protocol mutation [`crate::ir::edit::apply`] performs for an
@@ -896,19 +965,26 @@ pub fn rewrite_iteration(node: NormNode) -> NormNode {
 /// iterator to `coll` in both protocol calls and replace every `coll[ivar]` with a bare
 /// `ivar` (the element var). `span` is the range iterator's span (reused for the synthesized
 /// nodes).
-pub(crate) fn rewrite_index_loop(node: &mut NormNode, ivar: &str, coll: &str, span: (u32, u32)) {
-    let elem = |field: Option<&str>| {
-        NormNode::new(kind::VAR, field, span, Vec::new()).with_label(Label::Raw(coll.into()))
+pub(crate) fn rewrite_index_loop(
+    node: &mut NormNode,
+    ivar: &str,
+    coll: &str,
+    span: (u32, u32),
+    li: &LabelInterner,
+) {
+    let elem = |field: Option<Field>| {
+        NormNode::with_kind(kind::id::VAR, field, span, Vec::new())
+            .with_label(Label::Raw(coll.into()))
     };
     let Some(body) = node
         .children
         .iter_mut()
-        .find(|c| c.field.as_deref() == Some("body"))
+        .find(|c| c.field == Some(field::id::BODY))
     else {
         return;
     };
     for stmt in body.children.iter_mut() {
-        retarget_iterator(stmt, ivar, coll, span);
+        retarget_iterator(stmt, ivar, coll, span, li);
     }
     for stmt in body.children.iter_mut().skip(2) {
         *stmt = replace_index(std::mem::replace(stmt, elem(None)), ivar, coll);
@@ -919,18 +995,18 @@ pub(crate) fn rewrite_index_loop(node: &mut NormNode, ivar: &str, coll: &str, sp
 pub(crate) type IndexLoop = (Box<str>, Box<str>, (u32, u32));
 
 /// If `body` is the canonical index-loop protocol, return `(index var, collection, span)`.
-pub(crate) fn index_loop_match(body: &NormNode) -> Option<IndexLoop> {
+pub(crate) fn index_loop_match(body: &NormNode, li: &LabelInterner) -> Option<IndexLoop> {
     // body[1] = `Assign{ Var@target ivar, Call@value __next(ITER) }`.
     let bind = body.children.get(1)?;
-    if bind.kind.as_ref() != kind::ASSIGN || bind.children.len() != 2 {
+    if bind.kind != kind::id::ASSIGN || bind.children.len() != 2 {
         return None;
     }
     let ivar = match (&bind.children[0].kind, &bind.children[0].label) {
-        (k, Some(Label::Raw(t))) if k.as_ref() == kind::VAR => t.clone(),
+        (&k, Some(Label::Raw(t))) if k == kind::id::VAR => t.clone(),
         _ => return None,
     };
-    let iter = call_arg(&bind.children[1], "__next")?;
-    let coll = range_len_collection(iter)?;
+    let iter = call_arg(&bind.children[1], "__next", li)?;
+    let coll = range_len_collection(iter, li)?;
     // Every use of `ivar` past the protocol prelude must be exactly `coll[ivar]`.
     if !body
         .children
@@ -945,101 +1021,105 @@ pub(crate) fn index_loop_match(body: &NormNode) -> Option<IndexLoop> {
 
 /// A callee's name, matched whether still `Raw` (a plain `range`/`len` identifier — this
 /// pass runs pre-abstraction) or already `External` (synthesized `__next`, Rust `.len`).
-fn label_name_is(label: &Option<Label>, name: &str) -> bool {
+/// `li` resolves an `External` `LSym` for the comparison (interned once per call — the
+/// interning preamble's rule 5 — not per node it is compared against).
+fn label_name_is(label: &Option<Label>, name: &str, li: &LabelInterner) -> bool {
     match label {
-        Some(Label::External(t)) => t.as_ref() == name,
+        Some(Label::External(t)) => *t == li.intern(name),
         Some(Label::Raw(t)) => t.as_ref() == name,
         _ => false,
     }
 }
 
 /// The single argument of a `Call` whose callee is named `name` (`__next` / `__has_next`).
-fn call_arg<'a>(node: &'a NormNode, name: &str) -> Option<&'a NormNode> {
-    call_named_arg(node, name)
+fn call_arg<'a>(node: &'a NormNode, name: &str, li: &LabelInterner) -> Option<&'a NormNode> {
+    call_named_arg(node, name, li)
 }
 
 /// Match `0..xs.len()` (Rust: `Binop{Lit 0, .., Call{Field{xs,len}}}`) or `range(len(xs))`
 /// (Python: `Call{range, Call{len, xs}}`), returning the collection name.
-fn range_len_collection(iter: &NormNode) -> Option<Box<str>> {
+fn range_len_collection(iter: &NormNode, li: &LabelInterner) -> Option<Box<str>> {
+    static DOTDOT: LazyLock<Kind> = LazyLock::new(|| Kind::intern(".."));
     // Rust range.
-    if iter.kind.as_ref() == kind::BINOP && iter.children.len() == 3 {
-        let is_zero =
-            matches!(&iter.children[0].label, Some(Label::LitKept(t)) if t.as_ref() == "0");
-        if is_zero && iter.children[1].kind.as_ref() == ".." {
-            return len_call_collection(&iter.children[2]);
+    if iter.kind == kind::id::BINOP && iter.children.len() == 3 {
+        let zero = li.intern("0");
+        let is_zero = matches!(&iter.children[0].label, Some(Label::LitKept(t)) if *t == zero);
+        if is_zero && iter.children[1].kind == *DOTDOT {
+            return len_call_collection(&iter.children[2], li);
         }
     }
     // Python `range(len(xs))`.
-    if let Some(inner) = call_named_arg(iter, "range") {
-        return len_call_collection_py(inner);
+    if let Some(inner) = call_named_arg(iter, "range", li) {
+        return len_call_collection_py(inner, li);
     }
     None
 }
 
 /// Rust `xs.len()` → `Call{ callee: Field{ Var xs, len }, }` → `xs`.
-fn len_call_collection(node: &NormNode) -> Option<Box<str>> {
-    if node.kind.as_ref() != kind::CALL {
+fn len_call_collection(node: &NormNode, li: &LabelInterner) -> Option<Box<str>> {
+    if node.kind != kind::id::CALL {
         return None;
     }
     let field = node
         .children
         .iter()
-        .find(|c| c.field.as_deref() == Some("callee"))?;
-    if field.kind.as_ref() != kind::FIELD {
+        .find(|c| c.field == Some(field::id::CALLEE))?;
+    if field.kind != kind::id::FIELD {
         return None;
     }
     let name = field
         .children
         .iter()
-        .find(|c| c.field.as_deref() == Some("name"))?;
-    if !label_name_is(&name.label, "len") {
+        .find(|c| c.field == Some(field::id::NAME))?;
+    if !label_name_is(&name.label, "len", li) {
         return None;
     }
     let base = field
         .children
         .iter()
-        .find(|c| c.field.as_deref() == Some("base"))?;
+        .find(|c| c.field == Some(field::id::BASE))?;
     raw_text(base)
 }
 
 /// Python `len(xs)` → `xs`.
-fn len_call_collection_py(node: &NormNode) -> Option<Box<str>> {
-    call_named_arg(node, "len").and_then(raw_text)
+fn len_call_collection_py(node: &NormNode, li: &LabelInterner) -> Option<Box<str>> {
+    call_named_arg(node, "len", li).and_then(raw_text)
 }
 
 /// The single `@arg` of a `Call` whose callee is named `name` (`Raw` or `External`).
-fn call_named_arg<'a>(node: &'a NormNode, name: &str) -> Option<&'a NormNode> {
-    if node.kind.as_ref() != kind::CALL {
+fn call_named_arg<'a>(node: &'a NormNode, name: &str, li: &LabelInterner) -> Option<&'a NormNode> {
+    if node.kind != kind::id::CALL {
         return None;
     }
     let callee = node
         .children
         .iter()
-        .find(|c| c.field.as_deref() == Some("callee"))?;
-    if !label_name_is(&callee.label, name) {
+        .find(|c| c.field == Some(field::id::CALLEE))?;
+    if !label_name_is(&callee.label, name, li) {
         return None;
     }
     node.children
         .iter()
-        .find(|c| c.field.as_deref() == Some("arg"))
+        .find(|c| c.field == Some(field::id::ARG))
 }
 
 fn raw_text(node: &NormNode) -> Option<Box<str>> {
     match &node.label {
-        Some(Label::Raw(t)) if node.kind.as_ref() == kind::VAR => Some(t.clone()),
+        Some(Label::Raw(t)) if node.kind == kind::id::VAR => Some(t.clone()),
         _ => None,
     }
 }
 
 fn is_index(node: &NormNode, ivar: &str, coll: &str) -> bool {
     let child_is = |field: &str, name: &str| {
+        let target = Field::intern(field);
         node.children
             .iter()
-            .find(|c| c.field.as_deref() == Some(field))
+            .find(|c| c.field == Some(target))
             .and_then(raw_text)
             .is_some_and(|t| t.as_ref() == name)
     };
-    node.kind.as_ref() == kind::INDEX && child_is("base", coll) && child_is("idx", ivar)
+    node.kind == kind::id::INDEX && child_is("base", coll) && child_is("idx", ivar)
 }
 
 /// Every use of `ivar` in `node` is exactly `coll[ivar]` (a bare `ivar` fails the match).
@@ -1055,39 +1135,47 @@ fn index_uses_only(node: &NormNode, ivar: &str, coll: &str) -> bool {
 
 /// Swap the range iterator inside a protocol `__has_next(ITER)` / `__next(ITER)` call for a
 /// bare `Var coll` (leaving the arg's field intact).
-fn retarget_iterator(node: &mut NormNode, _ivar: &str, coll: &str, span: (u32, u32)) {
+fn retarget_iterator(
+    node: &mut NormNode,
+    _ivar: &str,
+    coll: &str,
+    span: (u32, u32),
+    li: &LabelInterner,
+) {
     // A nested loop owns its own iteration protocol — do NOT retarget its `__has_next`/`__next`
     // to THIS loop's collection (slow-wind: recursing in would make the inner loop iterate `coll`
     // too, a false convergence). Mirrors `replace_breaks`'s nested-loop stop. This loop's own
     // protocol lives in its guard/bind (never inside a nested loop), so it is still reached.
-    if node.kind.as_ref() == kind::LOOP {
+    if node.kind == kind::id::LOOP {
         return;
     }
-    let is_protocol = node.kind.as_ref() == kind::CALL
+    let has_next = li.intern("__has_next");
+    let next = li.intern("__next");
+    let is_protocol = node.kind == kind::id::CALL
         && node.children.iter().any(|c| {
-            c.field.as_deref() == Some("callee")
-                && matches!(&c.label, Some(Label::External(t)) if matches!(t.as_ref(), "__has_next" | "__next"))
+            c.field == Some(field::id::CALLEE)
+                && matches!(&c.label, Some(Label::External(t)) if *t == has_next || *t == next)
         });
     if is_protocol {
         if let Some(arg) = node
             .children
             .iter_mut()
-            .find(|c| c.field.as_deref() == Some("arg"))
+            .find(|c| c.field == Some(field::id::ARG))
         {
-            *arg = NormNode::new(kind::VAR, Some("arg"), span, Vec::new())
+            *arg = NormNode::with_kind(kind::id::VAR, Some(field::id::ARG), span, Vec::new())
                 .with_label(Label::Raw(coll.into()));
         }
         return;
     }
     for c in &mut node.children {
-        retarget_iterator(c, _ivar, coll, span);
+        retarget_iterator(c, _ivar, coll, span, li);
     }
 }
 
 /// Replace every `coll[ivar]` in `node` with a bare `Var ivar` (keeping the field).
 fn replace_index(mut node: NormNode, ivar: &str, coll: &str) -> NormNode {
     if is_index(&node, ivar, coll) {
-        return NormNode::new(kind::VAR, node.field.as_deref(), node.span, Vec::new())
+        return NormNode::with_kind(kind::id::VAR, node.field, node.span, Vec::new())
             .with_label(Label::Raw(ivar.into()));
     }
     node.children = node
@@ -1114,16 +1202,18 @@ fn replace_index(mut node: NormNode, ivar: &str, coll: &str) -> NormNode {
 /// so order between them is immaterial. Detect-only (D-IR-12): one [`CounterIter`](Edit::CounterIter)
 /// edit per rewritten loop, so the block-level splice cannot happen without
 /// [`crate::ir::edit::apply`] recording the event.
-pub fn detect_counter_iter(node: &NormNode) -> Vec<Edit> {
+///
+/// Takes the REAL scan `LabelInterner` that built `node` — unlike the historical
+/// throwaway-preview functions elsewhere in this file, the counter-loop matcher now also
+/// READS existing `Label::External`/`LitKept` text (`len`/`range`, a kept `0`/`1` literal)
+/// off `node` itself (via [`label_name_is`]/[`is_lit`]), which requires `node`'s OWN
+/// interner — a fresh one has no entries for its ids (interning preamble rule 5).
+pub fn detect_counter_iter(node: &NormNode, li: &Arc<LabelInterner>) -> Vec<Edit> {
     let mut edits = Vec::new();
     // `node` is the whole unit tree; pass it as the `root` for the counter's function-scoped
     // liveness check (a counter used ANYWHERE outside the (init, loop) pair is live — oozy-rover
     // minor c). It stays constant through the recursion so a nested block still sees the whole unit.
-    // Throwaway interner (interning WP): this detector's rewritten preview tree is discarded —
-    // only `edits` survives into the real applier (`ir::edit::apply_counter_iter`, which uses
-    // the REAL per-scan interner) — see the interning preamble.
-    let scratch_interner = crate::intern::LabelInterner::new();
-    counter_iter_edits(node, node, &mut edits, &scratch_interner);
+    counter_iter_edits(node, node, &mut edits, li);
     edits
 }
 
@@ -1151,9 +1241,17 @@ fn counter_iter_edits(
 }
 
 /// Convenience over the seam (tests): disabled sink → identical tree. See [`abstract_idents`].
-pub fn rewrite_counter_iteration(node: NormNode) -> NormNode {
-    let edits = detect_counter_iter(&node);
-    crate::ir::edit::apply(node, &edits, &mut TransformLog::disabled())
+/// See [`rewrite_iteration`]'s doc for why the disabled sink must share the caller's `li`: the
+/// APPLY side re-detects each site via [`fold_counter_loops`], which reads existing
+/// `Label::LitKept`/`External` text (`counter_guard`/`is_lit`/`label_name_is`) off the SAME
+/// tree the detect side matched.
+pub fn rewrite_counter_iteration(node: NormNode, li: &Arc<LabelInterner>) -> NormNode {
+    let edits = detect_counter_iter(&node, li);
+    crate::ir::edit::apply(
+        node,
+        &edits,
+        &mut TransformLog::disabled_with(Arc::clone(li)),
+    )
 }
 
 /// One recognized counter loop: `(collection, index var, span)` — the [`CounterIter`](Edit::CounterIter)
@@ -1172,7 +1270,7 @@ pub(crate) fn fold_counter_loops(
     root: &NormNode,
     label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
 ) -> Vec<CounterMatch> {
-    if block.kind.as_ref() != kind::BLOCK {
+    if block.kind != kind::id::BLOCK {
         return Vec::new();
     }
     let children = std::mem::take(&mut block.children);
@@ -1181,7 +1279,7 @@ pub(crate) fn fold_counter_loops(
     let matched: Vec<Option<CounterMatch>> = (0..children.len())
         .map(|k| {
             (k + 1 < children.len())
-                .then(|| counter_loop_pair(&children, k, root))
+                .then(|| counter_loop_pair(&children, k, root, label_interner))
                 .flatten()
         })
         .collect();
@@ -1216,25 +1314,30 @@ pub(crate) fn fold_counter_loops(
 /// distinct. `root` is the whole unit tree, so the liveness scan is FUNCTION-scoped, not
 /// block-scoped: a Python counter read after the enclosing `if` block is still live (oozy-rover
 /// minor c) — a block-scoped scan misses it and would wrongly drop the live post-loop use.
-fn counter_loop_pair(children: &[NormNode], k: usize, root: &NormNode) -> Option<CounterMatch> {
+fn counter_loop_pair(
+    children: &[NormNode],
+    k: usize,
+    root: &NormNode,
+    li: &LabelInterner,
+) -> Option<CounterMatch> {
     let loop_node = &children[k + 1];
-    if loop_node.kind.as_ref() != kind::LOOP {
+    if loop_node.kind != kind::id::LOOP {
         return None;
     }
     let body = loop_node
         .children
         .iter()
-        .find(|c| c.field.as_deref() == Some("body"))?;
+        .find(|c| c.field == Some(field::id::BODY))?;
     if body.children.len() < 2 {
         return None;
     }
-    let (ivar, coll) = counter_guard(&body.children[0])?;
+    let (ivar, coll) = counter_guard(&body.children[0], li)?;
     // The unit increment `ivar = ivar + 1` may sit ANYWHERE in the body, not only last: a
     // read-then-advance loop puts it right after the element read (`x = coll[i]; i += 1; …`),
     // and it must still converge with a `for x in coll`. Require exactly one such increment
     // (a single stride site); its position is dropped by the rewrite.
-    let inc = increment_position_in(&body.children, &ivar)?;
-    if !counter_init(&children[k], &ivar) {
+    let inc = increment_position_in(&body.children, &ivar, li)?;
+    if !counter_init(&children[k], &ivar, li) {
         return None;
     }
     // Every use of `ivar` in the loop body (excluding the guard[0] and the increment) must be
@@ -1262,55 +1365,56 @@ fn counter_loop_pair(children: &[NormNode], k: usize, root: &NormNode) -> Option
 }
 
 /// A break-guard `Branch{ Arm{ !(ivar < len(coll)) → { Break } } }` → `(ivar, coll)`.
-fn counter_guard(branch: &NormNode) -> Option<(Box<str>, Box<str>)> {
-    if branch.kind.as_ref() != kind::BRANCH || branch.children.len() != 1 {
+fn counter_guard(branch: &NormNode, li: &LabelInterner) -> Option<(Box<str>, Box<str>)> {
+    static LT: LazyLock<Kind> = LazyLock::new(|| Kind::intern("<"));
+    if branch.kind != kind::id::BRANCH || branch.children.len() != 1 {
         return None;
     }
     let arm = &branch.children[0];
-    if arm.kind.as_ref() != kind::ARM {
+    if arm.kind != kind::id::ARM {
         return None;
     }
     // The arm body MUST be exactly a bare `break` — the loop-exit condition of a `for x in coll`.
     // A non-breaking guard (`if !(i < len) { log(); }`) is a different loop that keeps running;
     // matching it would let `rewrite_counter_loop` delete that body when it drops guard[0]
     // (oozy-rover b), so it must stay distinct.
-    if !arm_field(arm, "body").is_some_and(is_bare_break_body) {
+    if !arm_field(arm, field::id::BODY).is_some_and(is_bare_break_body) {
         return None;
     }
     let guard = arm
         .children
         .iter()
-        .find(|c| c.field.as_deref() == Some("guard"))?;
+        .find(|c| c.field == Some(field::id::GUARD))?;
     let (left, op, right) = binop_parts(not_operand(guard)?)?;
-    if op != "<" {
+    if op != *LT {
         return None;
     }
-    Some((raw_text(left)?, len_collection(right)?))
+    Some((raw_text(left)?, len_collection(right, li)?))
 }
 
 /// `body` is exactly a bare `Break` — either the `Break` node directly, or a `Block` whose sole
 /// statement is one. (`break_guard` lowers the guard to `Block{ Break }`.)
 fn is_bare_break_body(body: &NormNode) -> bool {
-    let stmts: &[NormNode] = if body.kind.as_ref() == kind::BLOCK {
+    let stmts: &[NormNode] = if body.kind == kind::id::BLOCK {
         &body.children
     } else {
         std::slice::from_ref(body)
     };
-    matches!(stmts, [b] if b.kind.as_ref() == kind::BREAK && b.children.is_empty())
+    matches!(stmts, [b] if b.kind == kind::id::BREAK && b.children.is_empty())
 }
 
 /// The collection of a `len` call, either Rust `coll.len()` or Go/Python `len(coll)`.
-fn len_collection(node: &NormNode) -> Option<Box<str>> {
-    len_call_collection(node).or_else(|| len_call_collection_py(node))
+fn len_collection(node: &NormNode, li: &LabelInterner) -> Option<Box<str>> {
+    len_call_collection(node, li).or_else(|| len_call_collection_py(node, li))
 }
 
 /// The index of the single unit increment `ivar = ivar + 1`, if there is exactly one (a lone
 /// stride site) among `stmts`; `None` for zero or several. The increment need not be last — a
 /// read-then-advance loop puts it right after the element read.
-fn increment_position_in(stmts: &[NormNode], ivar: &str) -> Option<usize> {
+fn increment_position_in(stmts: &[NormNode], ivar: &str, li: &LabelInterner) -> Option<usize> {
     let mut found = None;
     for (i, stmt) in stmts.iter().enumerate() {
-        if counter_increment(stmt, ivar) {
+        if counter_increment(stmt, ivar, li) {
             if found.is_some() {
                 return None; // more than one stride site — not a plain counter
             }
@@ -1321,37 +1425,39 @@ fn increment_position_in(stmts: &[NormNode], ivar: &str) -> Option<usize> {
 }
 
 /// `stmt` is the unit increment `ivar = ivar + 1` (`ivar` in any assign-target position).
-fn counter_increment(stmt: &NormNode, ivar: &str) -> bool {
-    if stmt.kind.as_ref() != kind::ASSIGN || stmt.children.len() != 2 {
+fn counter_increment(stmt: &NormNode, ivar: &str, li: &LabelInterner) -> bool {
+    static PLUS: LazyLock<Kind> = LazyLock::new(|| Kind::intern("+"));
+    if stmt.kind != kind::id::ASSIGN || stmt.children.len() != 2 {
         return false;
     }
     let Some((left, op, right)) = binop_parts(&stmt.children[1]) else {
         return false;
     };
     is_raw_ident(&stmt.children[0], ivar)
-        && op == "+"
+        && op == *PLUS
         && is_raw_ident(left, ivar)
-        && is_lit(right, "1")
+        && is_lit(right, "1", li)
 }
 
 /// `stmt` is the loop init `ivar = 0`.
-fn counter_init(stmt: &NormNode, ivar: &str) -> bool {
-    stmt.kind.as_ref() == kind::ASSIGN
+fn counter_init(stmt: &NormNode, ivar: &str, li: &LabelInterner) -> bool {
+    stmt.kind == kind::id::ASSIGN
         && stmt.children.len() == 2
         && is_raw_ident(&stmt.children[0], ivar)
-        && is_lit(&stmt.children[1], "0")
+        && is_lit(&stmt.children[1], "0", li)
 }
 
 /// A kept structural literal (`0`/`1`) with value `val` — the loop init/step constants.
-fn is_lit(node: &NormNode, val: &str) -> bool {
-    node.kind.as_ref() == kind::LIT
-        && matches!(&node.label, Some(Label::LitKept(t)) if t.as_ref() == val)
+/// `li` resolves the `LitKept` `LSym` (interned once per call — rule 5 of the interning
+/// preamble — not once per node compared).
+fn is_lit(node: &NormNode, val: &str, li: &LabelInterner) -> bool {
+    let target = li.intern(val);
+    node.kind == kind::id::LIT && matches!(&node.label, Some(Label::LitKept(t)) if *t == target)
 }
 
 /// Any `Raw` `Var` named `name` occurs anywhere in `node`.
 fn mentions_raw(node: &NormNode, name: &str) -> bool {
-    (node.kind.as_ref() == kind::VAR
-        && matches!(&node.label, Some(Label::Raw(t)) if t.as_ref() == name))
+    (node.kind == kind::id::VAR && matches!(&node.label, Some(Label::Raw(t)) if t.as_ref() == name))
         || node.children.iter().any(|c| mentions_raw(c, name))
 }
 
@@ -1359,7 +1465,7 @@ fn mentions_raw(node: &NormNode, name: &str) -> bool {
 /// the counter's function-scoped liveness check: total mentions in the unit vs. mentions inside
 /// the (init, loop) pair — any excess is a live use elsewhere).
 fn count_raw_mentions(node: &NormNode, name: &str) -> usize {
-    let here = (node.kind.as_ref() == kind::VAR
+    let here = (node.kind == kind::id::VAR
         && matches!(&node.label, Some(Label::Raw(t)) if t.as_ref() == name))
         as usize;
     here + node
@@ -1389,12 +1495,12 @@ pub(crate) fn rewrite_counter_loop(
     let Some(body) = loop_node
         .children
         .iter_mut()
-        .find(|c| c.field.as_deref() == Some("body"))
+        .find(|c| c.field == Some(field::id::BODY))
     else {
         return;
     };
     let old = std::mem::take(&mut body.children);
-    let inc = increment_position_in(&old, ivar); // the increment — dropped (any position)
+    let inc = increment_position_in(&old, ivar, label_interner); // the increment — dropped (any position)
     let target = NormNode::new(kind::VAR, Some("target"), span, Vec::new())
         .with_label(Label::Raw(ivar.into()));
     let mut new_body = Vec::with_capacity(old.len());
@@ -1472,7 +1578,7 @@ pub fn decompose_multi_assign(node: NormNode) -> NormNode {
 /// site, in block order — a firing child is exactly a detected site, so detector and applier
 /// stay in lockstep. A no-op on non-`Block` nodes.
 pub(crate) fn fold_multi_assign(block: &mut NormNode) -> Vec<NormNode> {
-    if block.kind.as_ref() != kind::BLOCK {
+    if block.kind != kind::id::BLOCK {
         return Vec::new();
     }
     let children = std::mem::take(&mut block.children);
@@ -1498,15 +1604,15 @@ pub(crate) fn fold_multi_assign(block: &mut NormNode) -> Vec<NormNode> {
 /// ANF territory, out of scope), or a non-simple target (`x[i]`, `x.y`) where the name-level
 /// read/write analysis would be unsound.
 pub(crate) fn decompose_parallel_assign(assign: &NormNode) -> Option<Vec<NormNode>> {
-    if assign.kind.as_ref() != kind::ASSIGN {
+    if assign.kind != kind::id::ASSIGN {
         return None;
     }
     let mut targets = Vec::new();
     let mut values = Vec::new();
     for c in &assign.children {
-        match c.field.as_deref() {
-            Some("place") | Some("target") => targets.push(c.clone()),
-            Some("value") => values.push(c.clone()),
+        match c.field {
+            Some(f) if f == field::id::PLACE || f == field::id::TARGET => targets.push(c.clone()),
+            Some(f) if f == field::id::VALUE => values.push(c.clone()),
             _ => return None, // an unexpected slot — not a plain parallel assign
         }
     }
@@ -1519,7 +1625,7 @@ pub(crate) fn decompose_parallel_assign(assign: &NormNode) -> Option<Vec<NormNod
     let mut names: Vec<Box<str>> = Vec::with_capacity(n);
     for t in &targets {
         match &t.label {
-            Some(Label::Raw(s)) if t.kind.as_ref() == kind::VAR && t.children.is_empty() => {
+            Some(Label::Raw(s)) if t.kind == kind::id::VAR && t.children.is_empty() => {
                 names.push(s.clone());
             }
             _ => return None,
@@ -1609,7 +1715,7 @@ fn sequentialize_parallel_assign(
 /// Collect every `Raw` `Var` name anywhere in `node` into `out` — the disjointness set the
 /// cycle-break temp minter avoids (so a synthesized `__mt{n}` never shadows a real name).
 fn collect_raw_names(node: &NormNode, out: &mut HashSet<Box<str>>) {
-    if node.kind.as_ref() == kind::VAR
+    if node.kind == kind::id::VAR
         && let Some(Label::Raw(t)) = &node.label
     {
         out.insert(t.clone());
@@ -1637,14 +1743,14 @@ fn temp_save(temp: &str, saved: &str, span: (u32, u32)) -> NormNode {
 
 /// `v` is a bare `Var` whose `Raw` name is `name` (a parallel-assign identity pair `a = a`).
 fn is_bare_var_named(v: &NormNode, name: &str) -> bool {
-    v.kind.as_ref() == kind::VAR
+    v.kind == kind::id::VAR
         && v.children.is_empty()
         && matches!(&v.label, Some(Label::Raw(t)) if t.as_ref() == name)
 }
 
 /// Rename every `Raw` `Var` named `from` to `to`, in place (the cycle-breaking substitution).
 fn substitute_raw(node: &mut NormNode, from: &str, to: &str) {
-    if node.kind.as_ref() == kind::VAR
+    if node.kind == kind::id::VAR
         && matches!(&node.label, Some(Label::Raw(t)) if t.as_ref() == from)
     {
         node.label = Some(Label::Raw(to.into()));
@@ -1688,23 +1794,27 @@ pub fn lower_tail_recursion(
         return body; // the lone self-call was not a tail site — not linear recursion
     }
     let span = rewritten.span;
-    rewritten.field = Some("body".into());
-    let loop_node = NormNode::new(kind::LOOP, None, span, vec![rewritten]);
+    rewritten.field = Some(field::id::BODY);
+    let loop_node = NormNode::with_kind(kind::id::LOOP, None, span, vec![rewritten]);
     log.record(TransformKind::RecursionLower, span, Witness::None);
-    NormNode::new(kind::BLOCK, Some("body"), span, vec![loop_node])
+    NormNode::with_kind(
+        kind::id::BLOCK,
+        Some(field::id::BODY),
+        span,
+        vec![loop_node],
+    )
 }
 
 fn is_raw_ident(node: &NormNode, name: &str) -> bool {
-    node.kind.as_ref() == kind::VAR
-        && matches!(&node.label, Some(Label::Raw(t)) if t.as_ref() == name)
+    node.kind == kind::id::VAR && matches!(&node.label, Some(Label::Raw(t)) if t.as_ref() == name)
 }
 
 fn is_self_call(node: &NormNode, name: &str) -> bool {
-    node.kind.as_ref() == kind::CALL
+    node.kind == kind::id::CALL
         && node
             .children
             .iter()
-            .find(|c| c.field.as_deref() == Some("callee"))
+            .find(|c| c.field == Some(field::id::CALLEE))
             .is_some_and(|c| is_raw_ident(c, name))
 }
 
@@ -1733,11 +1843,11 @@ fn rewrite_tail_sites(
     in_loop: bool,
     top_level: bool,
 ) {
-    if node.kind.as_ref() == kind::BLOCK {
+    if node.kind == kind::id::BLOCK {
         let last = node.children.len().wrapping_sub(1);
         let mut out = Vec::with_capacity(node.children.len());
         for (i, child) in std::mem::take(&mut node.children).into_iter().enumerate() {
-            let is_return_self = child.kind.as_ref() == kind::RETURN
+            let is_return_self = child.kind == kind::id::RETURN
                 && child.children.len() == 1
                 && is_self_call(&child.children[0], name);
             let is_tail_bare = is_self_call(&child, name) && top_level && !in_loop && i == last;
@@ -1764,7 +1874,7 @@ fn rewrite_tail_sites(
         // Crossing a `Loop` marks everything below it as in-loop, so a bare self-call inside a
         // loop body is never treated as a tail site (its synthesized `continue` would restart the
         // inner loop, not the recursion loop).
-        let deeper_in_loop = in_loop || node.kind.as_ref() == kind::LOOP;
+        let deeper_in_loop = in_loop || node.kind == kind::id::LOOP;
         for c in &mut node.children {
             rewrite_tail_sites(c, name, params, replaced, deeper_in_loop, false);
         }
@@ -1793,7 +1903,7 @@ fn reassign_stmts(
     let args: Vec<&NormNode> = call
         .children
         .iter()
-        .filter(|c| c.field.as_deref() == Some("arg"))
+        .filter(|c| c.field == Some(field::id::ARG))
         .collect();
     if args.len() != params.len() {
         return None; // arity mismatch — not a sound reassignment; refuse the site
@@ -1802,18 +1912,18 @@ fn reassign_stmts(
     let mut children: Vec<NormNode> = params
         .iter()
         .map(|p| {
-            NormNode::new(kind::VAR, Some("place"), span, Vec::new())
+            NormNode::with_kind(kind::id::VAR, Some(field::id::PLACE), span, Vec::new())
                 .with_label(Label::Raw(p.clone()))
         })
         .collect();
     for arg in args {
         let mut value = arg.clone();
-        value.field = Some("value".into());
+        value.field = Some(field::id::VALUE);
         children.push(value);
     }
     Some(vec![
-        NormNode::new(kind::ASSIGN, None, span, children),
-        NormNode::new(kind::CONTINUE, None, span, Vec::new()),
+        NormNode::with_kind(kind::id::ASSIGN, None, span, children),
+        NormNode::with_kind(kind::id::CONTINUE, None, span, Vec::new()),
     ])
 }
 
@@ -1824,17 +1934,29 @@ mod tests {
     use crate::ir::render::to_sexpr;
 
     fn abstracted(src: &str) -> String {
-        let (ir, _log) = lower_rust_source(src).expect("a function");
-        to_sexpr(&abstract_idents(ir))
+        let (ir, log) = lower_rust_source(src).expect("a function");
+        to_sexpr(
+            &abstract_idents(ir, log.label_interner()),
+            log.label_interner(),
+        )
     }
 
     #[test]
     fn one_pass_serves_both_languages() {
         // The SAME abstract_idents runs on Rust and Python IR: renamed params across
         // languages converge to the same canonical form — "one algorithm, all languages".
-        let (r, _) = lower_rust_source("fn add(a: i32) { return a + 1; }").unwrap();
-        let (p, _) = lower_python_source("def add(x):\n    return x + 1\n").unwrap();
-        assert_eq!(to_sexpr(&abstract_idents(r)), to_sexpr(&abstract_idents(p)));
+        let (r, rlog) = lower_rust_source("fn add(a: i32) { return a + 1; }").unwrap();
+        let (p, plog) = lower_python_source("def add(x):\n    return x + 1\n").unwrap();
+        assert_eq!(
+            to_sexpr(
+                &abstract_idents(r, rlog.label_interner()),
+                rlog.label_interner()
+            ),
+            to_sexpr(
+                &abstract_idents(p, plog.label_interner()),
+                plog.label_interner()
+            )
+        );
     }
 
     #[test]
@@ -1852,8 +1974,11 @@ mod tests {
     #[test]
     fn trailing_continue_is_stripped() {
         let strip = |src: &str| {
-            let (ir, _) = lower_rust_source(src).unwrap();
-            to_sexpr(&strip_dead(abstract_idents(ir)))
+            let (ir, log) = lower_rust_source(src).unwrap();
+            to_sexpr(
+                &strip_dead(abstract_idents(ir, log.label_interner())),
+                log.label_interner(),
+            )
         };
         assert_eq!(
             strip("fn a() { for x in xs { f(x); continue; } }"),
@@ -1861,17 +1986,24 @@ mod tests {
         );
     }
 
-    fn comm_sorted(ir: NormNode, log: &mut TransformLog) -> NormNode {
-        let tree = abstract_idents(ir);
-        let edits = detect_comm_sort(&tree);
+    fn comm_sorted(ir: NormNode, li: &Arc<LabelInterner>, log: &mut TransformLog) -> NormNode {
+        let tree = abstract_idents(ir, li);
+        let edits = detect_comm_sort(&tree, li);
         crate::ir::edit::apply(tree, &edits, log)
     }
 
     #[test]
     fn commutative_operands_converge() {
         let canon = |src: &str| {
-            let (ir, _) = lower_rust_source(src).unwrap();
-            to_sexpr(&comm_sorted(ir, &mut TransformLog::disabled()))
+            let (ir, log) = lower_rust_source(src).unwrap();
+            to_sexpr(
+                &comm_sorted(
+                    ir,
+                    log.label_interner(),
+                    &mut TransformLog::disabled_with(Arc::clone(log.label_interner())),
+                ),
+                log.label_interner(),
+            )
         };
         // `a + b` and `b + a` sort to the same canonical order.
         assert_eq!(
@@ -1884,13 +2016,13 @@ mod tests {
     fn comm_sort_records_the_original_order() {
         // D-IR-12/D-IR-9: reordering `b + a` → `a + b` emits a CommSort event whose
         // witness records the ORIGINAL operand order, so the sort stays reversible.
-        let (ir, _) = lower_rust_source("fn f() { return b + a; }").unwrap();
-        let mut log = TransformLog::new();
-        let sorted = comm_sorted(ir, &mut log);
+        let (ir, src_log) = lower_rust_source("fn f() { return b + a; }").unwrap();
+        let mut log = TransformLog::new_with(Arc::clone(src_log.label_interner()));
+        let sorted = comm_sorted(ir, src_log.label_interner(), &mut log);
         assert!(
-            to_sexpr(&sorted).contains("(Var@left a)"),
+            to_sexpr(&sorted, src_log.label_interner()).contains("(Var@left a)"),
             "operands should converge to sorted order: {}",
-            to_sexpr(&sorted)
+            to_sexpr(&sorted, src_log.label_interner())
         );
         let ev = log
             .events()
@@ -1910,19 +2042,18 @@ mod tests {
         // NO edit — a fabricated no-op reorder would break detect idempotence on a
         // canonical tree. With no edit, `apply` is a total no-op, so the fingerprint
         // (span-excluded s-expression) is byte-identical before and after.
-        let (ir, _) = lower_rust_source("fn f() { return a + b; }").unwrap();
-        let tree = abstract_idents(ir);
-        let edits = detect_comm_sort(&tree);
+        let (ir, log) = lower_rust_source("fn f() { return a + b; }").unwrap();
+        let tree = abstract_idents(ir, log.label_interner());
+        let edits = detect_comm_sort(&tree, log.label_interner());
         assert!(
             edits.is_empty(),
             "an already-sorted commutative chain must emit no CommSort edit"
         );
-        let before = to_sexpr(&tree);
-        let after = to_sexpr(&crate::ir::edit::apply(
-            tree,
-            &edits,
-            &mut TransformLog::disabled(),
-        ));
+        let before = to_sexpr(&tree, log.label_interner());
+        let after = to_sexpr(
+            &crate::ir::edit::apply(tree, &edits, &mut TransformLog::disabled()),
+            log.label_interner(),
+        );
         assert_eq!(
             before, after,
             "the no-op comm-sort must not change the tree"
@@ -1933,10 +2064,14 @@ mod tests {
     fn comm_sort_is_idempotent() {
         // Sorting `b + a` yields a canonical tree; re-running the detector on that
         // output must emit no further edit (the fix's motivating idempotence property).
-        let (ir, _) = lower_rust_source("fn f() { return b + a; }").unwrap();
-        let sorted = comm_sorted(ir, &mut TransformLog::disabled());
+        let (ir, log) = lower_rust_source("fn f() { return b + a; }").unwrap();
+        let sorted = comm_sorted(
+            ir,
+            log.label_interner(),
+            &mut TransformLog::disabled_with(Arc::clone(log.label_interner())),
+        );
         assert!(
-            detect_comm_sort(&sorted).is_empty(),
+            detect_comm_sort(&sorted, log.label_interner()).is_empty(),
             "comm-sort must be idempotent on its own canonical output"
         );
     }
@@ -1945,8 +2080,14 @@ mod tests {
     fn rust_index_loop_converges_with_foreach() {
         // `for i in 0..xs.len() { g(xs[i]) }` ≡ `for x in xs { g(x) }`.
         let canon = |src: &str| {
-            let (ir, _) = lower_rust_source(src).unwrap();
-            to_sexpr(&abstract_idents(rewrite_iteration(ir)))
+            let (ir, log) = lower_rust_source(src).unwrap();
+            to_sexpr(
+                &abstract_idents(
+                    rewrite_iteration(ir, log.label_interner()),
+                    log.label_interner(),
+                ),
+                log.label_interner(),
+            )
         };
         assert_eq!(
             canon("fn f(xs: &[i32]) { for i in 0..xs.len() { g(xs[i]); } }"),
@@ -1957,8 +2098,14 @@ mod tests {
     #[test]
     fn python_index_loop_converges_with_foreach() {
         let canon = |src: &str| {
-            let (ir, _) = lower_python_source(src).unwrap();
-            to_sexpr(&abstract_idents(rewrite_iteration(ir)))
+            let (ir, log) = lower_python_source(src).unwrap();
+            to_sexpr(
+                &abstract_idents(
+                    rewrite_iteration(ir, log.label_interner()),
+                    log.label_interner(),
+                ),
+                log.label_interner(),
+            )
         };
         assert_eq!(
             canon("def f(xs):\n    for i in range(len(xs)):\n        g(xs[i])\n"),
@@ -1969,9 +2116,15 @@ mod tests {
     #[test]
     fn index_loop_using_the_index_directly_is_not_rewritten() {
         // `h(i)` uses the index for its own sake → must NOT collapse to a foreach.
-        let (ir, _) =
+        let (ir, log) =
             lower_rust_source("fn f(xs: &[i32]) { for i in 0..xs.len() { h(i); } }").unwrap();
-        let s = to_sexpr(&abstract_idents(rewrite_iteration(ir)));
+        let s = to_sexpr(
+            &abstract_idents(
+                rewrite_iteration(ir, log.label_interner()),
+                log.label_interner(),
+            ),
+            log.label_interner(),
+        );
         // The range iterator survives (still `__has_next` over the range, not over xs).
         assert!(s.contains("(..@op)"), "index loop wrongly rewritten: {s}");
     }
@@ -1982,21 +2135,37 @@ mod tests {
         // range form (`for i in 0..xs.len()`) produces — so `let mut i = 0; while i < xs.len()
         // { g(xs[i]); i += 1; }` ≡ `for i in 0..xs.len() { g(xs[i]); }` ≡ `for x in xs { g(x); }`.
         let counter = {
-            let (ir, _) = lower_rust_source(
+            let (ir, log) = lower_rust_source(
                 "fn f(xs: &[i32]) { let mut i = 0; while i < xs.len() { g(xs[i]); i += 1; } }",
             )
             .unwrap();
-            to_sexpr(&abstract_idents(rewrite_counter_iteration(ir)))
+            to_sexpr(
+                &abstract_idents(
+                    rewrite_counter_iteration(ir, log.label_interner()),
+                    log.label_interner(),
+                ),
+                log.label_interner(),
+            )
         };
         let range = {
-            let (ir, _) =
+            let (ir, log) =
                 lower_rust_source("fn f(xs: &[i32]) { for i in 0..xs.len() { g(xs[i]); } }")
                     .unwrap();
-            to_sexpr(&abstract_idents(rewrite_iteration(ir)))
+            to_sexpr(
+                &abstract_idents(
+                    rewrite_iteration(ir, log.label_interner()),
+                    log.label_interner(),
+                ),
+                log.label_interner(),
+            )
         };
         let foreach = {
-            let (ir, _) = lower_rust_source("fn f(xs: &[i32]) { for x in xs { g(x); } }").unwrap();
-            to_sexpr(&abstract_idents(ir))
+            let (ir, log) =
+                lower_rust_source("fn f(xs: &[i32]) { for x in xs { g(x); } }").unwrap();
+            to_sexpr(
+                &abstract_idents(ir, log.label_interner()),
+                log.label_interner(),
+            )
         };
         assert_eq!(
             counter, range,
@@ -2011,11 +2180,17 @@ mod tests {
     #[test]
     fn counter_loop_using_the_index_directly_is_not_rewritten() {
         // `h(i)` uses the index for its own sake → the counter loop must NOT collapse.
-        let (ir, _) = lower_rust_source(
+        let (ir, log) = lower_rust_source(
             "fn f(xs: &[i32]) { let mut i = 0; while i < xs.len() { h(i); i += 1; } }",
         )
         .unwrap();
-        let s = to_sexpr(&abstract_idents(rewrite_counter_iteration(ir)));
+        let s = to_sexpr(
+            &abstract_idents(
+                rewrite_counter_iteration(ir, log.label_interner()),
+                log.label_interner(),
+            ),
+            log.label_interner(),
+        );
         assert!(
             !s.contains("__has_next"),
             "counter loop wrongly rewritten: {s}"
@@ -2027,14 +2202,18 @@ mod tests {
         // The counter rewrite records an `IterProtocol` event (shared vocabulary with the range
         // form — the same canonicalization), whose note witness carries the original `coll[ivar]`
         // index form so the block-level splice stays reversible for display (D-IR-9/D-IR-12).
-        let (ir, _) = lower_rust_source(
+        let (ir, src_log) = lower_rust_source(
             "fn f(xs: &[i32]) { let mut i = 0; while i < xs.len() { g(xs[i]); i += 1; } }",
         )
         .unwrap();
-        let mut log = TransformLog::new();
-        let edits = detect_counter_iter(&ir);
+        // Share `src_log`'s interner (the one that built `ir`) with a fresh event log — a
+        // brand-new `TransformLog::new()` would mint its OWN, unrelated interner, and `apply`'s
+        // internals would panic trying to resolve `ir`'s labels through it (interning preamble
+        // rule 5).
+        let mut log = TransformLog::new_with(Arc::clone(src_log.label_interner()));
+        let edits = detect_counter_iter(&ir, log.label_interner());
         let out = crate::ir::edit::apply(ir, &edits, &mut log);
-        let s = to_sexpr(&out);
+        let s = to_sexpr(&out, log.label_interner());
         assert!(
             s.contains("__has_next") && s.contains("__next"),
             "counter loop not rewritten: {s}"
@@ -2055,8 +2234,11 @@ mod tests {
     fn loop_exit_folds_break_then_return_into_return_at_break() {
         // `loop { if c { break } s() } return E` ≡ `loop { if c { return E } s() }`.
         let fold = |src: &str| {
-            let (ir, _) = lower_rust_source(src).unwrap();
-            to_sexpr(&abstract_idents(normalize_loop_exit(ir)))
+            let (ir, log) = lower_rust_source(src).unwrap();
+            to_sexpr(
+                &abstract_idents(normalize_loop_exit(ir), log.label_interner()),
+                log.label_interner(),
+            )
         };
         let with_break = fold("fn f(a: i32) -> i32 { loop { if c() { break; } g(); } return a; }");
         let with_return = fold("fn h(a: i32) -> i32 { loop { if c() { return a; } g(); } }");
@@ -2076,7 +2258,7 @@ mod tests {
     }
 
     fn bool_normalized(ir: NormNode, log: &mut TransformLog) -> NormNode {
-        let tree = abstract_idents(ir);
+        let tree = abstract_idents(ir, log.label_interner());
         let edits = detect_boolean_normalize(&tree);
         crate::ir::edit::apply(tree, &edits, log)
     }
@@ -2086,10 +2268,10 @@ mod tests {
         // D-IR-9 reversal round-trip: orienting `b > a` → `a < b` emits a CmpOrient event
         // whose `Order([1,0])` witness records the operand swap, so the orientation is
         // recoverable for display (the same discipline as `comm_sort_records_the_original_order`).
-        let (ir, _) = lower_rust_source("fn f() -> bool { b > a }").unwrap();
-        let mut log = TransformLog::new();
+        let (ir, src_log) = lower_rust_source("fn f() -> bool { b > a }").unwrap();
+        let mut log = TransformLog::new_with(Arc::clone(src_log.label_interner()));
         let oriented = bool_normalized(ir, &mut log);
-        let s = to_sexpr(&oriented);
+        let s = to_sexpr(&oriented, log.label_interner());
         assert!(s.contains("(<@op)"), "`>` not oriented to `<`: {s}");
         assert!(!s.contains("(>@op)"), "a stray `>` survived: {s}");
         let ev = log
@@ -2109,10 +2291,10 @@ mod tests {
         // `!(a < b)` reduces in two recorded steps: NotPush (invert `<`→`>=`, witness None —
         // reversal re-wraps the `!`) then CmpOrient (orient `>=`→`<=`). The event pair is what
         // makes the reduction reversible for display (D-IR-9).
-        let (ir, _) = lower_rust_source("fn f() -> bool { !(a < b) }").unwrap();
-        let mut log = TransformLog::new();
+        let (ir, src_log) = lower_rust_source("fn f() -> bool { !(a < b) }").unwrap();
+        let mut log = TransformLog::new_with(Arc::clone(src_log.label_interner()));
         let out = bool_normalized(ir, &mut log);
-        let s = to_sexpr(&out);
+        let s = to_sexpr(&out, log.label_interner());
         assert!(!s.contains("(Unop"), "the `!` was not pushed away: {s}");
         assert!(s.contains("(<=@op)"), "did not settle at `<=`: {s}");
         let kinds: Vec<_> = log.events().iter().map(|e| e.kind).collect();
@@ -2137,14 +2319,14 @@ mod tests {
         // The nested-if merge emits a GuardMerge event keyed to the outer branch, whose
         // depth witness lets reversal re-nest the guards (D-IR-9). The fold cannot happen
         // silently — a merged tree implies a recorded event (the CQRS write-side guarantee).
-        let (ir, _) = lower_rust_source("fn f() { if a { if b { g(); } } }").unwrap();
-        let mut log = TransformLog::new();
+        let (ir, src_log) = lower_rust_source("fn f() { if a { if b { g(); } } }").unwrap();
+        let mut log = TransformLog::new_with(Arc::clone(src_log.label_interner()));
         let merged = crate::ir::edit::apply(
             ir.clone(),
             &detect_guard_canonicalize(&ir, Lang::Rust),
             &mut log,
         );
-        let s = to_sexpr(&merged);
+        let s = to_sexpr(&merged, log.label_interner());
         assert!(s.contains("(&&@op)"), "guards not merged into `&&`: {s}");
         assert_eq!(
             s.matches("Branch").count(),
@@ -2164,16 +2346,16 @@ mod tests {
         // Dropping a redundant else emits a DeadElse event keyed to the enclosing block, whose
         // witness is the hoisted else-body — enough to re-wrap it as the else arm on reversal
         // (D-IR-9). The block-level rebuild cannot happen without the recorded event.
-        let (ir, _) =
+        let (ir, src_log) =
             lower_rust_source("fn f(c: bool) -> i32 { if c { return 1; } else { g(); } h() }")
                 .unwrap();
-        let mut log = TransformLog::new();
+        let mut log = TransformLog::new_with(Arc::clone(src_log.label_interner()));
         let out = crate::ir::edit::apply(
             ir.clone(),
             &detect_guard_canonicalize(&ir, Lang::Rust),
             &mut log,
         );
-        let s = to_sexpr(&out);
+        let s = to_sexpr(&out, log.label_interner());
         // One arm left on the branch (the else is gone) and `g()` now sits as a sibling.
         assert_eq!(s.matches("(Arm").count(), 1, "else arm not dropped: {s}");
         let ev = log
@@ -2221,16 +2403,22 @@ mod tests {
         // `x, y = x+1, y*2` has no cross-dependency → NO temp → byte-identical to the two
         // adjacent single assigns (the "identifiable as two adjacent assigns" requirement).
         let parallel = {
-            let (ir, _) =
+            let (ir, log) =
                 lower_python_source("def f(x, y):\n    x, y = x + 1, y * 2\n    return x\n")
                     .unwrap();
-            to_sexpr(&abstract_idents(decompose_multi_assign(ir)))
+            to_sexpr(
+                &abstract_idents(decompose_multi_assign(ir), log.label_interner()),
+                log.label_interner(),
+            )
         };
         let adjacent = {
-            let (ir, _) =
+            let (ir, log) =
                 lower_python_source("def f(x, y):\n    x = x + 1\n    y = y * 2\n    return x\n")
                     .unwrap();
-            to_sexpr(&abstract_idents(ir))
+            to_sexpr(
+                &abstract_idents(ir, log.label_interner()),
+                log.label_interner(),
+            )
         };
         assert_eq!(
             parallel, adjacent,
@@ -2244,9 +2432,12 @@ mod tests {
     fn coupled_multi_assign_inserts_one_cycle_breaking_temp() {
         // The gcd swap `a, b = b, a%b` is a read-after-write cycle → exactly ONE temp:
         // `t = a; a = b; b = t%b` (t is the third positional local, v2).
-        let (ir, _) =
+        let (ir, log) =
             lower_python_source("def f(a, b):\n    a, b = b, a % b\n    return a\n").unwrap();
-        let s = to_sexpr(&abstract_idents(decompose_multi_assign(ir)));
+        let s = to_sexpr(
+            &abstract_idents(decompose_multi_assign(ir), log.label_interner()),
+            log.label_interner(),
+        );
         assert_eq!(
             s.matches("(Assign").count(),
             3,
@@ -2271,10 +2462,10 @@ mod tests {
         // Discrimination at the pass level: two adjacent single assigns are NOT a parallel
         // multi-assign — the decomposition must not fire (so `a=b; b=a%b` stays distinct from
         // the temped parallel form).
-        let (ir, _) =
+        let (ir, log) =
             lower_python_source("def f(a, b):\n    a = b\n    b = a % b\n    return a\n").unwrap();
-        let before = to_sexpr(&ir);
-        let after = to_sexpr(&decompose_multi_assign(ir));
+        let before = to_sexpr(&ir, log.label_interner());
+        let after = to_sexpr(&decompose_multi_assign(ir), log.label_interner());
         assert_eq!(before, after, "single assigns must be untouched: {after}");
     }
 
@@ -2283,13 +2474,15 @@ mod tests {
         // D-IR-9/D-IR-12 reversal round-trip: decomposing a parallel assign records a
         // `MultiAssign` event whose witness is the ORIGINAL multi-assign — enough to restore it
         // for display. The block-level splice cannot happen without the recorded event.
-        let (ir, _) =
+        let (ir, src_log) =
             lower_python_source("def f(a, b):\n    a, b = b, a % b\n    return a\n").unwrap();
-        let mut log = TransformLog::new();
+        let mut log = TransformLog::new_with(Arc::clone(src_log.label_interner()));
         let edits = detect_multi_assign(&ir);
         let out = crate::ir::edit::apply(ir, &edits, &mut log);
         assert_eq!(
-            to_sexpr(&out).matches("(Assign").count(),
+            to_sexpr(&out, log.label_interner())
+                .matches("(Assign")
+                .count(),
             3,
             "not decomposed"
         );

@@ -6,23 +6,28 @@ use reprise::config::Config;
 use reprise::lang::Lang;
 use reprise::tree::{Label, NormNode};
 
-fn serialize(node: &NormNode, out: &mut Vec<String>) {
+fn serialize(node: &NormNode, out: &mut Vec<String>, li: &reprise::intern::LabelInterner) {
+    // Resolved TEXT is what's compared across the two streams below (each built from
+    // its own, independently-scoped `units_from_source` call) — safe: interning-id-
+    // conversion WP's `LSym` ids are only meaningful within one interner, but the
+    // RESOLVED strings baked in here are ordinary content, comparable regardless of
+    // which interner produced them.
     let label = match &node.label {
         None => String::new(),
-        Some(Label::External(s)) => format!("E{s}"),
+        Some(Label::External(s)) => format!("E{}", li.resolve(*s)),
         Some(Label::Local(_)) => "L".to_string(),
-        Some(Label::LitKept(s)) => format!("K{s}"),
+        Some(Label::LitKept(s)) => format!("K{}", li.resolve(*s)),
         Some(Label::LitBucket(b)) => format!("B{}", b.name()),
         Some(Label::Raw(s)) | Some(Label::RawLit(s)) => format!("R{s}"),
     };
     out.push(format!(
         "{}/{}/{}",
         node.kind,
-        node.field.as_deref().unwrap_or(""),
+        node.field.map(|f| f.as_str()).unwrap_or(""),
         label
     ));
     for child in &node.children {
-        serialize(child, out);
+        serialize(child, out, li);
     }
 }
 
@@ -33,13 +38,15 @@ fn main() {
     for (i, path) in args.iter().take(2).enumerate() {
         let src = std::fs::read_to_string(path).unwrap();
         let lang = Lang::from_path(std::path::Path::new(path)).unwrap();
-        let units = reprise::unit::units_from_source(&src, lang, &cfg);
+        let label_interner = reprise::intern::LabelInterner::new();
+        let units =
+            reprise::unit::units_from_source_with_interner(&src, lang, &cfg, &label_interner);
         let unit = match args.get(2 + i) {
             Some(name) => units.iter().find(|u| &u.name == name).unwrap(),
             None => &units[0],
         };
         let mut toks = Vec::new();
-        serialize(unit.tree.expect_resident(), &mut toks);
+        serialize(unit.tree.expect_resident(), &mut toks, &label_interner);
         eprintln!("{}: unit {} with {} tokens", path, unit.name, toks.len());
         streams.push(toks);
     }

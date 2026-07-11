@@ -22,6 +22,18 @@ exclude = [
 [dependencies]
 anyhow = "1.0.103"
 bincode = "1.3"
+# interning-resolve-fix WP (session stark-mixed-front): backs the id-indexed `reverse`
+# tables in `src/intern.rs` (`IdInterner`'s Kind/Field table, `LabelInterner`'s per-scan
+# table). Resolution is id -> string, and ids are assigned densely from 0 by each
+# table's own intern() (push index == id, asserted at push time) — a `DashMap<id,
+# string>` was doing a hash + lock per resolve on the fingerprint-hashing hot path
+# (`fingerprint.rs::push_label`, walked over ~every node during near-tier retrieval),
+# which is exactly the class of regression this WP exists to kill. `boxcar::Vec` is a
+# lock-free, append-only, indexable vec purpose-built for this shape: `push` never
+# blocks a concurrent `get`, and `get(index)` is a direct indexed load, no hash, no
+# lock. Not hand-rolled (this project's policy) and not `RwLock<Vec>` (a global read
+# lock per node under rayon's parallel matching is the very contention being removed).
+boxcar = "0.2.14"
 clap = { version = "4.6.1", features = ["derive"] }
 # Interning WP (session stark-mixed-front): backs the per-scan `LabelInterner`
 # (src/intern.rs). A hand-rolled single `RwLock<HashMap<..>>` was measured to cause

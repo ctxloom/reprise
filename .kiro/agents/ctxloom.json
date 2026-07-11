@@ -1,0 +1,27 @@
+{
+  "description": "ctxloom-managed agent (context via steering, MCP via settings/mcp.json).",
+  "hooks": {
+    "agentSpawn": [
+      {
+        "command": "ctxloom hook session-bind"
+      }
+    ],
+    "postToolUse": [
+      {
+        "command": "ctxloom hook stamp-plan",
+        "matcher": "fs_write"
+      }
+    ],
+    "preToolUse": [
+      {
+        "command": "ltk evaluate",
+        "matcher": "Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit"
+      }
+    ]
+  },
+  "includeMcpJson": true,
+  "name": "ctxloom",
+  "resources": [
+    "skill://.kiro/skills/**/SKILL.md"
+  ]
+}

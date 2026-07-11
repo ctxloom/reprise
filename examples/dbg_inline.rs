@@ -33,9 +33,9 @@ fn main() {
         units.extend(f.units);
         raws.extend(f.raw_trees);
     }
-    let table = reprise::inline::DefTable::build(&units, &raws, &cfg);
+    let table = reprise::inline::DefTable::build(&units, &raws, &cfg, &label_interner);
     for i in 0..units.len() {
-        let exp = reprise::inline::expand_unit(i, &raws[i], &units, &table, &cfg);
+        let exp = reprise::inline::expand_unit(i, &raws[i], &units, &table, &cfg, &label_interner);
         println!(
             "unit {i} {} tokens={} fp={:032x} inlined={} chain={:?}",
             units[i].name, units[i].token_count, units[i].fingerprint, exp.calls_inlined, exp.chain

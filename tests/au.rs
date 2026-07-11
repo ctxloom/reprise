@@ -22,8 +22,15 @@ const B: &str = "def g(a, b, c, d, e, f, x, y):\n    r = a + b + x * y\n    s = 
 #[test]
 fn two_commutative_chains_anti_unify_is_sound_and_stable() {
     let cfg = Config::default();
-    let ua = reprise::units_from_source(A, Lang::Python, &cfg).remove(0);
-    let ub = reprise::units_from_source(B, Lang::Python, &cfg).remove(0);
+    // Interning-id-conversion WP: `ua`/`ub` must be interned into the SAME
+    // `LabelInterner` — `anti_unify` below compares their `Label`s directly (not
+    // just opaque fingerprints), and an `LSym` id is only meaningful relative to
+    // the interner that minted it.
+    let label_interner = reprise::intern::LabelInterner::new();
+    let ua = reprise::unit::units_from_source_with_interner(A, Lang::Python, &cfg, &label_interner)
+        .remove(0);
+    let ub = reprise::unit::units_from_source_with_interner(B, Lang::Python, &cfg, &label_interner)
+        .remove(0);
     let ir = cfg.normalize.normalizer == Normalizer::Ir
         && reprise::frontend::has_ir_frontend(Lang::Python);
     // A profile is required only on the historical path; the IR path passes `None`.
@@ -43,6 +50,7 @@ fn two_commutative_chains_anti_unify_is_sound_and_stable() {
             ub.tree.expect_resident(),
             profile,
             ir,
+            &label_interner,
         );
 
         let mut holes: Vec<(u32, u32)> = o.holes.iter().map(|h| (h.tokens_a, h.tokens_b)).collect();

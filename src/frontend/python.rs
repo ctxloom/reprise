@@ -576,7 +576,7 @@ mod tests {
     use super::lower_python_source;
     use crate::frontend::lower_rust_source;
     use crate::ir::render::to_sexpr;
-    use crate::ir::transform::TransformKind;
+    use crate::ir::transform::{TransformKind, TransformLog};
 
     #[test]
     fn dispatch_table_is_a_consistent_single_source_of_truth() {
@@ -595,8 +595,11 @@ mod tests {
     }
 
     fn abs(src: &str) -> String {
-        let (ir, _) = lower_python_source(src).unwrap();
-        to_sexpr(&crate::ir::abstract_idents(ir))
+        let (ir, log) = lower_python_source(src).unwrap();
+        to_sexpr(
+            &crate::ir::abstract_idents(ir, log.label_interner()),
+            log.label_interner(),
+        )
     }
 
     #[test]
@@ -667,9 +670,9 @@ mod tests {
         // The `native` gap fix: `a, b = b, a % b` now lowers to a canonical multi-target `Assign`
         // (self-referential → `@place` mutations), NOT a `NativeStmt` tuple pattern — so it flows
         // through the shared parallel-assign decomposition (byte-identical to Go's multi-`=`).
-        let (ir, _) =
+        let (ir, log) =
             lower_python_source("def f(a, b):\n    a, b = b, a % b\n    return a\n").unwrap();
-        let s = to_sexpr(&ir);
+        let s = to_sexpr(&ir, log.label_interner());
         assert!(!s.contains("Native"), "tuple assign still native: {s}");
         assert!(
             s.contains("(Assign (Var@place a) (Var@place b) (Var@value b) (Binop@value (Var@left a) (%@op) (Var@right b)))"),
@@ -717,14 +720,17 @@ mod tests {
     fn value_match_converges_with_the_equivalent_if_chain() {
         // §14: `match a: case 1/case 2/case _` ≡ `if a==1 / elif a==2 / else`.
         let canon = |src: &str| {
-            let (ir, _) = lower_python_source(src).unwrap();
-            let tree = crate::ir::abstract_idents(ir);
-            let edits = crate::ir::detect_comm_sort(&tree);
-            to_sexpr(&crate::ir::apply(
-                tree,
-                &edits,
-                &mut crate::ir::TransformLog::disabled(),
-            ))
+            let (ir, log) = lower_python_source(src).unwrap();
+            let tree = crate::ir::abstract_idents(ir, log.label_interner());
+            let edits = crate::ir::detect_comm_sort(&tree, log.label_interner());
+            to_sexpr(
+                &crate::ir::apply(
+                    tree,
+                    &edits,
+                    &mut crate::ir::TransformLog::disabled_with(log.label_interner().clone()),
+                ),
+                log.label_interner(),
+            )
         };
         assert_eq!(
             canon(
@@ -768,17 +774,22 @@ mod tests {
     fn python_lowers_the_core_subset() {
         let (ir, _log) = lower_python_source("def add(a):\n    return a + 5\n").unwrap();
         assert_eq!(
-            to_sexpr(&ir),
+            to_sexpr(&ir, _log.label_interner()),
             "(Unit (Var@param a) (Block@body (Return (Binop@value (Var@left a) (+@op) (Lit@right INT)))))"
         );
     }
 
     #[test]
     fn field_access_converges_and_names_stay_external() {
-        let abs = |ir| to_sexpr(&crate::ir::abstract_idents(ir));
-        let (r, _) = lower_rust_source("fn f(b: i32) { return a.b; }").unwrap();
-        let (p, _) = lower_python_source("def f(b):\n    return a.b\n").unwrap();
-        let (rs, ps) = (abs(r), abs(p));
+        let abs = |ir, log: &TransformLog| {
+            to_sexpr(
+                &crate::ir::abstract_idents(ir, log.label_interner()),
+                log.label_interner(),
+            )
+        };
+        let (r, rlog) = lower_rust_source("fn f(b: i32) { return a.b; }").unwrap();
+        let (p, plog) = lower_python_source("def f(b):\n    return a.b\n").unwrap();
+        let (rs, ps) = (abs(r, &rlog), abs(p, &plog));
         assert_eq!(rs, ps);
         // field name `b` stays External even though a local `b` (the param) exists.
         assert!(rs.contains("(Var@name b)"), "{rs}");
@@ -786,25 +797,36 @@ mod tests {
 
     #[test]
     fn index_access_converges() {
-        let abs = |ir| to_sexpr(&crate::ir::abstract_idents(ir));
-        let (r, _) = lower_rust_source("fn f() { return xs[i]; }").unwrap();
-        let (p, _) = lower_python_source("def f():\n    return xs[i]\n").unwrap();
-        assert_eq!(abs(r), abs(p));
+        let abs = |ir, log: &TransformLog| {
+            to_sexpr(
+                &crate::ir::abstract_idents(ir, log.label_interner()),
+                log.label_interner(),
+            )
+        };
+        let (r, rlog) = lower_rust_source("fn f() { return xs[i]; }").unwrap();
+        let (p, plog) = lower_python_source("def f():\n    return xs[i]\n").unwrap();
+        assert_eq!(abs(r, &rlog), abs(p, &plog));
     }
 
     #[test]
     fn python_pass_is_dropped() {
-        let (ir, _) = lower_python_source("def f():\n    pass\n").unwrap();
-        assert_eq!(to_sexpr(&ir), "(Unit (Block@body))");
+        let (ir, log) = lower_python_source("def f():\n    pass\n").unwrap();
+        assert_eq!(to_sexpr(&ir, log.label_interner()), "(Unit (Block@body))");
     }
 
     #[test]
     fn rust_and_python_for_loops_converge() {
         // Both `for` forms lower through the shared has_next/next iterated Loop.
-        let (r, _) = lower_rust_source("fn f() { for x in xs { g(x); } }").unwrap();
-        let (p, _) = lower_python_source("def f():\n    for x in xs:\n        g(x)\n").unwrap();
-        let rs = to_sexpr(&crate::ir::abstract_idents(r));
-        let ps = to_sexpr(&crate::ir::abstract_idents(p));
+        let (r, rlog) = lower_rust_source("fn f() { for x in xs { g(x); } }").unwrap();
+        let (p, plog) = lower_python_source("def f():\n    for x in xs:\n        g(x)\n").unwrap();
+        let rs = to_sexpr(
+            &crate::ir::abstract_idents(r, rlog.label_interner()),
+            rlog.label_interner(),
+        );
+        let ps = to_sexpr(
+            &crate::ir::abstract_idents(p, plog.label_interner()),
+            plog.label_interner(),
+        );
         assert_eq!(rs, ps);
         assert!(
             rs.contains("__has_next") && rs.contains("__next") && rs.contains("v0"),
@@ -817,8 +839,11 @@ mod tests {
         // The SAME shared break-guard synthesis + loop lowering drives both languages —
         // the frontends agree on the canonical form (they are partitioned in production
         // per §3, but the shared vocabulary is the whole point).
-        let (r, _) = lower_rust_source("fn w() { while c() { s(); } }").unwrap();
-        let (p, _) = lower_python_source("def w():\n    while c():\n        s()\n").unwrap();
-        assert_eq!(to_sexpr(&r), to_sexpr(&p));
+        let (r, rlog) = lower_rust_source("fn w() { while c() { s(); } }").unwrap();
+        let (p, plog) = lower_python_source("def w():\n    while c():\n        s()\n").unwrap();
+        assert_eq!(
+            to_sexpr(&r, rlog.label_interner()),
+            to_sexpr(&p, plog.label_interner())
+        );
     }
 }

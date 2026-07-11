@@ -161,7 +161,7 @@ pub fn corpus_units(root: &Path, config: &Config) -> anyhow::Result<CorpusUnits>
                                 &label_interner,
                             );
                             if config.cache.enabled {
-                                cache::store(cache_root, key, &extracted);
+                                cache::store(cache_root, key, &extracted, &label_interner);
                             }
                             FileOutcome::Units(extracted, digest, line_count, false)
                         }
@@ -225,6 +225,7 @@ pub fn corpus_units(root: &Path, config: &Config) -> anyhow::Result<CorpusUnits>
                     u.lang,
                     config,
                     u.variant.is_none(),
+                    &label_interner,
                 )
             })
             .collect()
@@ -332,13 +333,23 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
         // The tree decoder re-interns labels through THIS scan's interner
         // (post-interning, `NormNode` deserializes only via the wire path).
         let tree_lru_bytes = (gate.budget_bytes / 8).clamp(64 << 20, 1 << 30);
-        let li = std::sync::Arc::clone(&label_interner);
+        let li_encode = std::sync::Arc::clone(&label_interner);
+        let li_decode = std::sync::Arc::clone(&label_interner);
         Some(ScanPacks {
-            trees: pack::Pack::with_decoder(tree_lru_bytes, 16, &pack_dir, move |bytes| {
-                let wire: tree::NormNodeWire =
-                    bincode::deserialize(bytes).expect("pack tree decodes");
-                wire.into_real(&li)
-            })
+            trees: pack::Pack::with_codec(
+                tree_lru_bytes,
+                16,
+                &pack_dir,
+                move |node: &tree::NormNode| {
+                    let wire = node.to_wire(&li_encode);
+                    bincode::serialize(&wire).expect("pack tree serializes")
+                },
+                move |bytes| {
+                    let wire: tree::NormNodeWire =
+                        bincode::deserialize(bytes).expect("pack tree decodes");
+                    wire.into_real(&li_decode)
+                },
+            )
             .map_err(|e| {
                 anyhow::anyhow!("creating scan tree pack under {}: {e}", pack_dir.display())
             })?,
@@ -381,11 +392,11 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
 
     // ---- P5: best-effort inliner (spec §5.4) — variants appended, tagged ----
     if config.inline.enabled {
-        let table = inline::DefTable::build(&units, &raw_trees, config);
+        let table = inline::DefTable::build(&units, &raw_trees, config, &label_interner);
         stats.scc_units = table.scc_unit_count();
         let expansions: Vec<inline::Expansion> = (0..plain_count)
             .into_par_iter()
-            .map(|i| inline::expand_unit(i, &raw_trees[i], &units, &table, config))
+            .map(|i| inline::expand_unit(i, &raw_trees[i], &units, &table, config, &label_interner))
             .collect();
 
         /// Per-unit result of the tail below: `finish_variant` is a full
@@ -456,7 +467,13 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
                 // care where a tree came from: plain and variant, one mechanism).
                 // Under the gate: no digest, no spill — zero new work (P2).
                 let vd = packs.is_some().then(|| {
-                    digest::compute(variant.tree.expect_resident(), variant.lang, config, false)
+                    digest::compute(
+                        variant.tree.expect_resident(),
+                        variant.lang,
+                        config,
+                        false,
+                        &label_interner,
+                    )
                 });
                 if let Some(p) = &packs
                     && let unit::TreeSlot::Resident(t) = &variant.tree
@@ -512,9 +529,11 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
 
     // ---- exact tier (P7 bucketing; plain) + inline-assisted exact matches ----
     let digests_opt = gate.over.then_some(digests.as_slice());
-    let (exact, below_floor) = group::build_exact_groups(&units, digests_opt, config);
+    let (exact, below_floor) =
+        group::build_exact_groups(&units, digests_opt, config, &label_interner);
     stats.units_below_floor = below_floor;
-    let inline_exact = group::build_inline_exact_groups(&units, digests_opt, config);
+    let inline_exact =
+        group::build_inline_exact_groups(&units, digests_opt, config, &label_interner);
 
     let pair_key = |set: &mut HashSet<(usize, usize)>, indices: &[usize]| {
         for i in 0..indices.len() {
@@ -545,6 +564,7 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
         &mut stats.retrieval,
         &exact_pairs,
         packs.as_ref().map(|p| &p.trees),
+        &label_interner,
     );
     phase("near", &mut stats, Instant::now());
 
@@ -605,7 +625,7 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
                 Vec::new()
             } else {
                 part.par_iter()
-                    .map(|&i| stream::unit_stream(units[i].tree.expect_resident()))
+                    .map(|&i| stream::unit_stream(units[i].tree.expect_resident(), &label_interner))
                     .collect()
             };
             let handles: Vec<Option<std::sync::Arc<digest::SeqStream>>> = if gate.over {
@@ -720,6 +740,7 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
         config,
         &api_excluded,
         &mut stats.api_signatures,
+        &label_interner,
     );
     phase("api", &mut stats, Instant::now());
 

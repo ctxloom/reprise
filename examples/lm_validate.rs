@@ -18,6 +18,7 @@ use rayon::prelude::*;
 use reprise::au;
 use reprise::config::{Config, Normalizer};
 use reprise::fingerprint::{self, HashMode, Subtree};
+use reprise::intern::LabelInterner;
 use reprise::lang::Lang;
 use reprise::seq;
 use reprise::stream;
@@ -67,6 +68,10 @@ fn main() {
     cfg.cache.enabled = false; // no .reprise/ litter
 
     // ---- collect units across all roots, exactly as the pipeline extracts plain units ----
+    // ONE shared interner for the whole run: every unit lands in this single `units` vec and
+    // gets cross-compared within its lang partition (subtree_inventory/unit_stream/anti_unify),
+    // so their `Label::External`/`LitKept` LSyms must all resolve against the same interner.
+    let label_interner = reprise::intern::LabelInterner::new();
     let mut units: Vec<Unit> = Vec::new();
     for root in &roots {
         let files = reprise::walk::collect_files(root, &cfg).expect("collect_files");
@@ -77,7 +82,8 @@ fn main() {
             if reprise::walk::is_generated(&src, &cfg) {
                 continue;
             }
-            let (fus, _rep) = unit::extract_file_units(&path, &src, lang, &cfg);
+            let (fus, _rep) =
+                unit::extract_file_units_with_interner(&path, &src, lang, &cfg, &label_interner);
             units.extend(fus);
         }
     }
@@ -122,6 +128,7 @@ fn main() {
                     units[idx].tree.expect_resident(),
                     3,
                     HashMode::MaskedLocals,
+                    &label_interner,
                 );
                 let mut flat: Vec<(u128, u32)> = inv.iter().map(|s| (s.hash, s.offset)).collect();
                 flat.sort_unstable();
@@ -216,7 +223,7 @@ fn main() {
         // derive them with the same production serializer.
         let unit_streams: Vec<Vec<(u64, (u32, u32))>> = eligible
             .iter()
-            .map(|&i| stream::unit_stream(units[i].tree.expect_resident()))
+            .map(|&i| stream::unit_stream(units[i].tree.expect_resident(), &label_interner))
             .collect();
         let streams: Vec<&[(u64, (u32, u32))]> = unit_streams.iter().map(Vec::as_slice).collect();
         let corpus = stream::build_corpus(&streams);
@@ -271,7 +278,16 @@ fn main() {
                     df_sum as f64 / shared.len() as f64
                 };
                 let (ua, ub) = (a.unit_idx, b.unit_idx);
-                let verdict = verify(&units_ref[ua], &units_ref[ub], a, b, profile, ir, cfg_ref);
+                let verdict = verify(
+                    &units_ref[ua],
+                    &units_ref[ub],
+                    a,
+                    b,
+                    profile,
+                    ir,
+                    cfg_ref,
+                    &label_interner,
+                );
                 let region = pair_region.get(&(i.min(j), i.max(j)));
                 let (has_region, region_frag_df) = match region {
                     Some(&(_len, fp)) => (true, frag_units[&fp].len() as u32),
@@ -487,6 +503,7 @@ fn main() {
 }
 
 /// Faithful copy of matchtree.rs::size_gate_passes + offset_histogram_passes + acceptance.
+#[allow(clippy::too_many_arguments)]
 fn verify(
     ua: &Unit,
     ub: &Unit,
@@ -495,6 +512,7 @@ fn verify(
     profile: &'static dyn reprise::lang::LanguageProfile,
     ir: bool,
     cfg: &Config,
+    li: &LabelInterner,
 ) -> Verdict {
     if !size_gate_passes(ua.token_count, ub.token_count, cfg) {
         return Verdict::SizeRej;
@@ -507,6 +525,7 @@ fn verify(
         ub.tree.expect_resident(),
         (!ir).then_some(profile),
         ir,
+        li,
     );
     if outcome.divergence > cfg.thresholds.max_divergence {
         return Verdict::DivRej;

@@ -9,9 +9,16 @@
 //! would already have consumed.
 
 use crate::config::Config;
+use crate::intern::{Field, Kind};
 use crate::lang::{Lang, LanguageProfile};
 use crate::tree::{Bucket, Label, NormNode};
 use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
+
+static PASS_STATEMENT: LazyLock<Kind> = LazyLock::new(|| Kind::intern("pass_statement"));
+static ELSE_CLAUSE: LazyLock<Kind> = LazyLock::new(|| Kind::intern("else_clause"));
+static BLOCK_LOWER: LazyLock<Kind> = LazyLock::new(|| Kind::intern("block"));
+static BODY_FIELD: LazyLock<Field> = LazyLock::new(|| Field::intern("body"));
 
 /// CST-recursion depth cap for extraction — the untrusted-input DoS guard, shared by all
 /// three recursive descents of the parsed CST: the two unit-*finders* ([`collect_units`] and
@@ -214,7 +221,7 @@ fn convert(
                 // Splice-through wrappers (Go `statement_list`): hoist the
                 // wrapper's children into this node so blocks hold statements
                 // directly, matching the Rust/Python shape the passes expect.
-                if profile.splice_kind(&converted.kind) {
+                if profile.splice_kind(converted.kind) {
                     children.extend(converted.children);
                 } else {
                     children.push(converted);
@@ -245,7 +252,7 @@ pub fn apply_passes(
     let tree = profile.normalize_loop_exit(tree);
     let tree = abstract_idents(tree, profile, label_interner);
     let tree = abstract_literals(tree, profile, cfg, label_interner);
-    let tree = canonicalize_order(tree, profile, None);
+    let tree = canonicalize_order(tree, profile, label_interner, None);
     remove_dead(tree, profile)
 }
 
@@ -265,30 +272,29 @@ pub fn apply_passes(
 fn canonicalize_order(
     mut node: NormNode,
     profile: &dyn LanguageProfile,
-    parent_chain: Option<(&str, &str)>,
+    li: &crate::intern::LabelInterner,
+    parent_chain: Option<(Kind, Kind)>,
 ) -> NormNode {
     // Is THIS node a flatten-able commutative chain node, and what is its operator? The op is
     // a childless, label-less leaf at the operator position (index 1 of a len-3 binary node),
     // unaffected by canonicalizing the operands — so this is stable whether computed before or
     // after the child recursion. We compute it before, to thread the chain context down the
-    // spine. Cloning the kind decouples the tuple's lifetime from `node` (whose `children` are
-    // moved out just below) — `Kind` is `Copy` (interned id), so this is now a plain copy, not
-    // a heap-cloning `Box<str>`.
-    let this_kind: crate::intern::Kind = node.kind;
-    let this_op: Option<crate::intern::Kind> =
-        if profile.binary_fields(&node.kind).is_some() && node.children.len() == 3 {
+    // spine. `Kind` is `Copy` (interned id), so this is a plain copy, not a heap-cloning `Box<str>`.
+    let this_kind: Kind = node.kind;
+    let this_op: Option<Kind> =
+        if profile.binary_fields(node.kind).is_some() && node.children.len() == 3 {
             node.children
                 .iter()
                 .find(|c| {
                     c.children.is_empty()
                         && c.label.is_none()
-                        && profile.commutative_ops().contains(&c.kind.as_ref())
+                        && profile.commutative_ops().contains(&c.kind.as_str())
                 })
                 .map(|c| c.kind)
         } else {
             None
         };
-    let this_chain: Option<(&str, &str)> = this_op.as_deref().map(|op| (this_kind.as_ref(), op));
+    let this_chain: Option<(Kind, Kind)> = this_op.map(|op| (this_kind, op));
 
     // Canonicalize children bottom-up. The left operand (index 0) inherits this node's chain
     // context so a same-kind/op child recognizes itself as an inner spine node and skips its
@@ -298,7 +304,7 @@ fn canonicalize_order(
         .children
         .into_iter()
         .enumerate()
-        .map(|(i, c)| canonicalize_order(c, profile, if i == 0 { this_chain } else { None }))
+        .map(|(i, c)| canonicalize_order(c, profile, li, if i == 0 { this_chain } else { None }))
         .collect();
 
     // An inner spine node is the index-0 child of a parent chain of its exact (kind, op) —
@@ -307,18 +313,13 @@ fn canonicalize_order(
     let is_inner_spine = parent_chain.is_some() && parent_chain == this_chain;
 
     if !is_inner_spine
-        && let Some((lf, of, rf)) = profile.binary_fields(&node.kind)
-        && let Some(op) = this_op.as_deref()
+        && let Some((lf, of, rf)) = profile.binary_fields(node.kind)
+        && let Some(op) = this_op
     {
         let mut operands = Vec::new();
-        flatten_chain(&node, &node.kind, op, &mut operands);
+        flatten_chain(&node, node.kind, op, &mut operands);
         if operands.len() >= 2 {
-            let op_node = node
-                .children
-                .iter()
-                .find(|c| c.kind.as_ref() == op)
-                .unwrap()
-                .clone();
+            let op_node = node.children.iter().find(|c| c.kind == op).unwrap().clone();
             // Masked hash first (stable when local indices shift — the D2
             // cascade), exact hash as tie-break (so `a*b` vs `b*a` still
             // sorts consistently). `sort_by_cached_key` computes each element's
@@ -326,21 +327,25 @@ fn canonicalize_order(
             // same sort result, no recomputation.
             operands.sort_by_cached_key(|o| {
                 (
-                    crate::fingerprint::merkle_mode(o, crate::fingerprint::HashMode::MaskedLocals),
-                    crate::fingerprint::merkle(o),
+                    crate::fingerprint::merkle_mode(
+                        o,
+                        crate::fingerprint::HashMode::MaskedLocals,
+                        li,
+                    ),
+                    crate::fingerprint::merkle(o, li),
                 )
             });
             let field = node.field;
             let span = node.span;
             let kind = node.kind;
             let mut acc = operands.remove(0);
-            acc.field = lf.map(Into::into);
+            acc.field = lf;
             for mut next in operands {
-                next.field = rf.map(Into::into);
+                next.field = rf;
                 let mut op_clone = op_node.clone();
-                op_clone.field = of.map(Into::into);
-                let mut merged = NormNode::new(&kind, None, span, vec![acc, op_clone, next]);
-                merged.children[0].field = lf.map(Into::into);
+                op_clone.field = of;
+                let mut merged = NormNode::with_kind(kind, None, span, vec![acc, op_clone, next]);
+                merged.children[0].field = lf;
                 acc = merged;
             }
             acc.field = field;
@@ -348,16 +353,16 @@ fn canonicalize_order(
         }
     }
 
-    if let Some(key_field) = profile.sortable_pair_kind(&node.kind)
+    if let Some(key_field) = profile.sortable_pair_kind(node.kind)
         && node.children.len() >= 2
         && node
             .children
             .iter()
-            .all(|c| crate::lang::child_field(c, key_field).is_some())
+            .all(|c| crate::lang::child_field_id(c, key_field).is_some())
     {
         node.children.sort_by_key(|pair| {
-            crate::lang::child_field(pair, key_field)
-                .map(crate::fingerprint::merkle)
+            crate::lang::child_field_id(pair, key_field)
+                .map(|n| crate::fingerprint::merkle(n, li))
                 .unwrap_or(0)
         });
     }
@@ -365,11 +370,8 @@ fn canonicalize_order(
 }
 
 /// Collect operands of a same-kind, same-operator chain (left-assoc parses).
-fn flatten_chain(node: &NormNode, kind: &str, op: &str, out: &mut Vec<NormNode>) {
-    if node.kind.as_ref() == kind
-        && node.children.len() == 3
-        && node.children[1].kind.as_ref() == op
-    {
+fn flatten_chain(node: &NormNode, kind: Kind, op: Kind, out: &mut Vec<NormNode>) {
+    if node.kind == kind && node.children.len() == 3 && node.children[1].kind == op {
         flatten_chain(&node.children[0], kind, op, out);
         let mut rhs = node.children[2].clone();
         rhs.field = None;
@@ -399,15 +401,15 @@ fn abstract_idents(
 
     fn walk(
         node: &mut NormNode,
-        parent_kind: &str,
+        parent_kind: Kind,
         profile: &dyn LanguageProfile,
         declared: &HashSet<Box<str>>,
         order: &mut HashMap<Box<str>, u32>,
         label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
     ) {
         if let Some(Label::Raw(text)) = node.label.clone() {
-            let field = node.field.as_deref();
-            let label = if profile.always_external(&node.kind, field, parent_kind) {
+            let field = node.field;
+            let label = if profile.always_external(node.kind, field, parent_kind) {
                 Label::External(label_interner.intern(&text))
             } else if declared.contains(&text) {
                 let next = order.len() as u32;
@@ -419,12 +421,16 @@ fn abstract_idents(
         }
         let kind = node.kind;
         for child in &mut node.children {
-            walk(child, &kind, profile, declared, order, label_interner);
+            walk(child, kind, profile, declared, order, label_interner);
         }
     }
+    // Sentinel "no parent" kind at the root — mirrors `inline.rs`'s `substitute` root
+    // call (both feed `LanguageProfile::always_external`'s `parent_kind`); no real
+    // grammar/IR kind is ever the empty string, so it never collides.
+    static EMPTY_KIND: LazyLock<Kind> = LazyLock::new(|| Kind::intern(""));
     walk(
         &mut root,
-        "",
+        *EMPTY_KIND,
         profile,
         &declared,
         &mut order,
@@ -448,7 +454,9 @@ fn abstract_literals(
         label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
     ) {
         if let Some(Label::RawLit(text)) = node.label.clone() {
-            let bucket = profile.literal_bucket(&node.kind).unwrap_or(Bucket::Str);
+            let bucket = profile
+                .literal_bucket(node.kind.as_str())
+                .unwrap_or(Bucket::Str);
             let key = match bucket {
                 Bucket::Str | Bucket::Char => inner_text(&text),
                 _ => text.trim().to_string(),
@@ -496,18 +504,16 @@ fn remove_dead(mut node: NormNode, profile: &dyn LanguageProfile) -> NormNode {
         .into_iter()
         .filter_map(|child| {
             let child = remove_dead(child, profile);
-            match child.kind.as_ref() {
-                "pass_statement" => None,
-                "else_clause" if is_structurally_empty(&child) => None,
-                _ => Some(child),
-            }
+            let dead = child.kind == *PASS_STATEMENT
+                || (child.kind == *ELSE_CLAUSE && is_structurally_empty(&child));
+            if dead { None } else { Some(child) }
         })
         .collect();
     if profile.is_loop_core(&node)
         && let Some(body) = node
             .children
             .iter_mut()
-            .find(|c| c.field.as_deref() == Some("body"))
+            .find(|c| c.field == Some(*BODY_FIELD))
     {
         while body
             .children
@@ -523,5 +529,5 @@ fn remove_dead(mut node: NormNode, profile: &dyn LanguageProfile) -> NormNode {
 fn is_structurally_empty(node: &NormNode) -> bool {
     node.label.is_none()
         && (node.children.is_empty() || node.children.iter().all(is_structurally_empty))
-        && matches!(node.kind.as_ref(), "block" | "else_clause")
+        && (node.kind == *BLOCK_LOWER || node.kind == *ELSE_CLAUSE)
 }

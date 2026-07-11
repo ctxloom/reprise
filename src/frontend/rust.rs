@@ -346,8 +346,8 @@ fn lower_let_rust(
 ) -> NormNode {
     let mut assign = lower_assign(fe, node, field, span, ("pattern", "value", true), src, log);
     if let Some(target) = assign.children.first_mut()
-        && target.field.as_deref() == Some("target")
-        && target.kind.as_ref() != kind::VAR
+        && target.field == Some(crate::ir::field::id::TARGET)
+        && target.kind != kind::id::VAR
     {
         bind_pattern_idents(target);
     }
@@ -575,8 +575,11 @@ mod tests {
     }
 
     fn abs(src: &str) -> String {
-        let (ir, _) = rust(src);
-        to_sexpr(&crate::ir::abstract_idents(ir))
+        let (ir, log) = rust(src);
+        to_sexpr(
+            &crate::ir::abstract_idents(ir, log.label_interner()),
+            log.label_interner(),
+        )
     }
 
     #[test]
@@ -645,14 +648,17 @@ mod tests {
     }
 
     fn canon(src: &str) -> String {
-        let (ir, _) = rust(src);
-        let tree = crate::ir::abstract_idents(ir);
-        let edits = crate::ir::detect_comm_sort(&tree);
-        to_sexpr(&crate::ir::apply(
-            tree,
-            &edits,
-            &mut crate::ir::TransformLog::disabled(),
-        ))
+        let (ir, log) = rust(src);
+        let tree = crate::ir::abstract_idents(ir, log.label_interner());
+        let edits = crate::ir::detect_comm_sort(&tree, log.label_interner());
+        to_sexpr(
+            &crate::ir::apply(
+                tree,
+                &edits,
+                &mut crate::ir::TransformLog::disabled_with(log.label_interner().clone()),
+            ),
+            log.label_interner(),
+        )
     }
 
     #[test]
@@ -662,8 +668,11 @@ mod tests {
         // no left operand). So `..b` (open start) must stay DISTINCT from `b..` (open end) and from
         // a bounded `a..b`. The old "flip on first named child" mislabelled `..b`'s end as `@left`.
         let fp = |src: &str| {
-            let (ir, _) = rust(src);
-            crate::fingerprint::merkle(&crate::ir::abstract_idents(ir))
+            let (ir, log) = rust(src);
+            crate::fingerprint::merkle(
+                &crate::ir::abstract_idents(ir, log.label_interner()),
+                log.label_interner(),
+            )
         };
         let end = abs("fn f(b: i32) { let z = ..b; }");
         assert!(
@@ -779,7 +788,7 @@ mod tests {
     fn lowers_core_subset_and_records_paren_drop() {
         let (ir, log) = rust("fn f(x: i32) { return (g(x)); }");
         assert_eq!(
-            to_sexpr(&ir),
+            to_sexpr(&ir, log.label_interner()),
             "(Unit (Var@param x) (Block@body (Return (Call@value (Var@callee g) (Var@arg x)))))"
         );
         assert!(
@@ -792,7 +801,7 @@ mod tests {
     #[test]
     fn tail_recursion_becomes_a_loop() {
         let (ir, log) = rust("fn go(n: i32) { if n == 0 { return; } go(n - 1); }");
-        let s = to_sexpr(&ir);
+        let s = to_sexpr(&ir, log.label_interner());
         assert!(s.contains("(Loop"), "no loop: {s}");
         assert!(s.contains("Continue"), "no continue: {s}");
         assert!(
@@ -806,7 +815,7 @@ mod tests {
     fn tree_recursion_does_not_lower() {
         // Two self-calls, neither a tail site → must NOT become a loop.
         let (ir, log) = rust("fn fib(n: i32) { return fib(n - 1) + fib(n - 2); }");
-        assert!(!to_sexpr(&ir).contains("(Loop"));
+        assert!(!to_sexpr(&ir, log.label_interner()).contains("(Loop"));
         assert!(
             !log.events()
                 .iter()
@@ -818,7 +827,10 @@ mod tests {
     fn while_and_loop_converge_with_differing_logs() {
         let (while_ir, while_log) = rust("fn w() { while c() { s(); } }");
         let (loop_ir, loop_log) = rust("fn l() { loop { if !c() { break; } s(); } }");
-        assert_eq!(to_sexpr(&while_ir), to_sexpr(&loop_ir));
+        assert_eq!(
+            to_sexpr(&while_ir, while_log.label_interner()),
+            to_sexpr(&loop_ir, loop_log.label_interner())
+        );
         assert!(
             while_log
                 .events()
@@ -832,7 +844,10 @@ mod tests {
     fn literals_bucket_for_matching_but_the_value_is_detected_via_witness() {
         let (ir1, log1) = rust("fn f() { x(5); }");
         let (ir2, log2) = rust("fn g() { x(7); }");
-        assert_eq!(to_sexpr(&ir1), to_sexpr(&ir2));
+        assert_eq!(
+            to_sexpr(&ir1, log1.label_interner()),
+            to_sexpr(&ir2, log2.label_interner())
+        );
         let value = |log: &TransformLog| {
             log.events().iter().find_map(|e| match &e.witness {
                 Witness::Literal(t) => Some(t.to_string()),

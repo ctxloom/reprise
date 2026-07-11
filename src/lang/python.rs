@@ -4,8 +4,79 @@ use super::{
     LanguageProfile, child_field, collect_pattern_idents, count_self_calls, is_raw_ident,
     path_is_testy, raw_name, synth_call, synth_ident,
 };
+use crate::intern::{Field, Kind};
 use crate::tree::{Bucket, Label, NormNode};
 use std::path::Path;
+use std::sync::LazyLock;
+
+// ---- file-local interned kind/field statics (interning-id-conversion WP) ----
+//
+// None of these are the canonical IR vocabulary (`crate::ir::kind`/`crate::ir::field`)
+// — this file is the HISTORICAL Python grammar profile, entirely in tree-sitter's own
+// node-kind/field-name space, so every literal below gets its own `LazyLock`
+// (mechanism rule 2), even where a literal happens to share text with a pre-registered
+// IR const (e.g. `"left"`/`"body"`/`"name"`): `Kind`/`Field::intern` is idempotent, so
+// these resolve to the same id as any IR usage, but this file has no business reaching
+// into `ir::kind::id`/`ir::field::id` for a grammar-native meaning it doesn't share.
+
+// -- kinds --
+static FUNCTION_DEFINITION: LazyLock<Kind> = LazyLock::new(|| Kind::intern("function_definition"));
+static IDENTIFIER: LazyLock<Kind> = LazyLock::new(|| Kind::intern("identifier"));
+static KEYWORD_ARGUMENT: LazyLock<Kind> = LazyLock::new(|| Kind::intern("keyword_argument"));
+static BINARY_OPERATOR: LazyLock<Kind> = LazyLock::new(|| Kind::intern("binary_operator"));
+static BOOLEAN_OPERATOR: LazyLock<Kind> = LazyLock::new(|| Kind::intern("boolean_operator"));
+static COMPARISON_OPERATOR: LazyLock<Kind> = LazyLock::new(|| Kind::intern("comparison_operator"));
+static DICTIONARY: LazyLock<Kind> = LazyLock::new(|| Kind::intern("dictionary"));
+static BLOCK: LazyLock<Kind> = LazyLock::new(|| Kind::intern("block"));
+static ARGUMENT_LIST: LazyLock<Kind> = LazyLock::new(|| Kind::intern("argument_list"));
+static PARAMETERS: LazyLock<Kind> = LazyLock::new(|| Kind::intern("parameters"));
+static PATTERN_LIST: LazyLock<Kind> = LazyLock::new(|| Kind::intern("pattern_list"));
+static EXPRESSION_LIST: LazyLock<Kind> = LazyLock::new(|| Kind::intern("expression_list"));
+static LIST: LazyLock<Kind> = LazyLock::new(|| Kind::intern("list"));
+static TUPLE: LazyLock<Kind> = LazyLock::new(|| Kind::intern("tuple"));
+static SET: LazyLock<Kind> = LazyLock::new(|| Kind::intern("set"));
+static REPEAT: LazyLock<Kind> = LazyLock::new(|| Kind::intern("REPEAT"));
+static CASE_CLAUSE: LazyLock<Kind> = LazyLock::new(|| Kind::intern("case_clause"));
+static EXPRESSION_STATEMENT: LazyLock<Kind> =
+    LazyLock::new(|| Kind::intern("expression_statement"));
+static IF_STATEMENT: LazyLock<Kind> = LazyLock::new(|| Kind::intern("if_statement"));
+static WHILE_STATEMENT: LazyLock<Kind> = LazyLock::new(|| Kind::intern("while_statement"));
+static FOR_STATEMENT: LazyLock<Kind> = LazyLock::new(|| Kind::intern("for_statement"));
+static RETURN_STATEMENT: LazyLock<Kind> = LazyLock::new(|| Kind::intern("return_statement"));
+static TRY_STATEMENT: LazyLock<Kind> = LazyLock::new(|| Kind::intern("try_statement"));
+static WITH_STATEMENT: LazyLock<Kind> = LazyLock::new(|| Kind::intern("with_statement"));
+static BREAK_STATEMENT: LazyLock<Kind> = LazyLock::new(|| Kind::intern("break_statement"));
+static CONTINUE_STATEMENT: LazyLock<Kind> = LazyLock::new(|| Kind::intern("continue_statement"));
+static ASSERT_STATEMENT: LazyLock<Kind> = LazyLock::new(|| Kind::intern("assert_statement"));
+static RAISE_STATEMENT: LazyLock<Kind> = LazyLock::new(|| Kind::intern("raise_statement"));
+static PASS_STATEMENT: LazyLock<Kind> = LazyLock::new(|| Kind::intern("pass_statement"));
+static DELETE_STATEMENT: LazyLock<Kind> = LazyLock::new(|| Kind::intern("delete_statement"));
+static TRUE_KIND: LazyLock<Kind> = LazyLock::new(|| Kind::intern("true"));
+static CALL: LazyLock<Kind> = LazyLock::new(|| Kind::intern("call"));
+static GLOBAL_STATEMENT: LazyLock<Kind> = LazyLock::new(|| Kind::intern("global_statement"));
+static NONLOCAL_STATEMENT: LazyLock<Kind> = LazyLock::new(|| Kind::intern("nonlocal_statement"));
+static LAMBDA_PARAMETERS: LazyLock<Kind> = LazyLock::new(|| Kind::intern("lambda_parameters"));
+static AUGMENTED_ASSIGNMENT: LazyLock<Kind> =
+    LazyLock::new(|| Kind::intern("augmented_assignment"));
+static FOR_IN_CLAUSE: LazyLock<Kind> = LazyLock::new(|| Kind::intern("for_in_clause"));
+static NAMED_EXPRESSION: LazyLock<Kind> = LazyLock::new(|| Kind::intern("named_expression"));
+static AS_PATTERN_TARGET: LazyLock<Kind> = LazyLock::new(|| Kind::intern("as_pattern_target"));
+static ASSIGNMENT: LazyLock<Kind> = LazyLock::new(|| Kind::intern("assignment"));
+static LAMBDA: LazyLock<Kind> = LazyLock::new(|| Kind::intern("lambda"));
+static SUBSCRIPT: LazyLock<Kind> = LazyLock::new(|| Kind::intern("subscript"));
+
+// -- fields --
+static ATTRIBUTE: LazyLock<Field> = LazyLock::new(|| Field::intern("attribute"));
+static NAME_FIELD: LazyLock<Field> = LazyLock::new(|| Field::intern("name"));
+static LEFT_FIELD: LazyLock<Field> = LazyLock::new(|| Field::intern("left"));
+static RIGHT_FIELD: LazyLock<Field> = LazyLock::new(|| Field::intern("right"));
+static OPERATOR_FIELD: LazyLock<Field> = LazyLock::new(|| Field::intern("operator"));
+static OPERATORS_FIELD: LazyLock<Field> = LazyLock::new(|| Field::intern("operators"));
+static KEY_FIELD: LazyLock<Field> = LazyLock::new(|| Field::intern("key"));
+static CONDITION_FIELD: LazyLock<Field> = LazyLock::new(|| Field::intern("condition"));
+static BODY_FIELD: LazyLock<Field> = LazyLock::new(|| Field::intern("body"));
+static TYPE_FIELD: LazyLock<Field> = LazyLock::new(|| Field::intern("type"));
+static VALUE_FIELD: LazyLock<Field> = LazyLock::new(|| Field::intern("value"));
 
 pub struct PythonProfile;
 
@@ -53,8 +124,9 @@ impl LanguageProfile for PythonProfile {
         )
     }
 
-    fn always_external(&self, _kind: &str, field: Option<&str>, parent_kind: &str) -> bool {
-        field == Some("attribute") || (parent_kind == "keyword_argument" && field == Some("name"))
+    fn always_external(&self, _kind: Kind, field: Option<Field>, parent_kind: Kind) -> bool {
+        field == Some(*ATTRIBUTE)
+            || (parent_kind == *KEYWORD_ARGUMENT && field == Some(*NAME_FIELD))
     }
 
     fn collect_declared(&self, root: &NormNode, out: &mut Vec<Box<str>>) {
@@ -64,15 +136,21 @@ impl LanguageProfile for PythonProfile {
             }
         }
         fn walk(node: &NormNode, out: &mut Vec<Box<str>>) {
-            match node.kind.as_ref() {
-                "global_statement" | "nonlocal_statement" => return,
-                "function_definition" => push_field(node, "name", out),
-                "parameters" | "lambda_parameters" => collect_param_idents(node, out),
-                "assignment" | "augmented_assignment" | "for_statement" | "for_in_clause" => {
+            match node.kind {
+                k if k == *GLOBAL_STATEMENT || k == *NONLOCAL_STATEMENT => return,
+                k if k == *FUNCTION_DEFINITION => push_field(node, "name", out),
+                k if k == *PARAMETERS || k == *LAMBDA_PARAMETERS => {
+                    collect_param_idents(node, out);
+                }
+                k if k == *ASSIGNMENT
+                    || k == *AUGMENTED_ASSIGNMENT
+                    || k == *FOR_STATEMENT
+                    || k == *FOR_IN_CLAUSE =>
+                {
                     push_field(node, "left", out);
                 }
-                "named_expression" => push_field(node, "name", out),
-                "as_pattern_target" => collect_pattern_idents(node, out),
+                k if k == *NAMED_EXPRESSION => push_field(node, "name", out),
+                k if k == *AS_PATTERN_TARGET => collect_pattern_idents(node, out),
                 _ => {}
             }
             for child in &node.children {
@@ -110,79 +188,67 @@ impl LanguageProfile for PythonProfile {
         &["+", "*", "&", "|", "^", "==", "!=", "and", "or"]
     }
 
-    fn binary_fields(
-        &self,
-        kind: &str,
-    ) -> Option<(
-        Option<&'static str>,
-        Option<&'static str>,
-        Option<&'static str>,
-    )> {
-        match kind {
-            "binary_operator" | "boolean_operator" => {
-                Some((Some("left"), Some("operator"), Some("right")))
-            }
-            "comparison_operator" => Some((None, Some("operators"), None)),
-            _ => None,
+    fn binary_fields(&self, kind: Kind) -> Option<(Option<Field>, Option<Field>, Option<Field>)> {
+        if kind == *BINARY_OPERATOR || kind == *BOOLEAN_OPERATOR {
+            Some((Some(*LEFT_FIELD), Some(*OPERATOR_FIELD), Some(*RIGHT_FIELD)))
+        } else if kind == *COMPARISON_OPERATOR {
+            Some((None, Some(*OPERATORS_FIELD), None))
+        } else {
+            None
         }
     }
 
-    fn sortable_pair_kind(&self, kind: &str) -> Option<&'static str> {
-        match kind {
-            "dictionary" => Some("key"),
-            _ => None,
+    fn sortable_pair_kind(&self, kind: Kind) -> Option<Field> {
+        if kind == *DICTIONARY {
+            Some(*KEY_FIELD)
+        } else {
+            None
         }
     }
 
-    fn is_list_kind(&self, kind: &str) -> bool {
-        matches!(
-            kind,
-            "block"
-                | "argument_list"
-                | "parameters"
-                | "pattern_list"
-                | "expression_list"
-                | "list"
-                | "tuple"
-                | "set"
-                | "dictionary"
-                | "REPEAT"
-        )
+    fn is_list_kind(&self, kind: Kind) -> bool {
+        kind == *BLOCK
+            || kind == *ARGUMENT_LIST
+            || kind == *PARAMETERS
+            || kind == *PATTERN_LIST
+            || kind == *EXPRESSION_LIST
+            || kind == *LIST
+            || kind == *TUPLE
+            || kind == *SET
+            || kind == *DICTIONARY
+            || kind == *REPEAT
     }
 
-    fn is_dispatch_arm(&self, kind: &str) -> bool {
-        kind == "case_clause"
+    fn is_dispatch_arm(&self, kind: Kind) -> bool {
+        kind == *CASE_CLAUSE
     }
 
-    fn is_statement_kind(&self, kind: &str) -> bool {
-        matches!(
-            kind,
-            "expression_statement"
-                | "if_statement"
-                | "while_statement"
-                | "for_statement"
-                | "return_statement"
-                | "try_statement"
-                | "with_statement"
-                | "break_statement"
-                | "continue_statement"
-                | "assert_statement"
-                | "raise_statement"
-                | "pass_statement"
-                | "delete_statement"
-        )
+    fn is_statement_kind(&self, kind: Kind) -> bool {
+        kind == *EXPRESSION_STATEMENT
+            || kind == *IF_STATEMENT
+            || kind == *WHILE_STATEMENT
+            || kind == *FOR_STATEMENT
+            || kind == *RETURN_STATEMENT
+            || kind == *TRY_STATEMENT
+            || kind == *WITH_STATEMENT
+            || kind == *BREAK_STATEMENT
+            || kind == *CONTINUE_STATEMENT
+            || kind == *ASSERT_STATEMENT
+            || kind == *RAISE_STATEMENT
+            || kind == *PASS_STATEMENT
+            || kind == *DELETE_STATEMENT
     }
 
     fn is_loop_core(&self, node: &NormNode) -> bool {
-        node.kind.as_ref() == "while_statement"
+        node.kind == *WHILE_STATEMENT
             && node
                 .children
                 .iter()
-                .any(|c| c.field.as_deref() == Some("condition") && c.kind.as_ref() == "true")
+                .any(|c| c.field == Some(*CONDITION_FIELD) && c.kind == *TRUE_KIND)
     }
 
     fn is_continue_stmt(&self, node: &NormNode) -> bool {
-        node.kind.as_ref() == "continue_statement"
+        node.kind == *CONTINUE_STATEMENT
     }
 
     fn unit_is_test(&self, node: tree_sitter::Node, src: &str, name: &str, path: &Path) -> bool {
@@ -208,8 +274,8 @@ impl LanguageProfile for PythonProfile {
 
     // ---- Phase 3: inliner hooks (spec §5.4) ----
 
-    fn call_kind(&self) -> &'static str {
-        "call"
+    fn call_kind(&self) -> Kind {
+        *CALL
     }
 
     fn inline_params(&self, root: &NormNode) -> Option<Vec<Box<str>>> {
@@ -217,7 +283,7 @@ impl LanguageProfile for PythonProfile {
     }
 
     fn return_value<'a>(&self, stmt: &'a NormNode) -> Option<&'a NormNode> {
-        if stmt.kind.as_ref() == "return_statement" && stmt.children.len() == 1 {
+        if stmt.kind == *RETURN_STATEMENT && stmt.children.len() == 1 {
             return Some(&stmt.children[0]);
         }
         None
@@ -243,12 +309,12 @@ impl LanguageProfile for PythonProfile {
 }
 
 fn collect_param_idents(node: &NormNode, out: &mut Vec<Box<str>>) {
-    match node.field.as_deref() {
-        Some("type") | Some("value") => return,
+    match node.field {
+        Some(f) if f == *TYPE_FIELD || f == *VALUE_FIELD => return,
         _ => {}
     }
     if let Some(Label::Raw(text)) = &node.label
-        && node.kind.as_ref() == "identifier"
+        && node.kind == *IDENTIFIER
     {
         out.push(text.clone());
     }
@@ -268,53 +334,51 @@ fn lower(
         .into_iter()
         .map(|c| lower(c, label_interner))
         .collect();
-    match node.kind.as_ref() {
-        "while_statement" => {
-            let is_true_cond = node
-                .children
-                .iter()
-                .any(|c| c.field.as_deref() == Some("condition") && c.kind.as_ref() == "true");
-            if is_true_cond {
-                return node;
-            }
-            let Some(mut cond) = node.take_field("condition") else {
-                return node;
-            };
-            let span = cond.span;
-            cond.field = None;
-            if let Some(body) = node
-                .children
-                .iter_mut()
-                .find(|c| c.field.as_deref() == Some("body"))
-            {
-                body.children.insert(0, break_unless(cond));
-            }
-            node.children.insert(0, true_node(span));
-            node
+    if node.kind == *WHILE_STATEMENT {
+        let is_true_cond = node
+            .children
+            .iter()
+            .any(|c| c.field == Some(*CONDITION_FIELD) && c.kind == *TRUE_KIND);
+        if is_true_cond {
+            return node;
         }
-        "for_statement" => {
-            let span = node.span;
-            let (Some(mut left), Some(mut right), Some(mut body)) = (
-                node.take_field("left"),
-                node.take_field("right"),
-                node.take_field("body"),
-            ) else {
-                return node;
-            };
-            right.field = None;
-            let guard = break_unless(call("__has_next", None, right.clone(), label_interner));
-            left.field = Some("left".into());
-            let next = call("__next", Some("right"), right, label_interner);
-            let span_left = left.span;
-            let assign = NormNode::new("assignment", None, span_left, vec![left, next]);
-            let assign_stmt = NormNode::new("expression_statement", None, span_left, vec![assign]);
-            body.children.insert(0, guard);
-            body.children.insert(1, assign_stmt);
-            let mut children = vec![true_node(span), body];
-            children.append(&mut node.children);
-            NormNode::new("while_statement", node.field.as_deref(), span, children)
+        let Some(mut cond) = node.take_field("condition") else {
+            return node;
+        };
+        let span = cond.span;
+        cond.field = None;
+        if let Some(body) = node
+            .children
+            .iter_mut()
+            .find(|c| c.field == Some(*BODY_FIELD))
+        {
+            body.children.insert(0, break_unless(cond));
         }
-        _ => node,
+        node.children.insert(0, true_node(span));
+        node
+    } else if node.kind == *FOR_STATEMENT {
+        let span = node.span;
+        let (Some(mut left), Some(mut right), Some(mut body)) = (
+            node.take_field("left"),
+            node.take_field("right"),
+            node.take_field("body"),
+        ) else {
+            return node;
+        };
+        right.field = None;
+        let guard = break_unless(call("__has_next", None, right.clone(), label_interner));
+        left.field = Some(*LEFT_FIELD);
+        let next = call("__next", Some("right"), right, label_interner);
+        let span_left = left.span;
+        let assign = NormNode::new("assignment", None, span_left, vec![left, next]);
+        let assign_stmt = NormNode::new("expression_statement", None, span_left, vec![assign]);
+        body.children.insert(0, guard);
+        body.children.insert(1, assign_stmt);
+        let mut children = vec![true_node(span), body];
+        children.append(&mut node.children);
+        NormNode::with_kind(*WHILE_STATEMENT, node.field, span, children)
+    } else {
+        node
     }
 }
 
@@ -367,7 +431,7 @@ fn lower_recursion(root: NormNode) -> NormNode {
     let Some(body_idx) = root
         .children
         .iter()
-        .position(|c| c.field.as_deref() == Some("body"))
+        .position(|c| c.field == Some(*BODY_FIELD))
     else {
         return root;
     };
@@ -385,8 +449,9 @@ fn lower_recursion(root: NormNode) -> NormNode {
 
     let span = new_body.span;
     let mut inner = new_body;
-    inner.field = Some("body".into());
-    let while_node = NormNode::new("while_statement", None, span, vec![true_node(span), inner]);
+    inner.field = Some(*BODY_FIELD);
+    let while_node =
+        NormNode::with_kind(*WHILE_STATEMENT, None, span, vec![true_node(span), inner]);
     let wrapper = NormNode::new("block", Some("body"), span, vec![while_node]);
     root.children.insert(body_idx, wrapper);
     root
@@ -397,7 +462,7 @@ fn simple_params(root: &NormNode) -> Option<Vec<Box<str>>> {
     let mut out = Vec::new();
     for p in &params.children {
         match (&p.kind, &p.label) {
-            (k, Some(Label::Raw(text))) if k.as_ref() == "identifier" => out.push(text.clone()),
+            (k, Some(Label::Raw(text))) if *k == *IDENTIFIER => out.push(text.clone()),
             _ => return None, // defaults / *args / typed params: bail
         }
     }
@@ -405,8 +470,7 @@ fn simple_params(root: &NormNode) -> Option<Vec<Box<str>>> {
 }
 
 fn is_self_call(node: &NormNode, name: &str) -> bool {
-    node.kind.as_ref() == "call"
-        && child_field(node, "function").is_some_and(|f| is_raw_ident(f, name))
+    node.kind == *CALL && child_field(node, "function").is_some_and(|f| is_raw_ident(f, name))
 }
 
 /// Nested callable kinds — a `return <self-call>` inside a nested `def`/`lambda`
@@ -416,8 +480,8 @@ fn is_self_call(node: &NormNode, name: &str) -> bool {
 /// (`replaced == total`) so the bad lowering would commit. Stopping descent
 /// leaves the nested call uncounted → `replaced != total` → the unit safely
 /// bails out of recursion lowering.
-fn is_nested_callable(kind: &str) -> bool {
-    matches!(kind, "function_definition" | "lambda")
+fn is_nested_callable(kind: Kind) -> bool {
+    kind == *FUNCTION_DEFINITION || kind == *LAMBDA
 }
 
 fn rewrite_tail_sites(
@@ -426,14 +490,14 @@ fn rewrite_tail_sites(
     params: &[Box<str>],
     replaced: &mut u32,
 ) -> NormNode {
-    if is_nested_callable(node.kind.as_ref()) {
+    if is_nested_callable(node.kind) {
         return node; // a self-call inside a nested closure is not a tail site
     }
-    if node.kind.as_ref() == "block" {
+    if node.kind == *BLOCK {
         let mut out = Vec::with_capacity(node.children.len());
         for child in node.children {
             // `return f(...)`
-            let is_return_site = child.kind.as_ref() == "return_statement"
+            let is_return_site = child.kind == *RETURN_STATEMENT
                 && child.children.len() == 1
                 && is_self_call(&child.children[0], name);
             if is_return_site {
@@ -509,7 +573,7 @@ fn reassign_stmts(call: NormNode, params: &[Box<str>], replaced: &mut u32) -> Ve
 
 fn rewrite_iteration(mut node: NormNode) -> NormNode {
     node.children = node.children.into_iter().map(rewrite_iteration).collect();
-    if node.kind.as_ref() != "for_statement" {
+    if node.kind != *FOR_STATEMENT {
         return node;
     }
     let (Some(left), Some(right)) = (child_field(&node, "left"), child_field(&node, "right"))
@@ -532,13 +596,13 @@ fn rewrite_iteration(mut node: NormNode) -> NormNode {
     let right_idx = node
         .children
         .iter()
-        .position(|c| c.field.as_deref() == Some("right"))
+        .position(|c| c.field == Some(*RIGHT_FIELD))
         .unwrap();
     node.children[right_idx] = synth_ident(&collection, Some("right"), span);
     let body_idx = node
         .children
         .iter()
-        .position(|c| c.field.as_deref() == Some("body"))
+        .position(|c| c.field == Some(*BODY_FIELD))
         .unwrap();
     let body = node.children.remove(body_idx);
     let new_body = replace_subscripts(body, &ivar, &collection);
@@ -548,7 +612,7 @@ fn rewrite_iteration(mut node: NormNode) -> NormNode {
 
 /// Matches `range(len(X))` → Some(X).
 fn range_len_collection(right: &NormNode) -> Option<Box<str>> {
-    if right.kind.as_ref() != "call" {
+    if right.kind != *CALL {
         return None;
     }
     let f = child_field(right, "function")?;
@@ -560,7 +624,7 @@ fn range_len_collection(right: &NormNode) -> Option<Box<str>> {
         return None;
     }
     let inner = &args.children[0];
-    if inner.kind.as_ref() != "call" {
+    if inner.kind != *CALL {
         return None;
     }
     let g = child_field(inner, "function")?;
@@ -573,13 +637,13 @@ fn range_len_collection(right: &NormNode) -> Option<Box<str>> {
     }
     let coll = &inner_args.children[0];
     match &coll.label {
-        Some(Label::Raw(t)) if coll.kind.as_ref() == "identifier" => Some(t.clone()),
+        Some(Label::Raw(t)) if coll.kind == *IDENTIFIER => Some(t.clone()),
         _ => None,
     }
 }
 
 fn is_target_subscript(node: &NormNode, ivar: &str, coll: &str) -> bool {
-    node.kind.as_ref() == "subscript"
+    node.kind == *SUBSCRIPT
         && child_field(node, "value").is_some_and(|v| is_raw_ident(v, coll))
         && child_field(node, "subscript").is_some_and(|s| is_raw_ident(s, ivar))
 }
@@ -596,8 +660,8 @@ fn index_uses_only(node: &NormNode, ivar: &str, coll: &str) -> bool {
 
 fn replace_subscripts(mut node: NormNode, ivar: &str, coll: &str) -> NormNode {
     if is_target_subscript(&node, ivar, coll) {
-        let field = node.field.as_deref().map(str::to_owned);
-        return synth_ident(ivar, field.as_deref(), node.span);
+        let field = node.field.map(|f| f.as_str());
+        return synth_ident(ivar, field, node.span);
     }
     node.children = node
         .children
@@ -613,7 +677,7 @@ fn normalize_loop_exit(profile: &PythonProfile, mut root: NormNode) -> NormNode 
     let Some(body) = root
         .children
         .iter_mut()
-        .find(|c| c.field.as_deref() == Some("body"))
+        .find(|c| c.field == Some(*BODY_FIELD))
     else {
         return root;
     };
@@ -623,7 +687,7 @@ fn normalize_loop_exit(profile: &PythonProfile, mut root: NormNode) -> NormNode 
     }
     let ret_value: Option<NormNode> = {
         let last = &body.children[n - 1];
-        if last.kind.as_ref() == "return_statement" && last.children.len() == 1 {
+        if last.kind == *RETURN_STATEMENT && last.children.len() == 1 {
             Some(last.children[0].clone())
         } else {
             None
@@ -657,7 +721,7 @@ fn replace_breaks(
     }
     let mut i = 0;
     while i < node.children.len() {
-        if node.children[i].kind.as_ref() == "break_statement" {
+        if node.children[i].kind == *BREAK_STATEMENT {
             let span = node.children[i].span;
             node.children[i] = NormNode::new("return_statement", None, span, vec![value.clone()]);
             *replaced += 1;

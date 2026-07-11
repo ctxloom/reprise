@@ -75,17 +75,23 @@ impl SeqSlot {
 /// The fused pass: one digest from one canonical tree. `plain` is
 /// `unit.variant.is_none()` — variants skip the sequence/api fields entirely
 /// (those tiers never read variants).
-pub fn compute(tree: &NormNode, lang: Lang, cfg: &Config, plain: bool) -> UnitDigest {
-    let (bag_set, offsets) = crate::matchtree::rep_substrate(tree, cfg);
+pub fn compute(
+    tree: &NormNode,
+    lang: Lang,
+    cfg: &Config,
+    plain: bool,
+    li: &crate::intern::LabelInterner,
+) -> UnitDigest {
+    let (bag_set, offsets) = crate::matchtree::rep_substrate(tree, cfg, li);
     UnitDigest {
-        boilerplate_mass: crate::ir::substance::boilerplate_mass(tree),
+        boilerplate_mass: crate::ir::substance::boilerplate_mass(tree, li),
         bag_set,
         offsets,
         seq_tokens: if plain {
-            SeqSlot::Resident(crate::stream::unit_stream(tree))
+            SeqSlot::Resident(crate::stream::unit_stream(tree, li))
         } else {
             SeqSlot::Absent
         },
-        api_elems: plain.then(|| crate::api::call_elems(tree, lang, cfg)),
+        api_elems: plain.then(|| crate::api::call_elems(tree, lang, cfg, li)),
     }
 }

@@ -14,6 +14,7 @@
 //! module is the P1 foundation: the vocabulary, the event log, and provenance.
 
 pub mod edit;
+pub mod field;
 pub mod kind;
 pub mod pass;
 pub mod provenance;
@@ -40,10 +41,12 @@ pub use transform::{TransformEvent, TransformKind, TransformLog, Witness};
 pub struct FoldRules;
 
 impl crate::fold::FoldRules for FoldRules {
-    fn is_list_kind(&self, k: &str) -> bool {
-        k == kind::BLOCK || k == kind::BRANCH || k == "REPEAT"
+    fn is_list_kind(&self, k: crate::intern::Kind) -> bool {
+        static REPEAT: std::sync::LazyLock<crate::intern::Kind> =
+            std::sync::LazyLock::new(|| crate::intern::Kind::intern("REPEAT"));
+        k == kind::id::BLOCK || k == kind::id::BRANCH || k == *REPEAT
     }
-    fn is_dispatch_arm(&self, k: &str) -> bool {
-        k == kind::ARM
+    fn is_dispatch_arm(&self, k: crate::intern::Kind) -> bool {
+        k == kind::id::ARM
     }
 }

@@ -525,7 +525,7 @@ fn lower_if_c(
             .named_children(&mut cursor)
             .find_map(|c| fe.lower_node(c, Some("body"), src, log))
             .map(|b| {
-                if b.kind.as_ref() == kind::BRANCH {
+                if b.kind == kind::id::BRANCH {
                     b // an `else if`: pass through so `push_else_arm` splices it flat
                 } else {
                     block_wrap(b, span)
@@ -825,13 +825,19 @@ mod tests {
     }
 
     fn abs(src: &str) -> String {
-        let (ir, _) = lower_c_source(src).expect("a c function");
-        to_sexpr(&crate::ir::abstract_idents(ir))
+        let (ir, log) = lower_c_source(src).expect("a c function");
+        to_sexpr(
+            &crate::ir::abstract_idents(ir, log.label_interner()),
+            log.label_interner(),
+        )
     }
 
     fn fp(src: &str) -> u128 {
-        let (ir, _) = lower_c_source(src).expect("a c function");
-        crate::fingerprint::merkle(&crate::ir::abstract_idents(ir))
+        let (ir, log) = lower_c_source(src).expect("a c function");
+        crate::fingerprint::merkle(
+            &crate::ir::abstract_idents(ir, log.label_interner()),
+            log.label_interner(),
+        )
     }
 
     #[test]
@@ -893,7 +899,7 @@ mod tests {
     #[test]
     fn do_while_places_the_guard_after_the_body() {
         let (ir, log) = lower_c_source("void f(int n) { do { s(); } while (n < 10); }").unwrap();
-        let s = to_sexpr(&ir);
+        let s = to_sexpr(&ir, log.label_interner());
         assert!(s.contains("(Loop"), "{s}");
         assert!(
             log.events()
@@ -925,8 +931,8 @@ mod tests {
         // Probe §5(A): a preproc conditional INSIDE a function body lowers its children in
         // place, BOTH branches, as written — never emulating the preprocessor.
         let src = "void f(void) {\n#ifdef DEBUG\n    dbg();\n#else\n    release();\n#endif\n}\n";
-        let (ir, _) = lower_c_source(src).unwrap();
-        let s = to_sexpr(&ir);
+        let (ir, log) = lower_c_source(src).unwrap();
+        let s = to_sexpr(&ir, log.label_interner());
         assert!(s.contains("dbg"), "{s}");
         assert!(s.contains("release"), "{s}");
     }

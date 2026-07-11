@@ -37,6 +37,12 @@ use serde::de::DeserializeOwned;
 
 /// The pluggable value decoder (see the struct doc).
 type Decoder<T> = Box<dyn Fn(&[u8]) -> T + Send + Sync>;
+/// The pluggable value encoder (see the struct doc) — the write-side counterpart of
+/// [`Decoder`], needed for the same reason: post-interning, a `NormNode`'s
+/// `Label::External`/`LitKept` ids resolve only through the scan's `LabelInterner`
+/// (`NormNode::to_wire`), so `T: Serialize` alone can no longer produce the bytes —
+/// the encoder closure captures that context instead (see [`Pack::with_codec`]).
+type Encoder<T> = Box<dyn Fn(&T) -> Vec<u8> + Send + Sync>;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -46,11 +52,12 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 /// A content-addressed store of serialized `T` values in one scan-scoped temp
 /// file, fronted by a byte-bounded sharded LRU of decoded values.
 ///
-/// Decoding is pluggable ([`Pack::with_decoder`]) because not every payload can
-/// derive a context-free `Deserialize`: post-interning, a `NormNode`'s labels
-/// re-intern through the CURRENT scan's `LabelInterner` (`NormNodeWire::
-/// into_real`) — the pack is scan-scoped, so capturing that scan's interner in
-/// the decoder is exactly right. Plain-data payloads use [`Pack::new`].
+/// Encoding/decoding are pluggable ([`Pack::with_codec`]) because not every payload
+/// can (de)serialize context-free: post-interning, a `NormNode`'s labels resolve
+/// through the CURRENT scan's `LabelInterner` in both directions (`NormNode::
+/// to_wire` / `NormNodeWire::into_real`) — the pack is scan-scoped, so capturing
+/// that scan's interner in the codec is exactly right. Plain-data payloads (already
+/// `Serialize + DeserializeOwned` with no external context) use [`Pack::new`].
 pub struct Pack<T> {
     file: File,
     /// The directory the backing file lives under (or, for [`Pack::over_file`]
@@ -68,6 +75,7 @@ pub struct Pack<T> {
     lru: ShardedLru<T>,
     hits: AtomicU64,
     misses: AtomicU64,
+    encode: Encoder<T>,
     decode: Decoder<T>,
 }
 
@@ -105,9 +113,13 @@ impl<T: Serialize + DeserializeOwned + Send + Sync> Pack<T> {
     /// the pack's backing directory (see `resolve_pack_dir`) — the file itself
     /// is anonymous (`tempfile_in`), `dir` only chooses its volume.
     pub fn new(lru_bytes: u64, shards: usize, dir: &Path) -> std::io::Result<Self> {
-        Self::with_decoder(lru_bytes, shards, dir, |bytes| {
-            bincode::deserialize(bytes).expect("pack value decodes")
-        })
+        Self::with_codec(
+            lru_bytes,
+            shards,
+            dir,
+            |v| bincode::serialize(v).expect("pack value serializes"),
+            |bytes| bincode::deserialize(bytes).expect("pack value decodes"),
+        )
     }
 
     /// Test/diagnostic hook: build a pack directly over an already-open file,
@@ -116,19 +128,27 @@ impl<T: Serialize + DeserializeOwned + Send + Sync> Pack<T> {
     /// ENOSPC on write) without needing a real full filesystem. `dir` is used
     /// only for the error message (see [`PackStoreError`]).
     pub fn over_file(file: File, dir: impl Into<PathBuf>, lru_bytes: u64, shards: usize) -> Self {
-        Self::over_file_with_decoder(file, dir, lru_bytes, shards, |bytes| {
-            bincode::deserialize(bytes).expect("pack value decodes")
-        })
+        Self::over_file_with_codec(
+            file,
+            dir,
+            lru_bytes,
+            shards,
+            |v| bincode::serialize(v).expect("pack value serializes"),
+            |bytes| bincode::deserialize(bytes).expect("pack value decodes"),
+        )
     }
 }
 
-impl<T: Serialize + Send + Sync> Pack<T> {
-    /// [`Pack::new`] with an explicit decoder — for payloads whose deserialize
-    /// needs context a derive cannot reach (the interned-tree wire path).
-    pub fn with_decoder(
+impl<T: Send + Sync> Pack<T> {
+    /// [`Pack::new`]/[`Pack::over_file`] with explicit encode/decode closures —
+    /// for payloads whose (de)serialization needs context a derive cannot reach
+    /// (the interned-tree wire path: `NormNode::to_wire`/`NormNodeWire::into_real`
+    /// against the current scan's `LabelInterner`).
+    pub fn with_codec(
         lru_bytes: u64,
         shards: usize,
         dir: &Path,
+        encode: impl Fn(&T) -> Vec<u8> + Send + Sync + 'static,
         decode: impl Fn(&[u8]) -> T + Send + Sync + 'static,
     ) -> std::io::Result<Self> {
         let file = tempfile::tempfile_in(dir)?;
@@ -137,19 +157,21 @@ impl<T: Serialize + Send + Sync> Pack<T> {
             dir.to_path_buf(),
             lru_bytes,
             shards,
+            encode,
             decode,
         ))
     }
 
-    /// [`Pack::over_file`] with an explicit decoder (see [`Pack::with_decoder`]).
-    pub fn over_file_with_decoder(
+    /// [`Pack::over_file`] with explicit codec (see [`Pack::with_codec`]).
+    pub fn over_file_with_codec(
         file: File,
         dir: impl Into<PathBuf>,
         lru_bytes: u64,
         shards: usize,
+        encode: impl Fn(&T) -> Vec<u8> + Send + Sync + 'static,
         decode: impl Fn(&[u8]) -> T + Send + Sync + 'static,
     ) -> Self {
-        Self::from_parts(file, dir.into(), lru_bytes, shards, decode)
+        Self::from_parts(file, dir.into(), lru_bytes, shards, encode, decode)
     }
 
     fn from_parts(
@@ -157,6 +179,7 @@ impl<T: Serialize + Send + Sync> Pack<T> {
         dir: PathBuf,
         lru_bytes: u64,
         shards: usize,
+        encode: impl Fn(&T) -> Vec<u8> + Send + Sync + 'static,
         decode: impl Fn(&[u8]) -> T + Send + Sync + 'static,
     ) -> Self {
         Pack {
@@ -168,6 +191,7 @@ impl<T: Serialize + Send + Sync> Pack<T> {
             lru: ShardedLru::new(lru_bytes, shards),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
+            encode: Box::new(encode),
             decode: Box::new(decode),
         }
     }
@@ -180,7 +204,7 @@ impl<T: Serialize + Send + Sync> Pack<T> {
         if let Some(err) = self.failure.get() {
             return Err(err.clone()); // already doomed — fail fast, no I/O retry
         }
-        let bytes = bincode::serialize(value).expect("pack value serializes");
+        let bytes = (self.encode)(value);
         let key = xxhash_rust::xxh3::xxh3_128(&bytes);
         if self.index.read().expect("pack index").contains_key(&key) {
             return Ok(key); // dedup: same bytes, same key, stored once

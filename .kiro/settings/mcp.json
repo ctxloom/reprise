@@ -1,0 +1,23 @@
+{
+  "mcpServers": {
+    "ctxloom": {
+      "args": [
+        "mcp"
+      ],
+      "command": "ctxloom"
+    },
+    "sequential-thinking": {
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-sequential-thinking"
+      ],
+      "command": "npx"
+    },
+    "taskloom": {
+      "args": [
+        "mcp"
+      ],
+      "command": "taskloom"
+    }
+  }
+}

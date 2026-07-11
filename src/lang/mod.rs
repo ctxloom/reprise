@@ -8,8 +8,19 @@ pub mod python;
 pub mod rust;
 pub mod typescript;
 
+use crate::intern::{Field, Kind};
 use crate::tree::{Bucket, Label, NormNode};
 use std::path::Path;
+use std::sync::LazyLock;
+
+/// Shared, once-interned `Kind` for the (near-)universal tree-sitter identifier leaf
+/// name — every one of the five historical grammars names it `"identifier"` (a
+/// per-language file that genuinely differs would define its OWN local static
+/// instead; this one is deliberately centralized because `lang/mod.rs`'s own
+/// cross-language helpers below need it). A `LazyLock` interns it ONCE, so every
+/// comparison against it (`node.kind == *IDENTIFIER`) is a bare `u16` equality,
+/// never a string compare (interning-id-conversion WP mechanism rule 3).
+static IDENTIFIER: LazyLock<Kind> = LazyLock::new(|| Kind::intern("identifier"));
 
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
@@ -146,10 +157,19 @@ pub trait LanguageProfile: Sync {
     /// mutability specifiers, lifetimes — spec §5.2.1/§5.2.7).
     fn strip_kind(&self, kind: &str) -> bool;
 
-    /// Identifier-carrying leaf kinds (become `Label::Raw`).
+    /// Identifier-carrying leaf kinds (become `Label::Raw`). **Dual-natured, by
+    /// design** (interning-id-conversion WP): `normalize::convert` calls this with
+    /// the RAW tree-sitter kind string (the node has no `Kind` yet — this call
+    /// decides whether it becomes one), so the parameter stays `&str`, unconverted.
+    /// The one post-construction caller (`inline::substitute`, off the O(n·m)
+    /// `anti_unify` hot path) resolves its `Kind` via `.as_str()` before calling —
+    /// an explicit, visible resolve, not a `Deref` shim.
     fn is_identifier(&self, kind: &str) -> bool;
 
-    /// Literal leaf kinds and their bucket (spec §5.2.5).
+    /// Literal leaf kinds and their bucket (spec §5.2.5). Dual-natured like
+    /// [`Self::is_identifier`] — stays `&str`; its one post-construction caller
+    /// (`normalize::abstract_literals`, a one-time P1 pass, not the matching hot
+    /// path) resolves via `.as_str()`.
     fn literal_bucket(&self, kind: &str) -> Option<Bucket>;
 
     /// Wrapper kinds flattened away (redundant parens — spec §5.2.7).
@@ -157,9 +177,11 @@ pub trait LanguageProfile: Sync {
 
     /// Kinds whose children are spliced directly into the parent during
     /// conversion, dropping the wrapper node (Go's `statement_list` inside
-    /// `block`, so Go blocks hold statements directly like Rust/Python).
-    /// Default: never splice.
-    fn splice_kind(&self, _kind: &str) -> bool {
+    /// `block`, so Go blocks hold statements directly like Rust/Python). Default:
+    /// never splice. Takes `Kind` (not `&str`, unlike `is_identifier`/
+    /// `literal_bucket` above) — every call site (`normalize::convert`) already
+    /// has a just-converted child `NormNode`, never a raw grammar string.
+    fn splice_kind(&self, _kind: Kind) -> bool {
         false
     }
 
@@ -170,7 +192,7 @@ pub trait LanguageProfile: Sync {
     /// sample labeled every sampled match-arm repeat FP). Only Rust and
     /// Python implement this — the other profiles' switch bodies are not
     /// fold list kinds, so their arms can never fold in the first place.
-    fn is_dispatch_arm(&self, _kind: &str) -> bool {
+    fn is_dispatch_arm(&self, _kind: Kind) -> bool {
         false
     }
 
@@ -178,8 +200,10 @@ pub trait LanguageProfile: Sync {
     fn keep_anon_parent(&self, parent_kind: &str) -> bool;
 
     /// Identifier positions that are always external regardless of the
-    /// declared set (field names, attribute access, type names).
-    fn always_external(&self, kind: &str, field: Option<&str>, parent_kind: &str) -> bool;
+    /// declared set (field names, attribute access, type names). `Kind`/`Field`-
+    /// typed (called only on already-converted `NormNode`s, including from
+    /// `au.rs`'s per-pair comparison path via the `Shapes` shim).
+    fn always_external(&self, kind: Kind, field: Option<Field>, parent_kind: Kind) -> bool;
 
     /// Collect names syntactically declared within the unit (spec §5.2.4).
     /// Runs after loop lowering, on `Label::Raw` trees.
@@ -219,27 +243,25 @@ pub trait LanguageProfile: Sync {
     fn normalize_loop_exit(&self, root: NormNode) -> NormNode;
 
     /// Commutative operator token kinds (spec §5.2.6; unsoundness accepted).
+    /// Stays `&str` (like `is_identifier`): its one call site
+    /// (`normalize::canonicalize_order`) is a one-time P1 construction pass, not
+    /// the `anti_unify` matching hot path, and resolves the compared `Kind` via
+    /// `.as_str()`.
     fn commutative_ops(&self) -> &'static [&'static str];
 
-    /// (left_field, op_field, right_field) for rebuildable binary kinds.
-    fn binary_fields(
-        &self,
-        kind: &str,
-    ) -> Option<(
-        Option<&'static str>,
-        Option<&'static str>,
-        Option<&'static str>,
-    )>;
+    /// (left_field, op_field, right_field) for rebuildable binary kinds. `Kind`/
+    /// `Field`-typed — called from `au.rs`'s per-pair comparison path.
+    fn binary_fields(&self, kind: Kind) -> Option<(Option<Field>, Option<Field>, Option<Field>)>;
 
     /// Kind whose children are sortable key/value pairs → the key field name.
-    fn sortable_pair_kind(&self, kind: &str) -> Option<&'static str>;
+    fn sortable_pair_kind(&self, kind: Kind) -> Option<Field>;
 
     /// Kinds whose children form a variable-length list (AU aligns these with
     /// graded Smith-Waterman rather than positionally — spec §5.6).
-    fn is_list_kind(&self, kind: &str) -> bool;
+    fn is_list_kind(&self, kind: Kind) -> bool;
 
     /// Statement-like kinds (factorability classification — spec §5.6).
-    fn is_statement_kind(&self, kind: &str) -> bool;
+    fn is_statement_kind(&self, kind: Kind) -> bool;
 
     /// Is this node the lowered loop core (`loop`/`while True`)?
     fn is_loop_core(&self, node: &NormNode) -> bool;
@@ -252,8 +274,12 @@ pub trait LanguageProfile: Sync {
 
     // ---- Phase 3: best-effort inliner (spec §5.4) ----
 
-    /// The language's plain-call node kind (`call_expression` / `call`).
-    fn call_kind(&self) -> &'static str;
+    /// The language's plain-call node kind (`call_expression` / `call`). `Kind`-
+    /// typed (compared against already-converted `NormNode`s on `inline.rs`'s and
+    /// `api.rs`'s per-node paths) — each impl interns its literal once via a
+    /// `LazyLock<Kind>` (or the shared canonical `ir::kind::id` consts for the IR
+    /// `Shapes` case), never a string compare at the call site.
+    fn call_kind(&self) -> Kind;
 
     /// Simple-identifier parameter names of a raw unit, or None when patterns,
     /// defaults, or receivers make the unit non-inlinable by substitution.
@@ -276,7 +302,11 @@ pub trait LanguageProfile: Sync {
 
 /// Shared helper: synthesize a call node with an External callee, using the
 /// language's native call/argument-list kinds. (Consolidated from per-language
-/// copies — reprise's own first self-scan finding.)
+/// copies — reprise's own first self-scan finding.) `call_kind`/`args_kind`/
+/// `field` are compile-time literals at every call site; interning them here
+/// (once per call, not per comparison — the interning-id-conversion WP's
+/// "runtime strings intern once per acquisition" rule) keeps this helper
+/// ergonomic for callers while the resulting `NormNode`'s `kind`/`field` are ids.
 pub(crate) fn synth_call(
     call_kind: &str,
     args_kind: &str,
@@ -301,11 +331,12 @@ pub(crate) fn synth_ident(name: &str, field: Option<&str>, span: (u32, u32)) -> 
 /// Shared helper: collect `Raw` identifier texts in a pattern-like subtree,
 /// skipping type annotations (subtrees in a `type` field).
 pub(crate) fn collect_pattern_idents(node: &NormNode, out: &mut Vec<Box<str>>) {
-    if node.field.as_deref() == Some("type") {
+    static TYPE: LazyLock<Field> = LazyLock::new(|| Field::intern("type"));
+    if node.field == Some(*TYPE) {
         return;
     }
     if let Some(crate::tree::Label::Raw(text)) = &node.label
-        && node.kind.as_ref() == "identifier"
+        && node.kind == *IDENTIFIER
     {
         out.push(text.clone());
     }
@@ -314,10 +345,18 @@ pub(crate) fn collect_pattern_idents(node: &NormNode, out: &mut Vec<Box<str>>) {
     }
 }
 
+/// `field` is a compile-time literal at every call site; interned once per call
+/// (see [`synth_call`]'s doc comment for the rationale).
 pub(crate) fn child_field<'a>(node: &'a NormNode, field: &str) -> Option<&'a NormNode> {
-    node.children
-        .iter()
-        .find(|c| c.field.as_deref() == Some(field))
+    let target = Field::intern(field);
+    node.children.iter().find(|c| c.field == Some(target))
+}
+
+/// Like [`child_field`], but for a caller that already holds an interned [`Field`]
+/// (e.g. from `LanguageProfile::sortable_pair_kind`'s return) — skips the pointless
+/// resolve-then-reintern round trip.
+pub(crate) fn child_field_id(node: &NormNode, field: Field) -> Option<&NormNode> {
+    node.children.iter().find(|c| c.field == Some(field))
 }
 
 /// The unit's own name while still un-abstracted; None once passes ran.
@@ -329,15 +368,20 @@ pub(crate) fn raw_name(root: &NormNode) -> Option<Box<str>> {
 }
 
 pub(crate) fn is_raw_ident(node: &NormNode, text: &str) -> bool {
-    node.kind.as_ref() == "identifier"
-        && matches!(&node.label, Some(Label::Raw(t)) if t.as_ref() == text)
+    node.kind == *IDENTIFIER && matches!(&node.label, Some(Label::Raw(t)) if t.as_ref() == text)
 }
 
 /// Count calls to `name` anywhere in the subtree (self-call census for the
-/// linear-recursion guard: tree recursion must NOT lower).
+/// linear-recursion guard: tree recursion must NOT lower). `call_kind` is a
+/// compile-time literal at every call site; interned once per call (see
+/// [`synth_call`]'s doc comment).
 pub(crate) fn count_self_calls(node: &NormNode, call_kind: &str, name: &str) -> u32 {
+    count_self_calls_id(node, Kind::intern(call_kind), name)
+}
+
+fn count_self_calls_id(node: &NormNode, call_kind: Kind, name: &str) -> u32 {
     let mut n = 0;
-    if node.kind.as_ref() == call_kind
+    if node.kind == call_kind
         && let Some(f) = child_field(node, "function")
         && is_raw_ident(f, name)
     {
@@ -345,7 +389,7 @@ pub(crate) fn count_self_calls(node: &NormNode, call_kind: &str, name: &str) -> 
     }
     node.children
         .iter()
-        .map(|c| count_self_calls(c, call_kind, name))
+        .map(|c| count_self_calls_id(c, call_kind, name))
         .sum::<u32>()
         + n
 }
