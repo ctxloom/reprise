@@ -99,10 +99,11 @@ fn assert_spans_survive(root: &NormNode, src_len: usize, name: &str, lang: Lang)
 #[test]
 fn normalization_is_idempotent() {
     let cfg = Config::default();
+    let label_interner = reprise::intern::LabelInterner::new();
     for (src, lang) in seed_sources().into_iter().chain(inline_sources()) {
         for (name, raw) in raw_units_from_source(&src, lang) {
-            let once = apply_passes(raw.clone(), lang, &cfg);
-            let twice = apply_passes(once.clone(), lang, &cfg);
+            let once = apply_passes(raw.clone(), lang, &cfg, &label_interner);
+            let twice = apply_passes(once.clone(), lang, &cfg, &label_interner);
             assert_eq!(
                 once, twice,
                 "normalize not idempotent for unit `{name}` ({lang:?})"
@@ -114,14 +115,15 @@ fn normalization_is_idempotent() {
 #[test]
 fn normalization_is_deterministic() {
     let cfg = Config::default();
+    let label_interner = reprise::intern::LabelInterner::new();
     for (src, lang) in seed_sources().into_iter().chain(inline_sources()) {
         let a: Vec<_> = raw_units_from_source(&src, lang)
             .into_iter()
-            .map(|(_, t)| apply_passes(t, lang, &cfg))
+            .map(|(_, t)| apply_passes(t, lang, &cfg, &label_interner))
             .collect();
         let b: Vec<_> = raw_units_from_source(&src, lang)
             .into_iter()
-            .map(|(_, t)| apply_passes(t, lang, &cfg))
+            .map(|(_, t)| apply_passes(t, lang, &cfg, &label_interner))
             .collect();
         assert_eq!(a, b, "normalize not deterministic ({lang:?})");
     }
@@ -131,9 +133,10 @@ fn normalization_is_deterministic() {
 fn spans_survive_normalization() {
     // Spec §4 hard requirement: every normalized node maps back into the source.
     let cfg = Config::default();
+    let label_interner = reprise::intern::LabelInterner::new();
     for (src, lang) in seed_sources().into_iter().chain(inline_sources()) {
         for (name, raw) in raw_units_from_source(&src, lang) {
-            let normed = apply_passes(raw, lang, &cfg);
+            let normed = apply_passes(raw, lang, &cfg, &label_interner);
             assert_spans_survive(&normed, src.len(), &name, lang);
         }
     }
@@ -182,11 +185,12 @@ fn ir_normalization_is_idempotent() {
     // identity-permutation skip still leaves other no-op-safe edits possible). Tree identity is
     // the robust invariant.
     let path = Path::new("seed");
+    let label_interner = reprise::intern::LabelInterner::new();
     for (src, lang) in ir_sources() {
-        for unit in extract_ir_units(&src, lang, path) {
+        for unit in extract_ir_units(&src, lang, path, &label_interner) {
             // `unit.tree` is already `run_passes(raw)`; re-run the passes on it.
             let once = unit.tree;
-            let mut log = TransformLog::disabled();
+            let mut log = TransformLog::disabled_with(label_interner.clone());
             let twice = run_passes(once.clone(), lang, &mut log);
             assert_eq!(
                 once, twice,
@@ -202,9 +206,10 @@ fn ir_normalization_is_deterministic() {
     // Lowering + the pass pipeline are pure: the same source lowered twice yields byte-identical
     // IR trees (same fingerprint).
     let path = Path::new("seed");
+    let label_interner = reprise::intern::LabelInterner::new();
     for (src, lang) in ir_sources() {
-        let a = extract_ir_units(&src, lang, path);
-        let b = extract_ir_units(&src, lang, path);
+        let a = extract_ir_units(&src, lang, path, &label_interner);
+        let b = extract_ir_units(&src, lang, path, &label_interner);
         assert_eq!(
             a.len(),
             b.len(),
@@ -226,8 +231,9 @@ fn ir_spans_survive_normalization() {
     // synthesized loop-protocol / break-guard / temp nodes — carries a span that maps back
     // into the source (same invariant as the historical span test, via `assert_spans_survive`).
     let path = Path::new("seed");
+    let label_interner = reprise::intern::LabelInterner::new();
     for (src, lang) in ir_sources() {
-        for unit in extract_ir_units(&src, lang, path) {
+        for unit in extract_ir_units(&src, lang, path, &label_interner) {
             assert_spans_survive(&unit.tree, src.len(), &unit.name, lang);
         }
     }

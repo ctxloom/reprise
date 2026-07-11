@@ -413,7 +413,7 @@ fn callee_name(function: &NormNode) -> Option<Box<str>> {
     let mut found: Option<Box<str>> = None;
     fn walk(node: &NormNode, found: &mut Option<Box<str>>) {
         if let Some(Label::External(name)) = &node.label {
-            *found = Some(name.clone());
+            *found = Some(name.as_str().into());
         }
         for child in &node.children {
             walk(child, found);

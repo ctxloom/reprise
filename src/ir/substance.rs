@@ -164,7 +164,8 @@ fn child_by_field<'a>(node: &'a NormNode, field: &str) -> Option<&'a NormNode> {
 
 fn label_str(n: &NormNode) -> Option<&str> {
     match &n.label {
-        Some(Label::Raw(t) | Label::RawLit(t) | Label::External(t) | Label::LitKept(t)) => Some(t),
+        Some(Label::Raw(t) | Label::RawLit(t)) => Some(t.as_ref()),
+        Some(Label::External(t) | Label::LitKept(t)) => Some(t.as_ref()),
         _ => None,
     }
 }

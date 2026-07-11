@@ -232,14 +232,19 @@ fn convert(
 /// identifiers (4) → literals (5) → order canonicalization (6) → dead
 /// syntax (7). Iteration-protocol rewrite runs before loop lowering (it needs
 /// intact `for` nodes); loop-exit normalization right after it.
-pub fn apply_passes(tree: NormNode, lang: Lang, cfg: &Config) -> NormNode {
+pub fn apply_passes(
+    tree: NormNode,
+    lang: Lang,
+    cfg: &Config,
+    label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+) -> NormNode {
     let profile = lang.profile();
     let tree = profile.lower_recursion(tree);
-    let tree = profile.rewrite_iteration(tree);
-    let tree = profile.lower_loops(tree);
+    let tree = profile.rewrite_iteration(tree, label_interner);
+    let tree = profile.lower_loops(tree, label_interner);
     let tree = profile.normalize_loop_exit(tree);
-    let tree = abstract_idents(tree, profile);
-    let tree = abstract_literals(tree, profile, cfg);
+    let tree = abstract_idents(tree, profile, label_interner);
+    let tree = abstract_literals(tree, profile, cfg, label_interner);
     let tree = canonicalize_order(tree, profile, None);
     remove_dead(tree, profile)
 }
@@ -267,9 +272,10 @@ fn canonicalize_order(
     // unaffected by canonicalizing the operands — so this is stable whether computed before or
     // after the child recursion. We compute it before, to thread the chain context down the
     // spine. Cloning the kind decouples the tuple's lifetime from `node` (whose `children` are
-    // moved out just below), at the cost of one small `Box<str>` clone per node.
-    let this_kind: Box<str> = node.kind.clone();
-    let this_op: Option<Box<str>> =
+    // moved out just below) — `Kind` is `Copy` (interned id), so this is now a plain copy, not
+    // a heap-cloning `Box<str>`.
+    let this_kind: crate::intern::Kind = node.kind;
+    let this_op: Option<crate::intern::Kind> =
         if profile.binary_fields(&node.kind).is_some() && node.children.len() == 3 {
             node.children
                 .iter()
@@ -278,7 +284,7 @@ fn canonicalize_order(
                         && c.label.is_none()
                         && profile.commutative_ops().contains(&c.kind.as_ref())
                 })
-                .map(|c| c.kind.clone())
+                .map(|c| c.kind)
         } else {
             None
         };
@@ -324,9 +330,9 @@ fn canonicalize_order(
                     crate::fingerprint::merkle(o),
                 )
             });
-            let field = node.field.clone();
+            let field = node.field;
             let span = node.span;
-            let kind = node.kind.clone();
+            let kind = node.kind;
             let mut acc = operands.remove(0);
             acc.field = lf.map(Into::into);
             for mut next in operands {
@@ -377,7 +383,15 @@ fn flatten_chain(node: &NormNode, kind: &str, op: &str, out: &mut Vec<NormNode>)
 
 /// Spec §5.2.4: locals become positional `Local(n)` by first occurrence;
 /// everything else keeps its name as `External`.
-fn abstract_idents(mut root: NormNode, profile: &dyn LanguageProfile) -> NormNode {
+///
+/// `label_interner` (interning WP): the historical normalizer has no `TransformLog` to
+/// piggyback the per-scan `LabelInterner` on (that's an IR-frontend-only seam), so it
+/// is threaded explicitly here — a short chain contained to normalize.rs + unit.rs.
+fn abstract_idents(
+    mut root: NormNode,
+    profile: &dyn LanguageProfile,
+    label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+) -> NormNode {
     let mut declared_list = Vec::new();
     profile.collect_declared(&root, &mut declared_list);
     let declared: HashSet<Box<str>> = declared_list.into_iter().collect();
@@ -389,32 +403,50 @@ fn abstract_idents(mut root: NormNode, profile: &dyn LanguageProfile) -> NormNod
         profile: &dyn LanguageProfile,
         declared: &HashSet<Box<str>>,
         order: &mut HashMap<Box<str>, u32>,
+        label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
     ) {
         if let Some(Label::Raw(text)) = node.label.clone() {
             let field = node.field.as_deref();
             let label = if profile.always_external(&node.kind, field, parent_kind) {
-                Label::External(text)
+                Label::External(label_interner.intern(&text))
             } else if declared.contains(&text) {
                 let next = order.len() as u32;
                 Label::Local(*order.entry(text).or_insert(next))
             } else {
-                Label::External(text)
+                Label::External(label_interner.intern(&text))
             };
             node.label = Some(label);
         }
-        let kind = node.kind.clone();
+        let kind = node.kind;
         for child in &mut node.children {
-            walk(child, &kind, profile, declared, order);
+            walk(child, &kind, profile, declared, order, label_interner);
         }
     }
-    walk(&mut root, "", profile, &declared, &mut order);
+    walk(
+        &mut root,
+        "",
+        profile,
+        &declared,
+        &mut order,
+        label_interner,
+    );
     root
 }
 
 /// Spec §5.2.5: typed buckets, except keep-list literals whose identity is
 /// structural.
-fn abstract_literals(mut root: NormNode, profile: &dyn LanguageProfile, cfg: &Config) -> NormNode {
-    fn walk(node: &mut NormNode, profile: &dyn LanguageProfile, keep: &[String]) {
+fn abstract_literals(
+    mut root: NormNode,
+    profile: &dyn LanguageProfile,
+    cfg: &Config,
+    label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+) -> NormNode {
+    fn walk(
+        node: &mut NormNode,
+        profile: &dyn LanguageProfile,
+        keep: &[String],
+        label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+    ) {
         if let Some(Label::RawLit(text)) = node.label.clone() {
             let bucket = profile.literal_bucket(&node.kind).unwrap_or(Bucket::Str);
             let key = match bucket {
@@ -422,16 +454,21 @@ fn abstract_literals(mut root: NormNode, profile: &dyn LanguageProfile, cfg: &Co
                 _ => text.trim().to_string(),
             };
             node.label = Some(if keep.iter().any(|k| k == &key) {
-                Label::LitKept(key.into())
+                Label::LitKept(label_interner.intern(&key))
             } else {
                 Label::LitBucket(bucket)
             });
         }
         for child in &mut node.children {
-            walk(child, profile, keep);
+            walk(child, profile, keep, label_interner);
         }
     }
-    walk(&mut root, profile, &cfg.normalize.literal_keep);
+    walk(
+        &mut root,
+        profile,
+        &cfg.normalize.literal_keep,
+        label_interner,
+    );
     root
 }
 

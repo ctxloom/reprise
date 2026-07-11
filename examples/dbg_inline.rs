@@ -23,11 +23,13 @@ fn main() {
 
     // Re-run the pipeline pieces to inspect variants.
     let files = reprise::walk::collect_files(std::path::Path::new(&dir), &cfg).unwrap();
+    let label_interner = reprise::intern::LabelInterner::new();
     let mut units = Vec::new();
     let mut raws = Vec::new();
     for (path, lang) in &files {
         let src = std::fs::read_to_string(path).unwrap();
-        let f = reprise::unit::extract_file_units_keep_raw(path, &src, *lang, &cfg);
+        let f =
+            reprise::unit::extract_file_units_keep_raw(path, &src, *lang, &cfg, &label_interner);
         units.extend(f.units);
         raws.extend(f.raw_trees);
     }
@@ -44,6 +46,7 @@ fn main() {
                 &units[i],
                 exp.tree.expect("calls_inlined > 0"),
                 &cfg,
+                &label_interner,
             ) {
                 println!(
                     "  variant tokens={} fp={:032x}",

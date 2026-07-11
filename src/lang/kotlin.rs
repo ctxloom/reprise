@@ -103,15 +103,23 @@ impl LanguageProfile for KotlinProfile {
         walk(root, out);
     }
 
-    fn lower_loops(&self, node: NormNode) -> NormNode {
-        lower(externalize_nav(node))
+    fn lower_loops(
+        &self,
+        node: NormNode,
+        label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+    ) -> NormNode {
+        lower(externalize_nav(node, label_interner), label_interner)
     }
 
     fn lower_recursion(&self, root: NormNode) -> NormNode {
         lower_recursion(root)
     }
 
-    fn rewrite_iteration(&self, root: NormNode) -> NormNode {
+    fn rewrite_iteration(
+        &self,
+        root: NormNode,
+        _label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+    ) -> NormNode {
         rewrite_iteration(root)
     }
 
@@ -228,7 +236,11 @@ impl LanguageProfile for KotlinProfile {
 }
 
 fn ident_text_is(node: &NormNode, text: &str) -> bool {
-    matches!(&node.label, Some(Label::Raw(t) | Label::External(t)) if t.as_ref() == text)
+    match &node.label {
+        Some(Label::Raw(t)) => t.as_ref() == text,
+        Some(Label::External(t)) => t.as_ref() == text,
+        _ => false,
+    }
 }
 
 fn is_true_ident(node: &NormNode) -> bool {
@@ -246,14 +258,21 @@ fn eq_token(span: (u32, u32)) -> NormNode {
 /// Relabel navigation targets (`.field`) as External — no field/kind positions
 /// them, so a bare undeclared→External default would misfire when a target name
 /// collides with a declared local.
-fn externalize_nav(mut node: NormNode) -> NormNode {
-    node.children = node.children.into_iter().map(externalize_nav).collect();
+fn externalize_nav(
+    mut node: NormNode,
+    label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+) -> NormNode {
+    node.children = node
+        .children
+        .into_iter()
+        .map(|c| externalize_nav(c, label_interner))
+        .collect();
     if node.kind.as_ref() == "navigation_expression"
         && let Some(last) = node.children.last_mut()
         && last.kind.as_ref() == "identifier"
         && let Some(Label::Raw(t)) = &last.label
     {
-        last.label = Some(Label::External(t.clone()));
+        last.label = Some(Label::External(label_interner.intern(t)));
     }
     node
 }
@@ -275,8 +294,19 @@ fn break_unless(mut cond: NormNode) -> NormNode {
     NormNode::new("if_expression", None, span, vec![negated, block])
 }
 
-fn call(name: &str, arg: NormNode) -> NormNode {
-    synth_call("call_expression", "value_arguments", name, None, arg)
+fn call(
+    name: &str,
+    arg: NormNode,
+    label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+) -> NormNode {
+    synth_call(
+        "call_expression",
+        "value_arguments",
+        name,
+        None,
+        arg,
+        label_interner,
+    )
 }
 
 /// The function body block, navigated by kind (`function_body` was spliced, so
@@ -288,8 +318,15 @@ fn body_block_idx(root: &NormNode) -> Option<usize> {
 }
 
 /// Lower while / do-while / for-in to the `while (true)` core (spec §5.2.2).
-fn lower(mut node: NormNode) -> NormNode {
-    node.children = node.children.into_iter().map(lower).collect();
+fn lower(
+    mut node: NormNode,
+    label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+) -> NormNode {
+    node.children = node
+        .children
+        .into_iter()
+        .map(|c| lower(c, label_interner))
+        .collect();
     match node.kind.as_ref() {
         "while_statement" => {
             // Already the core (`while (true)`) — don't re-lower.
@@ -345,14 +382,17 @@ fn lower(mut node: NormNode) -> NormNode {
                 vec![true_node(span), block],
             )
         }
-        "for_statement" => lower_for_in(node),
+        "for_statement" => lower_for_in(node, label_interner),
         _ => node,
     }
 }
 
 /// `for (x in xs) { body }` → `while (true) { if (!__has_next(xs)) break; x = __next(xs); body }`.
 /// for_statement children (post-convert): variable_declaration, iterable, block.
-fn lower_for_in(mut node: NormNode) -> NormNode {
+fn lower_for_in(
+    mut node: NormNode,
+    label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+) -> NormNode {
     let span = node.span;
     let field = node.field.as_deref().map(str::to_owned);
     let Some(block_idx) = node
@@ -378,10 +418,10 @@ fn lower_for_in(mut node: NormNode) -> NormNode {
     };
     let mut iterable = node.children.remove(iter_idx);
     iterable.field = None;
-    let guard = break_unless(call("__has_next", iterable.clone()));
+    let guard = break_unless(call("__has_next", iterable.clone(), label_interner));
     // Bind via `property_declaration` (a declaring form) so `collect_declared`
     // binds the loop variable as a local, like the natural `val x = …`.
-    let next = call("__next", iterable);
+    let next = call("__next", iterable, label_interner);
     let bind = NormNode::new("property_declaration", None, span, vec![var, next]);
     block.children.insert(0, guard);
     block.children.insert(1, bind);

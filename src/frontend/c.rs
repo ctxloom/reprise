@@ -726,7 +726,7 @@ fn desugar_update(
     let read = lvalue.and_then(|n| fe.lower_node(n, Some("left"), src, log));
     let op = NormNode::new(op_text, Some("op"), span, Vec::new());
     let one = NormNode::new(kind::LIT, Some("right"), span, Vec::new())
-        .with_label(Label::LitKept("1".into()));
+        .with_label(Label::LitKept(log.label_interner().intern("1")));
     let binop = NormNode::new(
         kind::BINOP,
         Some("value"),
@@ -909,10 +909,12 @@ mod tests {
     #[test]
     fn function_inside_ifdef_is_extracted() {
         let src = "#ifdef CONFIG_FOO\nstatic int helper(int x) {\n    return x + 1;\n}\n#endif\n";
+        let label_interner = crate::intern::LabelInterner::new();
         let units = crate::frontend::extract_ir_units(
             src,
             crate::lang::Lang::C,
             std::path::Path::new("t.c"),
+            &label_interner,
         );
         assert_eq!(units.len(), 1, "expected exactly one unit");
         assert_eq!(units[0].name, "helper");
@@ -936,10 +938,12 @@ mod tests {
         // function's declarator and body parse fine on either side — extraction must not gate
         // on file-level cleanliness.
         let src = "static void __init foo(void) {\n    bar();\n}\n";
+        let label_interner = crate::intern::LabelInterner::new();
         let units = crate::frontend::extract_ir_units(
             src,
             crate::lang::Lang::C,
             std::path::Path::new("t.c"),
+            &label_interner,
         );
         assert_eq!(
             units.len(),

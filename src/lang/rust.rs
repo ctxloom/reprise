@@ -96,15 +96,23 @@ impl LanguageProfile for RustProfile {
         walk(root, out);
     }
 
-    fn lower_loops(&self, node: NormNode) -> NormNode {
-        lower(node)
+    fn lower_loops(
+        &self,
+        node: NormNode,
+        label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+    ) -> NormNode {
+        lower(node, label_interner)
     }
 
     fn lower_recursion(&self, root: NormNode) -> NormNode {
         lower_recursion(root)
     }
 
-    fn rewrite_iteration(&self, root: NormNode) -> NormNode {
+    fn rewrite_iteration(
+        &self,
+        root: NormNode,
+        _label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+    ) -> NormNode {
         rewrite_iteration(root)
     }
 
@@ -234,8 +242,15 @@ impl LanguageProfile for RustProfile {
 /// Lower `while` / `for` to the minimal loop core (spec §5.2.2):
 /// `loop { if !(cond) { break; } bind; body }` — using the exact tree shapes
 /// tree-sitter produces for the manually written form, so both converge.
-fn lower(mut node: NormNode) -> NormNode {
-    node.children = node.children.into_iter().map(lower).collect();
+fn lower(
+    mut node: NormNode,
+    label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+) -> NormNode {
+    node.children = node
+        .children
+        .into_iter()
+        .map(|c| lower(c, label_interner))
+        .collect();
     match node.kind.as_ref() {
         "while_expression" => {
             let field = node.field.as_deref().map(str::to_owned);
@@ -261,9 +276,9 @@ fn lower(mut node: NormNode) -> NormNode {
                 return node;
             };
             value.field = None;
-            let guard = break_unless(call("__has_next", None, value.clone()));
+            let guard = break_unless(call("__has_next", None, value.clone(), label_interner));
             pat.field = Some("pattern".into());
-            let next = call("__next", Some("value"), value);
+            let next = call("__next", Some("value"), value, label_interner);
             let span_pat = pat.span;
             let let_decl = NormNode::new("let_declaration", None, span_pat, vec![pat, next]);
             body.children.insert(0, guard);
@@ -291,8 +306,20 @@ fn break_unless(cond: NormNode) -> NormNode {
     NormNode::new("expression_statement", None, span, vec![iff])
 }
 
-fn call(name: &str, field: Option<&str>, arg: NormNode) -> NormNode {
-    synth_call("call_expression", "arguments", name, field, arg)
+fn call(
+    name: &str,
+    field: Option<&str>,
+    arg: NormNode,
+    label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+) -> NormNode {
+    synth_call(
+        "call_expression",
+        "arguments",
+        name,
+        field,
+        arg,
+        label_interner,
+    )
 }
 
 // ---- recursion lowering (spec §5.2.2 Rev 5) ----

@@ -672,7 +672,7 @@ fn try_expr_inline(node: NormNode, ctx: &mut Ctx) -> NormNode {
     if !single && !ctx.has_expr_block {
         return node; // D17: no synthetic expression block
     }
-    let field = node.field.clone();
+    let field = node.field;
     let span = node.span;
     let stmts = splice_body(def_idx, args, ctx);
     if let Shapes::Ir(_) = ctx.shapes {
@@ -720,7 +720,7 @@ fn try_expr_inline(node: NormNode, ctx: &mut Ctx) -> NormNode {
 /// in an expression block (Rust only — Python/Go leave the call, D17).
 fn ir_place_expr(
     mut stmts: Vec<NormNode>,
-    field: Option<Box<str>>,
+    field: Option<crate::intern::Field>,
     span: (u32, u32),
     node: NormNode,
     ctx: &Ctx,
@@ -755,7 +755,7 @@ fn de_return_tail(stmts: &mut [NormNode]) {
 fn de_return_node(node: &mut NormNode) {
     let k = node.kind.as_ref();
     if k == kind::RETURN && node.children.len() == 1 {
-        let field = node.field.clone();
+        let field = node.field;
         let mut v = node.children.remove(0);
         v.field = field;
         *node = v;
@@ -876,10 +876,10 @@ fn substitute(
         && let Some(rep) = map.get(text.as_ref())
     {
         let mut r = (*rep).clone();
-        r.field = node.field.clone();
+        r.field = node.field;
         return r;
     }
-    let kind = node.kind.clone();
+    let kind = node.kind;
     node.children = node
         .children
         .into_iter()

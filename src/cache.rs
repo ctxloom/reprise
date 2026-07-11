@@ -119,10 +119,22 @@ fn entry_path(root: &Path, key: u128) -> PathBuf {
 }
 
 /// Load a cached extraction; `path` re-anchors the stored file coordinates
-/// (the key covers the relative path, so a moved root still hits).
-pub fn load(root: &Path, key: u128, path: &Path) -> Option<FileUnits> {
+/// (the key covers the relative path, so a moved root still hits). `label_interner`
+/// is the CURRENT scan's per-scan interner (interning WP) — a cache hit re-interns
+/// the stored `Label::External`/`LitKept` text into it (fresh ids; a different scan's
+/// interner, by design — see the interning preamble's cache-serde section). Bytes are
+/// read through [`crate::unit::FileUnitsWire`], which is field-for-field identical to
+/// the pre-interning `Box<str>`-based `FileUnits` shape, so this reads today's D19
+/// blobs (and any future ones written by [`store`]) without a format change.
+pub fn load(
+    root: &Path,
+    key: u128,
+    path: &Path,
+    label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+) -> Option<FileUnits> {
     let bytes = std::fs::read(entry_path(root, key)).ok()?;
-    let mut cached: FileUnits = bincode::deserialize(&bytes).ok()?;
+    let wire: crate::unit::FileUnitsWire = bincode::deserialize(&bytes).ok()?;
+    let mut cached: FileUnits = wire.into_real(label_interner);
     for unit in &mut cached.units {
         unit.file = path.to_path_buf();
     }
@@ -156,8 +168,46 @@ pub fn store(root: &Path, key: u128, value: &FileUnits) {
 
 #[cfg(test)]
 mod tests {
-    use super::key;
+    use super::{key, load, store};
     use crate::config::{Config, Normalizer};
+
+    /// Interning WP end-to-end: `store` (real per-scan interner) → `load` (a FRESH
+    /// per-scan interner, simulating a new process reusing a warm cache) through the
+    /// ACTUAL `cache::store`/`cache::load` functions (not a hand-rolled
+    /// serialize/deserialize) — a cache hit must be byte-identical to a cold
+    /// extraction in every observable way (fingerprint, tree shape), matching this
+    /// module's own doc-comment contract.
+    #[test]
+    fn store_then_load_round_trips_through_a_fresh_label_interner() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let cfg = Config::default();
+        let src =
+            "func f(a int) int {\n\tfor i := 0; i < a; i++ {\n\t\ta += i\n\t}\n\treturn a\n}\n";
+        let path = std::path::Path::new("f.go");
+
+        let write_interner = crate::intern::LabelInterner::new();
+        let original = crate::unit::extract_file_units_keep_raw(
+            path,
+            src,
+            crate::lang::Lang::Go,
+            &cfg,
+            &write_interner,
+        );
+        assert!(!original.units.is_empty(), "fixture produced no units");
+        let k = key("f.go", src, &cfg);
+        store(root, k, &original);
+
+        let read_interner = crate::intern::LabelInterner::new();
+        let reloaded = load(root, k, path, &read_interner).expect("cache hit");
+
+        assert_eq!(original.units.len(), reloaded.units.len());
+        for (o, r) in original.units.iter().zip(reloaded.units.iter()) {
+            assert_eq!(o.fingerprint, r.fingerprint);
+            assert_eq!(o.tree, r.tree);
+        }
+        assert_eq!(original.raw_trees, reloaded.raw_trees);
+    }
 
     #[test]
     fn key_distinguishes_the_normalizer_selector() {

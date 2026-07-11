@@ -336,7 +336,7 @@ fn apply_counter_iter(
         .map(|c| apply_counter_iter(c, root, edits, log))
         .collect();
     let locus = node.span;
-    for (coll, ivar, _span) in pass::fold_counter_loops(&mut node, root) {
+    for (coll, ivar, _span) in pass::fold_counter_loops(&mut node, root, log.label_interner()) {
         let Some(Edit::CounterIter { .. }) = edits.next() else {
             unreachable!("apply routed a non-CounterIter edit into apply_counter_iter");
         };
@@ -428,7 +428,7 @@ fn apply_abstract_idents(
     };
     let locals: HashMap<&str, u32> = map.iter().map(|(n, name)| (name.as_ref(), *n)).collect();
     let mut node = node;
-    pass::relabel_from_map(&mut node, &locals);
+    pass::relabel_from_map(&mut node, &locals, log.label_interner());
     if log.enabled() {
         let span = node.span;
         let witness: Vec<String> = map.iter().map(|(n, name)| format!("v{n}={name}")).collect();

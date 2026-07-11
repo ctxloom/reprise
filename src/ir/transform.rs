@@ -11,7 +11,9 @@
 //! relocated out of the hashable tree — which *is* the event payload that makes
 //! "un-apply the transform" well-defined.
 
+use crate::intern::LabelInterner;
 use std::fmt::Write as _;
+use std::sync::Arc;
 
 /// Closed, versioned vocabulary of normalization transforms (`docs/SIMILARITY-IR.md`
 /// §15). Bijective ones invert from a trivial witness; lossy ones need a real one.
@@ -114,7 +116,17 @@ pub struct TransformEvent {
 }
 
 /// The per-unit event log: append-only, ordered, deterministic.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// Interning WP (session `stark-mixed-front`): also carries the per-scan
+/// [`LabelInterner`] that `Label::External`/`Label::LitKept` construction sites reach
+/// through — this log is already threaded through essentially the entire IR-frontend
+/// recursive descent, so piggybacking the interner here means construction sites that
+/// already take `log: &mut TransformLog` need no new parameter at all (see the
+/// interning preamble). `label_interner` is deliberately excluded from `Debug`/
+/// `PartialEq`/`Eq`/`Clone`'s semantics below (hand-rolled, not derived): it is pure
+/// plumbing, not part of "did the same transforms happen" — `TransformEvent`/`Witness`
+/// never reference it.
+#[derive(Debug, Clone)]
 pub struct TransformLog {
     events: Vec<TransformEvent>,
     /// A disabled log is the null sink (D-IR-10): [`record`](Self::record) early-
@@ -132,23 +144,71 @@ pub struct TransformLog {
     /// Set when the depth guard truncated an over-deep subtree, so the unit can be flagged
     /// `parse_degraded` (never a silent drop — spec §5.1/§12 never-drop-but-flag).
     truncated: bool,
+    /// The per-scan label interner External/LitKept construction reaches through this
+    /// log. Defaults to a fresh, private, throwaway interner (see
+    /// [`new`](Self::new)/[`disabled`](Self::disabled)) so every existing zero-argument
+    /// call site keeps compiling unchanged; the ONE real per-scan instance is threaded
+    /// in explicitly via [`new_with`](Self::new_with)/[`disabled_with`](Self::disabled_with)
+    /// at the actual scan entry point (`frontend::collect_ir_units`).
+    label_interner: Arc<LabelInterner>,
 }
+
+impl Default for TransformLog {
+    fn default() -> Self {
+        TransformLog::new()
+    }
+}
+
+impl PartialEq for TransformLog {
+    fn eq(&self, other: &Self) -> bool {
+        self.events == other.events
+            && self.disabled == other.disabled
+            && self.depth == other.depth
+            && self.truncated == other.truncated
+    }
+}
+impl Eq for TransformLog {}
 
 impl TransformLog {
     pub fn new() -> Self {
-        Self::default()
+        Self::new_with(LabelInterner::new())
+    }
+
+    /// Like [`new`](Self::new), but reaching through to a caller-supplied per-scan
+    /// label interner (the real production path uses this).
+    pub fn new_with(label_interner: Arc<LabelInterner>) -> Self {
+        TransformLog {
+            events: Vec::new(),
+            disabled: false,
+            depth: 0,
+            truncated: false,
+            label_interner,
+        }
     }
 
     /// The null sink for the bulk-scan path (`docs/transform-seam.md` §1): recording
     /// is a no-op that allocates nothing, so completing the (hash-excluded) event
     /// stream costs nothing and cannot move the tree.
     pub fn disabled() -> Self {
+        Self::disabled_with(LabelInterner::new())
+    }
+
+    /// Like [`disabled`](Self::disabled), but reaching through to a caller-supplied
+    /// per-scan label interner (the real production path uses this).
+    pub fn disabled_with(label_interner: Arc<LabelInterner>) -> Self {
         Self {
             events: Vec::new(),
             disabled: true,
             depth: 0,
             truncated: false,
+            label_interner,
         }
+    }
+
+    /// The per-scan label interner External/LitKept construction sites reach through
+    /// this log to intern text into.
+    pub fn label_interner(&self) -> &Arc<LabelInterner> {
+        &self.label_interner
     }
 
     /// Current CST-recursion depth (the DoS guard's counter). Tracked in both sinks.

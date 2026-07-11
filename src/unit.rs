@@ -26,7 +26,10 @@ pub struct VariantTag {
     pub scc: bool,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// `Deserialize` is NOT derived (see `tree::Label`'s doc comment: `NormNode`'s own
+/// `Deserialize` isn't derived either, since `Label::External`/`LitKept` need the
+/// current scan's `LabelInterner`) — deserialize through [`UnitWire`] instead.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Unit {
     pub file: PathBuf,
     pub lang: Lang,
@@ -43,6 +46,42 @@ pub struct Unit {
     pub tree: NormNode,
     /// Some for inline-expanded variants; None for plain units.
     pub variant: Option<VariantTag>,
+}
+
+/// Deserialize-only mirror of [`Unit`] — see [`crate::tree::NormNodeWire`].
+#[derive(serde::Deserialize)]
+pub struct UnitWire {
+    pub file: PathBuf,
+    pub lang: Lang,
+    pub name: String,
+    pub byte_span: (u32, u32),
+    pub line_span: (u32, u32),
+    pub token_count: u32,
+    pub parse_degraded: bool,
+    pub is_test: bool,
+    pub accept_drift: bool,
+    pub fingerprint: u128,
+    pub tree: crate::tree::NormNodeWire,
+    pub variant: Option<VariantTag>,
+}
+
+impl UnitWire {
+    pub fn into_real(self, label_interner: &std::sync::Arc<crate::intern::LabelInterner>) -> Unit {
+        Unit {
+            file: self.file,
+            lang: self.lang,
+            name: self.name,
+            byte_span: self.byte_span,
+            line_span: self.line_span,
+            token_count: self.token_count,
+            parse_degraded: self.parse_degraded,
+            is_test: self.is_test,
+            accept_drift: self.accept_drift,
+            fingerprint: self.fingerprint,
+            tree: self.tree.into_real(label_interner),
+            variant: self.variant,
+        }
+    }
 }
 
 /// Internal duplication inside one unit (spec §5.3 direct finding).
@@ -62,7 +101,11 @@ pub struct InternalRepeat {
 /// One file's extraction, keeping the raw (pre-pass) trees alive for the
 /// inliner's definition table (spec §5.4: the table is built from raw trees
 /// so recursion lowering can fire on SCC-expanded variants).
-#[derive(serde::Serialize, serde::Deserialize)]
+///
+/// `Deserialize` is NOT derived — see [`Unit`]'s doc comment; deserialize through
+/// [`FileUnitsWire`], which `cache::load` does (re-interning `Label` text into the
+/// current scan's `LabelInterner`).
+#[derive(serde::Serialize)]
 pub struct FileUnits {
     pub units: Vec<Unit>,
     pub repeats: Vec<InternalRepeat>,
@@ -71,6 +114,37 @@ pub struct FileUnits {
     /// Units suppressed by the `reprise:ignore` pragma (spec §2, §12: the
     /// count must be visible so suppression can't silently accumulate).
     pub suppressed: usize,
+}
+
+/// Deserialize-only mirror of [`FileUnits`] — see [`crate::tree::NormNodeWire`].
+#[derive(serde::Deserialize)]
+pub struct FileUnitsWire {
+    pub units: Vec<UnitWire>,
+    pub repeats: Vec<InternalRepeat>,
+    pub raw_trees: Vec<crate::tree::NormNodeWire>,
+    pub suppressed: usize,
+}
+
+impl FileUnitsWire {
+    pub fn into_real(
+        self,
+        label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+    ) -> FileUnits {
+        FileUnits {
+            units: self
+                .units
+                .into_iter()
+                .map(|u| u.into_real(label_interner))
+                .collect(),
+            repeats: self.repeats,
+            raw_trees: self
+                .raw_trees
+                .into_iter()
+                .map(|t| t.into_real(label_interner))
+                .collect(),
+            suppressed: self.suppressed,
+        }
+    }
 }
 
 /// Unit pragmas (spec §2 + D41): a comment containing a marker on the unit's
@@ -119,13 +193,19 @@ fn accepts_drift(lines: &[&str], first_line: u32) -> bool {
         .is_some_and(|ln| lines[ln as usize - 1].contains("reprise:accept-drift"))
 }
 
-pub fn extract_file_units_keep_raw(path: &Path, src: &str, lang: Lang, cfg: &Config) -> FileUnits {
+pub fn extract_file_units_keep_raw(
+    path: &Path,
+    src: &str,
+    lang: Lang,
+    cfg: &Config,
+    label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+) -> FileUnits {
     // Normalizer selector (non-boolean, plugin-extensible — D-IR-3): the "ir" plugin
     // lowers directly to the canonical IR (D-IR-1a) and skips the historical passes.
     // A language without an IR frontend yet (TS, Kotlin) falls back to the historical
     // normalizer so those files still scan (per-language capability gate, §9 P2).
     if cfg.normalize.normalizer == Normalizer::Ir && crate::frontend::has_ir_frontend(lang) {
-        return extract_ir_file_units(path, src, lang, cfg);
+        return extract_ir_file_units(path, src, lang, cfg, label_interner);
     }
     // `normalizer = "historical"` (or an IR-frontend-less language under `"ir"`, which also
     // falls to this branch) is about to call `lang.profile()` below (via `pass_and_fold`). C
@@ -158,7 +238,7 @@ pub fn extract_file_units_keep_raw(path: &Path, src: &str, lang: Lang, cfg: &Con
         let accept_drift = accepts_drift(&lines, raw.line_span.0);
         let raw_tree =
             std::mem::replace(&mut raw.tree, NormNode::new("", None, (0, 0), Vec::new()));
-        let (tree, found) = pass_and_fold(raw_tree.clone(), lang, cfg);
+        let (tree, found) = pass_and_fold(raw_tree.clone(), lang, cfg, label_interner);
         let unit = unit_from_tree(path, lang, &raw, tree, accept_drift);
         for f in found {
             // Report a run only when the duplicated mass clears the sequence floor.
@@ -188,7 +268,13 @@ pub fn extract_file_units_keep_raw(path: &Path, src: &str, lang: Lang, cfg: &Con
 /// canonical IR, sibling-run folded (spec §5.3 / D30, on the canonical kinds via
 /// [`crate::ir::FoldRules`]), fingerprinted, and flowed through the same matching back
 /// half as the historical path. (Inline variants remain deferred — back-half, §3.)
-fn extract_ir_file_units(path: &Path, src: &str, lang: Lang, cfg: &Config) -> FileUnits {
+fn extract_ir_file_units(
+    path: &Path,
+    src: &str,
+    lang: Lang,
+    cfg: &Config,
+    label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+) -> FileUnits {
     let mut out = FileUnits {
         units: Vec::new(),
         repeats: Vec::new(),
@@ -196,7 +282,7 @@ fn extract_ir_file_units(path: &Path, src: &str, lang: Lang, cfg: &Config) -> Fi
         suppressed: 0,
     };
     let lines: Vec<&str> = src.lines().collect();
-    for u in crate::frontend::extract_ir_units(src, lang, path) {
+    for u in crate::frontend::extract_ir_units(src, lang, path, label_interner) {
         if is_suppressed(&lines, u.line_span.0) {
             out.suppressed += 1;
             continue;
@@ -254,18 +340,29 @@ fn extract_ir_file_units(path: &Path, src: &str, lang: Lang, cfg: &Config) -> Fi
     out
 }
 
+/// Public convenience entry point (bypasses `corpus_units`'s per-scan interner
+/// plumbing — kept a stable, unchanged public signature per the interning WP's
+/// escalation rule: `reprise-mcp` and many tests call this directly). Constructs its
+/// own throwaway, single-call-scoped `LabelInterner` — a degenerate one-call "scan",
+/// consistent with the per-scan scoping used everywhere else.
 pub fn extract_file_units(
     path: &Path,
     src: &str,
     lang: Lang,
     cfg: &Config,
 ) -> (Vec<Unit>, Vec<InternalRepeat>) {
-    let f = extract_file_units_keep_raw(path, src, lang, cfg);
+    let label_interner = crate::intern::LabelInterner::new();
+    let f = extract_file_units_keep_raw(path, src, lang, cfg, &label_interner);
     (f.units, f.repeats)
 }
 
-fn pass_and_fold(tree: NormNode, lang: Lang, cfg: &Config) -> (NormNode, Vec<RepeatFinding>) {
-    let tree = normalize::apply_passes(tree, lang, cfg);
+fn pass_and_fold(
+    tree: NormNode,
+    lang: Lang,
+    cfg: &Config,
+    label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+) -> (NormNode, Vec<RepeatFinding>) {
+    let tree = normalize::apply_passes(tree, lang, cfg, label_interner);
     let mut found: Vec<RepeatFinding> = Vec::new();
     let tree = fold::fold_repeats(
         tree,
@@ -290,12 +387,13 @@ fn ir_pass_and_fold(
     root_name: &str,
     lang: Lang,
     cfg: &Config,
+    label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
 ) -> (NormNode, Vec<RepeatFinding>) {
     let expanded = ir_relower_recursion(expanded, root_name);
     let tree = crate::frontend::run_passes(
         expanded,
         lang,
-        &mut crate::ir::transform::TransformLog::disabled(),
+        &mut crate::ir::transform::TransformLog::disabled_with(label_interner.clone()),
     );
     let mut found: Vec<RepeatFinding> = Vec::new();
     let tree = fold::fold_repeats_with(
@@ -373,14 +471,15 @@ pub fn finish_variant(
     base: &Unit,
     expanded: NormNode,
     cfg: &Config,
+    label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
 ) -> Option<Unit> {
     // IR-path variants re-run the canonical IR passes (`frontend::run_passes`) rather
     // than the historical `apply_passes`, so a spliced variant converges with the
     // frontend's own canonical form for the equivalent hand-inlined function.
     let (tree, _found) = if is_ir(base.lang, cfg) {
-        ir_pass_and_fold(expanded, &base.name, base.lang, cfg)
+        ir_pass_and_fold(expanded, &base.name, base.lang, cfg, label_interner)
     } else {
-        pass_and_fold(expanded, base.lang, cfg)
+        pass_and_fold(expanded, base.lang, cfg, label_interner)
     };
     let fingerprint = fingerprint::merkle(&tree);
     if fingerprint == base.fingerprint {
@@ -510,14 +609,26 @@ mod tests {
         let cfg = ir_cfg();
         // A run of ≥3 identical statements folds to a REPEAT (proves fold is wired on the
         // IR path) — the convergence that makes rolled duplication detectable.
+        let label_interner = crate::intern::LabelInterner::new();
         let folded = "fn f(a: i32) { g(a); g(a); g(a); g(a); }";
-        let fu =
-            extract_file_units_keep_raw(std::path::Path::new("m.rs"), folded, Lang::Rust, &cfg);
+        let fu = extract_file_units_keep_raw(
+            std::path::Path::new("m.rs"),
+            folded,
+            Lang::Rust,
+            &cfg,
+            &label_interner,
+        );
         assert!(has_repeat(&fu.units[0].tree), "run did not fold to REPEAT");
 
         // A run of substantial statements also clears the reporting floor → a finding.
         let big = "fn f(a: i32, xs: &[i32]) { let t = a + xs[a] * 7 + xs[a]; let t = a + xs[a] * 7 + xs[a]; let t = a + xs[a] * 7 + xs[a]; let t = a + xs[a] * 7 + xs[a]; }";
-        let fb = extract_file_units_keep_raw(std::path::Path::new("m.rs"), big, Lang::Rust, &cfg);
+        let fb = extract_file_units_keep_raw(
+            std::path::Path::new("m.rs"),
+            big,
+            Lang::Rust,
+            &cfg,
+            &label_interner,
+        );
         assert!(
             !fb.repeats.is_empty(),
             "no internal-repeat finding above the floor"

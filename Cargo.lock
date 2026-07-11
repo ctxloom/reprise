@@ -786,6 +786,7 @@ dependencies = [
  "anyhow",
  "bincode",
  "clap",
+ "dashmap",
  "globset",
  "ignore",
  "mimalloc",

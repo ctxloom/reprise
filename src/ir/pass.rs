@@ -34,7 +34,11 @@ pub fn detect_abstract_idents(root: &NormNode) -> Vec<Edit> {
     // Compute the first-occurrence local order via the historical relabel walk on a
     // throwaway clone — the same traversal the applier uses, so the indices agree.
     let mut order: HashMap<Box<str>, u32> = HashMap::new();
-    relabel(&mut root.clone(), &declared, &mut order);
+    // Throwaway interner: `relabel`'s output tree here is discarded (only `order`, the
+    // name→index map, survives into the `Edit`), so it needs no connection to any real
+    // scan's `LabelInterner` — see the interning preamble.
+    let scratch_interner = crate::intern::LabelInterner::new();
+    relabel(&mut root.clone(), &declared, &mut order, &scratch_interner);
     let mut map: Vec<(u32, Box<str>)> = order.into_iter().map(|(name, n)| (n, name)).collect();
     map.sort_unstable_by_key(|&(n, _)| n);
     vec![Edit::AbstractIdents { map }]
@@ -66,7 +70,12 @@ fn collect_declared(node: &NormNode, out: &mut HashSet<Box<str>>) {
     }
 }
 
-fn relabel(node: &mut NormNode, declared: &HashSet<Box<str>>, order: &mut HashMap<Box<str>, u32>) {
+fn relabel(
+    node: &mut NormNode,
+    declared: &HashSet<Box<str>>,
+    order: &mut HashMap<Box<str>, u32>,
+    label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+) {
     if node.kind.as_ref() == kind::VAR
         && let Some(Label::Raw(t)) = node.label.clone()
     {
@@ -74,11 +83,11 @@ fn relabel(node: &mut NormNode, declared: &HashSet<Box<str>>, order: &mut HashMa
             let next = order.len() as u32;
             Label::Local(*order.entry(t).or_insert(next))
         } else {
-            Label::External(t)
+            Label::External(label_interner.intern(&t))
         });
     }
     for c in &mut node.children {
-        relabel(c, declared, order);
+        relabel(c, declared, order, label_interner);
     }
 }
 
@@ -86,17 +95,21 @@ fn relabel(node: &mut NormNode, declared: &HashSet<Box<str>>, order: &mut HashMa
 /// [`AbstractIdents`](Edit::AbstractIdents): a `Raw` `Var` named in `locals` becomes its
 /// positional `Local`, every other `Raw` `Var` becomes `External`. Reproduces [`relabel`]
 /// from the precomputed map (same indices), so the two paths agree byte-for-byte.
-pub(crate) fn relabel_from_map(node: &mut NormNode, locals: &HashMap<&str, u32>) {
+pub(crate) fn relabel_from_map(
+    node: &mut NormNode,
+    locals: &HashMap<&str, u32>,
+    label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+) {
     if node.kind.as_ref() == kind::VAR
         && let Some(Label::Raw(t)) = node.label.clone()
     {
         node.label = Some(match locals.get(t.as_ref()) {
             Some(&n) => Label::Local(n),
-            None => Label::External(t),
+            None => Label::External(label_interner.intern(&t)),
         });
     }
     for c in &mut node.children {
-        relabel_from_map(c, locals);
+        relabel_from_map(c, locals, label_interner);
     }
 }
 
@@ -154,7 +167,7 @@ fn comm_sort_edits(node: &NormNode, out: &mut Vec<Edit>) -> NormNode {
                     order,
                 });
             }
-            return rebuild_chain(sorted, op, node.field.clone(), node.span);
+            return rebuild_chain(sorted, op, node.field, node.span);
         }
     }
     let mut n = node.shallow_clone();
@@ -201,7 +214,7 @@ pub(crate) fn flatten_chain(node: &NormNode, op: &str, out: &mut Vec<NormNode>) 
 pub(crate) fn rebuild_chain(
     mut operands: Vec<NormNode>,
     op: NormNode,
-    field: Option<Box<str>>,
+    field: Option<crate::intern::Field>,
     root_span: (u32, u32),
 ) -> NormNode {
     let span = operands[0].span;
@@ -331,7 +344,7 @@ fn classify_not(operand: &NormNode) -> Option<NotReduction> {
 /// child negations record their own events as they recurse.
 fn push_not(node: NormNode, red: NotReduction, steps: &mut Vec<BoolStep>) -> NormNode {
     let locus = node.span;
-    let field = node.field.clone();
+    let field = node.field;
     steps.push((TransformKind::NotPush, locus, Witness::None));
     let inner = take_operand(node); // the operand `x`, dropping the `!`
     let reduced = match red {
@@ -933,7 +946,11 @@ pub(crate) fn index_loop_match(body: &NormNode) -> Option<IndexLoop> {
 /// A callee's name, matched whether still `Raw` (a plain `range`/`len` identifier — this
 /// pass runs pre-abstraction) or already `External` (synthesized `__next`, Rust `.len`).
 fn label_name_is(label: &Option<Label>, name: &str) -> bool {
-    matches!(label, Some(Label::External(t) | Label::Raw(t)) if t.as_ref() == name)
+    match label {
+        Some(Label::External(t)) => t.as_ref() == name,
+        Some(Label::Raw(t)) => t.as_ref() == name,
+        _ => false,
+    }
 }
 
 /// The single argument of a `Call` whose callee is named `name` (`__next` / `__has_next`).
@@ -1102,7 +1119,11 @@ pub fn detect_counter_iter(node: &NormNode) -> Vec<Edit> {
     // `node` is the whole unit tree; pass it as the `root` for the counter's function-scoped
     // liveness check (a counter used ANYWHERE outside the (init, loop) pair is live — oozy-rover
     // minor c). It stays constant through the recursion so a nested block still sees the whole unit.
-    counter_iter_edits(node, node, &mut edits);
+    // Throwaway interner (interning WP): this detector's rewritten preview tree is discarded —
+    // only `edits` survives into the real applier (`ir::edit::apply_counter_iter`, which uses
+    // the REAL per-scan interner) — see the interning preamble.
+    let scratch_interner = crate::intern::LabelInterner::new();
+    counter_iter_edits(node, node, &mut edits, &scratch_interner);
     edits
 }
 
@@ -1110,15 +1131,20 @@ pub fn detect_counter_iter(node: &NormNode) -> Vec<Edit> {
 /// nested counter loop settles first) and return the rewritten subtree, so the walk stays in
 /// step with the applier. Both sides drive the shared [`fold_counter_loops`], so the matches —
 /// and the emitted/consumed edit order — agree by construction.
-fn counter_iter_edits(node: &NormNode, root: &NormNode, out: &mut Vec<Edit>) -> NormNode {
+fn counter_iter_edits(
+    node: &NormNode,
+    root: &NormNode,
+    out: &mut Vec<Edit>,
+    label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+) -> NormNode {
     let mut n = node.shallow_clone();
     n.children = node
         .children
         .iter()
-        .map(|c| counter_iter_edits(c, root, out))
+        .map(|c| counter_iter_edits(c, root, out, label_interner))
         .collect();
     let locus = n.span;
-    for (coll, ivar, _span) in fold_counter_loops(&mut n, root) {
+    for (coll, ivar, _span) in fold_counter_loops(&mut n, root, label_interner) {
         out.push(Edit::CounterIter { locus, coll, ivar });
     }
     n
@@ -1141,7 +1167,11 @@ pub(crate) type CounterMatch = (Box<str>, Box<str>, (u32, u32));
 /// coll` lowers). Returns one `(coll, ivar, span)` per rewritten loop, in block order — a
 /// firing pair is exactly a detected site, so detector and applier stay in lockstep (like
 /// [`fold_loop_exit`]). A no-op on non-`Block` nodes.
-pub(crate) fn fold_counter_loops(block: &mut NormNode, root: &NormNode) -> Vec<CounterMatch> {
+pub(crate) fn fold_counter_loops(
+    block: &mut NormNode,
+    root: &NormNode,
+    label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+) -> Vec<CounterMatch> {
     if block.kind.as_ref() != kind::BLOCK {
         return Vec::new();
     }
@@ -1165,7 +1195,7 @@ pub(crate) fn fold_counter_loops(block: &mut NormNode, root: &NormNode) -> Vec<C
             && let Some((coll, ivar, span)) = matched[k - 1].clone()
         {
             let mut loop_node = child;
-            rewrite_counter_loop(&mut loop_node, &ivar, &coll, span);
+            rewrite_counter_loop(&mut loop_node, &ivar, &coll, span, label_interner);
             matches.push((coll, ivar, span));
             out.push(loop_node);
         } else {
@@ -1350,6 +1380,7 @@ pub(crate) fn rewrite_counter_loop(
     ivar: &str,
     coll: &str,
     span: (u32, u32),
+    label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
 ) {
     use crate::frontend::{break_guard, call_ext, make_assign};
     let coll_var = |field: Option<&str>| {
@@ -1368,12 +1399,12 @@ pub(crate) fn rewrite_counter_loop(
         .with_label(Label::Raw(ivar.into()));
     let mut new_body = Vec::with_capacity(old.len());
     new_body.push(break_guard(
-        call_ext("__has_next", coll_var(None), span),
+        call_ext("__has_next", coll_var(None), span, label_interner),
         span,
     ));
     new_body.push(make_assign(
         target,
-        call_ext("__next", coll_var(None), span),
+        call_ext("__next", coll_var(None), span, label_interner),
         span,
     ));
     for (i, stmt) in old.into_iter().enumerate() {

@@ -82,15 +82,23 @@ impl LanguageProfile for PythonProfile {
         walk(root, out);
     }
 
-    fn lower_loops(&self, node: NormNode) -> NormNode {
-        lower(node)
+    fn lower_loops(
+        &self,
+        node: NormNode,
+        label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+    ) -> NormNode {
+        lower(node, label_interner)
     }
 
     fn lower_recursion(&self, root: NormNode) -> NormNode {
         lower_recursion(root)
     }
 
-    fn rewrite_iteration(&self, root: NormNode) -> NormNode {
+    fn rewrite_iteration(
+        &self,
+        root: NormNode,
+        _label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+    ) -> NormNode {
         rewrite_iteration(root)
     }
 
@@ -251,8 +259,15 @@ fn collect_param_idents(node: &NormNode, out: &mut Vec<Box<str>>) {
 
 /// Lower `while cond` / `for x in xs` to the `while True` core (spec §5.2.2),
 /// mirroring the exact shapes tree-sitter produces for the manual form.
-fn lower(mut node: NormNode) -> NormNode {
-    node.children = node.children.into_iter().map(lower).collect();
+fn lower(
+    mut node: NormNode,
+    label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+) -> NormNode {
+    node.children = node
+        .children
+        .into_iter()
+        .map(|c| lower(c, label_interner))
+        .collect();
     match node.kind.as_ref() {
         "while_statement" => {
             let is_true_cond = node
@@ -287,9 +302,9 @@ fn lower(mut node: NormNode) -> NormNode {
                 return node;
             };
             right.field = None;
-            let guard = break_unless(call("__has_next", None, right.clone()));
+            let guard = break_unless(call("__has_next", None, right.clone(), label_interner));
             left.field = Some("left".into());
-            let next = call("__next", Some("right"), right);
+            let next = call("__next", Some("right"), right, label_interner);
             let span_left = left.span;
             let assign = NormNode::new("assignment", None, span_left, vec![left, next]);
             let assign_stmt = NormNode::new("expression_statement", None, span_left, vec![assign]);
@@ -321,8 +336,13 @@ fn break_unless(cond: NormNode) -> NormNode {
     NormNode::new("if_statement", None, span, vec![negated, consequence])
 }
 
-fn call(name: &str, field: Option<&str>, arg: NormNode) -> NormNode {
-    synth_call("call", "argument_list", name, field, arg)
+fn call(
+    name: &str,
+    field: Option<&str>,
+    arg: NormNode,
+    label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+) -> NormNode {
+    synth_call("call", "argument_list", name, field, arg, label_interner)
 }
 
 // ---- recursion lowering ----

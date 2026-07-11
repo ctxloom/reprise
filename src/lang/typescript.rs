@@ -145,15 +145,23 @@ impl LanguageProfile for TypeScriptProfile {
         walk(root, out);
     }
 
-    fn lower_loops(&self, node: NormNode) -> NormNode {
-        lower(node)
+    fn lower_loops(
+        &self,
+        node: NormNode,
+        label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+    ) -> NormNode {
+        lower(node, label_interner)
     }
 
     fn lower_recursion(&self, root: NormNode) -> NormNode {
         lower_recursion(root)
     }
 
-    fn rewrite_iteration(&self, root: NormNode) -> NormNode {
+    fn rewrite_iteration(
+        &self,
+        root: NormNode,
+        _label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+    ) -> NormNode {
         rewrite_iteration(root)
     }
 
@@ -315,14 +323,33 @@ fn break_unless(mut cond: NormNode) -> NormNode {
     NormNode::new("if_statement", None, span, vec![negated, consequence])
 }
 
-fn call(name: &str, field: Option<&str>, arg: NormNode) -> NormNode {
-    synth_call("call_expression", "arguments", name, field, arg)
+fn call(
+    name: &str,
+    field: Option<&str>,
+    arg: NormNode,
+    label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+) -> NormNode {
+    synth_call(
+        "call_expression",
+        "arguments",
+        name,
+        field,
+        arg,
+        label_interner,
+    )
 }
 
 /// Lower while / do / for-of / for-in to the `while (true)` core; hoist
 /// three-clause `for` inits and append their steps at the statement level.
-fn lower(mut node: NormNode) -> NormNode {
-    node.children = node.children.into_iter().map(lower).collect();
+fn lower(
+    mut node: NormNode,
+    label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+) -> NormNode {
+    node.children = node
+        .children
+        .into_iter()
+        .map(|c| lower(c, label_interner))
+        .collect();
     // Expand three-clause fors inside statement containers (a for produces
     // init + while, which lower() alone cannot return as one node).
     if node.kind.as_ref() == "statement_block" {
@@ -374,7 +401,7 @@ fn lower(mut node: NormNode) -> NormNode {
                 vec![true_node(span), body],
             )
         }
-        "for_in_statement" => lower_for_in(node),
+        "for_in_statement" => lower_for_in(node, label_interner),
         // Arrow → function expression (spec §5.2.3): `(x) => x+1` converges
         // with `function(x){ return x+1 }`. Only parenthesized-param arrows
         // are canonicalized; bare-param arrows (`x => …`) are left as-is
@@ -412,7 +439,10 @@ fn desugar_arrow(mut node: NormNode) -> NormNode {
 /// `while (true) { if (!__has_next(xs)) break; const x = __next(xs); body }`.
 /// (of/in are dropped anon tokens post-convert, so both forms lower alike —
 /// accepted, DECISIONS.md D23.)
-fn lower_for_in(mut node: NormNode) -> NormNode {
+fn lower_for_in(
+    mut node: NormNode,
+    label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+) -> NormNode {
     let field = node.field.as_deref().map(str::to_owned);
     let span = node.span;
     let (Some(mut left), Some(mut right), Some(mut body)) = (
@@ -423,9 +453,9 @@ fn lower_for_in(mut node: NormNode) -> NormNode {
         return node;
     };
     right.field = None;
-    let guard = break_unless(call("__has_next", None, right.clone()));
+    let guard = break_unless(call("__has_next", None, right.clone(), label_interner));
     left.field = Some("name".into());
-    let next = call("__next", Some("value"), right);
+    let next = call("__next", Some("value"), right, label_interner);
     let declr = NormNode::new("variable_declarator", None, span, vec![left, next]);
     let bind = NormNode::new("lexical_declaration", None, span, vec![declr]);
     body.children.insert(0, guard);

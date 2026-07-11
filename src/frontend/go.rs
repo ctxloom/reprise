@@ -323,7 +323,10 @@ fn lower_range_into(
     else {
         return;
     };
-    let guard = break_guard(call_ext("__has_next", iter.clone(), span), span);
+    let guard = break_guard(
+        call_ext("__has_next", iter.clone(), span, log.label_interner()),
+        span,
+    );
     body.children.insert(0, guard);
     if let Some(left) = clause.child_by_field_name("left") {
         let mut targets = lower_targets(fe, left, true, src, log);
@@ -333,7 +336,7 @@ fn lower_range_into(
         // rewrite (Go counter ≡ Go range ≡ Rust foreach).
         targets.retain(|t| !is_blank_target(t));
         if !targets.is_empty() {
-            let mut value = call_ext("__next", iter, span);
+            let mut value = call_ext("__next", iter, span, log.label_interner());
             value.field = Some("value".into());
             let mut children = targets;
             children.push(value);
@@ -386,7 +389,7 @@ fn lower_switch(
                 case.child_by_field_name("type").and_then(|t| {
                     let ty = fe.lower_node(t, None, src, log)?;
                     Some(match subject.as_ref() {
-                        Some(subj) => matches_guard(subj, ty, span),
+                        Some(subj) => matches_guard(subj, ty, span, log),
                         None => ty,
                     })
                 }),
@@ -524,7 +527,7 @@ fn lower_inc_dec(
     let read = lvalue.and_then(|n| fe.lower_node(n, Some("left"), src, log));
     let op = NormNode::new(op_text, Some("op"), span, Vec::new());
     let one = NormNode::new(kind::LIT, Some("right"), span, Vec::new())
-        .with_label(Label::LitKept("1".into()));
+        .with_label(Label::LitKept(log.label_interner().intern("1")));
     let binop = NormNode::new(
         kind::BINOP,
         Some("value"),

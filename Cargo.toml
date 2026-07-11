@@ -23,6 +23,16 @@ exclude = [
 anyhow = "1.0.103"
 bincode = "1.3"
 clap = { version = "4.6.1", features = ["derive"] }
+# Interning WP (session stark-mixed-front): backs the per-scan `LabelInterner`
+# (src/intern.rs). A hand-rolled single `RwLock<HashMap<..>>` was measured to cause
+# severe write-lock contention under rayon's parallel extraction at real corpus scale
+# (~5-6x wall-clock slowdown on a real kernel subtree) — the label vocabulary is
+# open-ended (repo-specific identifiers), unlike the small bounded kind/field table, so
+# it never "saturates" the way that one does and stays write-hot for the whole scan.
+# `dashmap` is already resolved in this workspace's dependency graph (pulled
+# transitively via the MCP/LSP server crates), so this adds no new supply-chain
+# surface — it is the standard, widely-used sharded-concurrent-map crate.
+dashmap = "6.2"
 globset = "0.4.18"
 ignore = "0.4.27"
 rayon = "1.12.0"

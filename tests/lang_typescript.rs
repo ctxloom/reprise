@@ -230,9 +230,10 @@ fn ts_switch_break_is_not_rewritten_as_loop_return() {
     let src = "function f(x: number): number {\n  while (true) {\n    switch (x) {\n      case 1: break;\n      default: x++;\n    }\n    if (x > 10) break;\n  }\n  return x;\n}\n";
     let raw = reprise::normalize::raw_units_from_source(src, Lang::TypeScript);
     let p = Lang::TypeScript.profile();
+    let label_interner = reprise::intern::LabelInterner::new();
     let t = p.lower_recursion(raw.into_iter().next().unwrap().1);
-    let t = p.rewrite_iteration(t);
-    let t = p.lower_loops(t);
+    let t = p.rewrite_iteration(t, &label_interner);
+    let t = p.lower_loops(t, &label_interner);
     let t = p.normalize_loop_exit(t);
 
     fn switch_keeps_break(n: &reprise::tree::NormNode) -> bool {

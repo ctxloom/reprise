@@ -31,7 +31,8 @@ fn write_node(node: &NormNode, out: &mut String) {
 
 fn label_text(label: &Label) -> String {
     match label {
-        Label::Raw(t) | Label::RawLit(t) | Label::External(t) | Label::LitKept(t) => t.to_string(),
+        Label::Raw(t) | Label::RawLit(t) => t.to_string(),
+        Label::External(t) | Label::LitKept(t) => t.as_ref().to_string(),
         Label::Local(n) => format!("v{n}"),
         Label::LitBucket(b) => b.name().to_string(),
     }

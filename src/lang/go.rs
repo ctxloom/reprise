@@ -113,15 +113,23 @@ impl LanguageProfile for GoProfile {
         walk(root, out);
     }
 
-    fn lower_loops(&self, node: NormNode) -> NormNode {
-        lower(node)
+    fn lower_loops(
+        &self,
+        node: NormNode,
+        label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+    ) -> NormNode {
+        lower(node, label_interner)
     }
 
     fn lower_recursion(&self, root: NormNode) -> NormNode {
         lower_recursion(root)
     }
 
-    fn rewrite_iteration(&self, root: NormNode) -> NormNode {
+    fn rewrite_iteration(
+        &self,
+        root: NormNode,
+        _label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+    ) -> NormNode {
         rewrite_iteration(root)
     }
 
@@ -271,15 +279,33 @@ fn break_unless(mut cond: NormNode) -> NormNode {
     NormNode::new("if_statement", None, span, vec![negated, consequence])
 }
 
-fn call(name: &str, arg: NormNode) -> NormNode {
-    synth_call("call_expression", "argument_list", name, None, arg)
+fn call(
+    name: &str,
+    arg: NormNode,
+    label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+) -> NormNode {
+    synth_call(
+        "call_expression",
+        "argument_list",
+        name,
+        None,
+        arg,
+        label_interner,
+    )
 }
 
 /// Lower the Go `for` forms to the infinite-`for` core (spec §5.2.2). Range and
 /// condition-only forms transform in place; the three-clause form is hoisted at
 /// the block level (init + core), which a single-node rewrite cannot express.
-fn lower(mut node: NormNode) -> NormNode {
-    node.children = node.children.into_iter().map(lower).collect();
+fn lower(
+    mut node: NormNode,
+    label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+) -> NormNode {
+    node.children = node
+        .children
+        .into_iter()
+        .map(|c| lower(c, label_interner))
+        .collect();
     if node.kind.as_ref() == "block" {
         node.children = expand_for_clauses(node.children);
     }
@@ -293,7 +319,7 @@ fn lower(mut node: NormNode) -> NormNode {
         .map(|c| c.kind.to_string());
     match clause.as_deref() {
         Some("for_clause") => node, // hoisted at block level
-        Some("range_clause") => lower_range(node),
+        Some("range_clause") => lower_range(node, label_interner),
         Some(_) => lower_while_form(node),
         None => node, // infinite: already the core
     }
@@ -317,7 +343,10 @@ fn lower_while_form(mut node: NormNode) -> NormNode {
 }
 
 /// `for left := range xs { body }` → `for { if !__has_next(xs) break; left = __next(xs); body }`.
-fn lower_range(mut node: NormNode) -> NormNode {
+fn lower_range(
+    mut node: NormNode,
+    label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+) -> NormNode {
     let span = node.span;
     let field = node.field.as_deref().map(str::to_owned);
     let Some(mut body) = node.take_field("body") else {
@@ -336,9 +365,9 @@ fn lower_range(mut node: NormNode) -> NormNode {
         return node;
     };
     right.field = None;
-    let guard = break_unless(call("__has_next", right.clone()));
+    let guard = break_unless(call("__has_next", right.clone(), label_interner));
     left.field = Some("left".into());
-    let next = call("__next", right);
+    let next = call("__next", right, label_interner);
     let rhs = NormNode::new("expression_list", Some("right"), span, vec![next]);
     // `:=` (short_var_declaration), not `=`, so `collect_declared` binds the
     // range variables as locals (the range var is genuinely declared here).

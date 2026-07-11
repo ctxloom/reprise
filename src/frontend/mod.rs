@@ -262,7 +262,7 @@ pub(crate) fn dispatch(
         Lowering::Lit(bucket) => Some(lit(node, field, span, bucket, src, log)),
         Lowering::Leaf(k) => Some(leaf(k, field, span)),
         Lowering::Var => Some(var(node, field, span, src)),
-        Lowering::ExtName => Some(ext_name(node, field, span, src)),
+        Lowering::ExtName => Some(ext_name(node, field, span, src, log)),
         Lowering::Unwrap => unwrap_stmt(fe, node, field, src, log),
         Lowering::DropParens => drop_parens(fe, node, field, span, src, log),
         // A language-local fn-ptr: call it with the same args every shared helper gets.
@@ -519,7 +519,12 @@ pub(crate) fn frontend_table(lang: Lang) -> Option<FrontendTable> {
 
 /// Walk `src`'s CST and IR-normalize every function-like unit — the IR-path analog of
 /// `normalize::extract_raw_units`. Rust/Python/Go.
-pub fn extract_ir_units(src: &str, lang: Lang, path: &std::path::Path) -> Vec<IrUnit> {
+pub fn extract_ir_units(
+    src: &str,
+    lang: Lang,
+    path: &std::path::Path,
+    label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+) -> Vec<IrUnit> {
     let root_kinds = ir_root_kinds(lang);
     if root_kinds.is_empty() {
         return Vec::new();
@@ -532,7 +537,16 @@ pub fn extract_ir_units(src: &str, lang: Lang, path: &std::path::Path) -> Vec<Ir
         return Vec::new();
     };
     let mut out = Vec::new();
-    collect_ir_units(cst.root_node(), src, lang, root_kinds, path, &mut out, 0);
+    collect_ir_units(
+        cst.root_node(),
+        src,
+        lang,
+        root_kinds,
+        path,
+        &mut out,
+        0,
+        label_interner,
+    );
     out
 }
 
@@ -541,6 +555,7 @@ pub fn extract_ir_units(src: &str, lang: Lang, path: &std::path::Path) -> Vec<Ir
 /// untrusted, deeply-nested file would overflow *here* (before or after lowering) too. Past
 /// [`crate::normalize::MAX_EXTRACTION_DEPTH`] we stop searching deeper; a unit nested that far
 /// is itself pathological, and units we already found lower under their own guard.
+#[allow(clippy::too_many_arguments)]
 fn collect_ir_units(
     node: Node,
     src: &str,
@@ -549,6 +564,7 @@ fn collect_ir_units(
     path: &std::path::Path,
     out: &mut Vec<IrUnit>,
     depth: u32,
+    label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
 ) {
     if root_kinds.contains(&node.kind()) {
         // Bulk scan is the read-model selector's disabled sink (D-IR-12 /
@@ -557,7 +573,9 @@ fn collect_ir_units(
         // signal a disabled sink still carries is the depth guard's `truncated` flag: an
         // untrusted, over-deep unit is lowered up to `MAX_EXTRACTION_DEPTH` then truncated,
         // and the flag surfaces as `parse_degraded` (never a silent drop — spec §5.1/§12).
-        let mut log = TransformLog::disabled();
+        // Interning WP: `disabled_with` reaches the per-scan `LabelInterner` through to
+        // every construction site downstream that already threads `log`.
+        let mut log = TransformLog::disabled_with(label_interner.clone());
         let raw = lower_unit_for(lang, node, src, &mut log);
         let tree = run_passes(raw.clone(), lang, &mut log);
         let name = unit_name_for(lang, node, src);
@@ -580,7 +598,16 @@ fn collect_ir_units(
     }
     let mut cursor = node.walk();
     for c in node.named_children(&mut cursor) {
-        collect_ir_units(c, src, lang, root_kinds, path, out, depth + 1);
+        collect_ir_units(
+            c,
+            src,
+            lang,
+            root_kinds,
+            path,
+            out,
+            depth + 1,
+            label_interner,
+        );
     }
 }
 
@@ -624,9 +651,16 @@ pub(crate) fn var(node: Node, field: Option<&str>, span: (u32, u32), src: &str) 
 /// An identifier that is `External` **by structure** (a field/type/package name — it can
 /// never be a declared local), built directly so identifier abstraction leaves it alone.
 /// Mirrors the historical `always_external` hook (spec §5.2.4 exception).
-pub(crate) fn ext_name(node: Node, field: Option<&str>, span: (u32, u32), src: &str) -> NormNode {
-    NormNode::new(kind::VAR, field, span, Vec::new())
-        .with_label(Label::External(text(node, src).into()))
+pub(crate) fn ext_name(
+    node: Node,
+    field: Option<&str>,
+    span: (u32, u32),
+    src: &str,
+    log: &TransformLog,
+) -> NormNode {
+    NormNode::new(kind::VAR, field, span, Vec::new()).with_label(Label::External(
+        log.label_interner().intern(text(node, src)),
+    ))
 }
 
 /// Literals whose identity is *structural* and must not bucket (spec §5.2.5): `0`/`1`/
@@ -656,7 +690,7 @@ pub(crate) fn lit(
         _ => raw.trim().to_string(),
     };
     let label = if LIT_KEEP.contains(&key.as_str()) {
-        Label::LitKept(key.into())
+        Label::LitKept(log.label_interner().intern(&key))
     } else {
         log.record(TransformKind::LitBucket, span, Witness::Literal(raw.into()));
         Label::LitBucket(bucket)
@@ -690,13 +724,9 @@ pub(crate) fn native(
     src: &str,
     log: &mut TransformLog,
 ) -> NormNode {
-    NormNode::new(
-        kind::NATIVE_STMT,
-        field,
-        span,
-        lower_stmts(fe, node, src, log),
-    )
-    .with_label(Label::External(node.kind().into()))
+    let stmts = lower_stmts(fe, node, src, log);
+    let tag = log.label_interner().intern(node.kind());
+    NormNode::new(kind::NATIVE_STMT, field, span, stmts).with_label(Label::External(tag))
 }
 
 pub(crate) fn block(
@@ -965,9 +995,14 @@ pub(crate) fn eq_guard(subject: &NormNode, value: NormNode, span: (u32, u32)) ->
 /// arms). It keeps the subject (two matches on different subjects stay distinct) and the
 /// pattern's captures (declared locals), and — being a `matches` call, not an equality —
 /// correctly does **not** converge with an equality if-chain.
-pub(crate) fn matches_guard(subject: &NormNode, mut pat: NormNode, span: (u32, u32)) -> NormNode {
+pub(crate) fn matches_guard(
+    subject: &NormNode,
+    mut pat: NormNode,
+    span: (u32, u32),
+    log: &TransformLog,
+) -> NormNode {
     let callee = NormNode::new(kind::VAR, Some("callee"), span, Vec::new())
-        .with_label(Label::External("matches".into()));
+        .with_label(Label::External(log.label_interner().intern("matches")));
     let mut subj = subject.clone();
     subj.field = Some("arg".into());
     // Keep a bare-capture pattern's own `@target` (a binding); else it rides as `@arg`.
@@ -1013,7 +1048,12 @@ pub(crate) fn case_guard(
     }
     match (subject, literal) {
         (Some(subj), Some(lit)) => Some(eq_guard(subj, fe.lower_node(lit, None, src, log)?, span)),
-        (Some(subj), None) => Some(matches_guard(subj, lower_pattern(fe, pat, src, log)?, span)),
+        (Some(subj), None) => Some(matches_guard(
+            subj,
+            lower_pattern(fe, pat, src, log)?,
+            span,
+            log,
+        )),
         (None, _) => lower_pattern(fe, pat, src, log),
     }
 }
@@ -1151,10 +1191,17 @@ pub(crate) fn lower_for(
             p
         });
     if let (Some(iter), Some(pat)) = (iter, pat) {
-        let guard = break_guard(call_ext("__has_next", iter.clone(), span), span);
+        let guard = break_guard(
+            call_ext("__has_next", iter.clone(), span, log.label_interner()),
+            span,
+        );
         if pat.kind.as_ref() == kind::VAR {
             // Simple element var (`for x in xs`): bind it directly to `__next`.
-            let bind = make_assign(pat, call_ext("__next", iter, span), span);
+            let bind = make_assign(
+                pat,
+                call_ext("__next", iter, span, log.label_interner()),
+                span,
+            );
             body.children.insert(0, bind);
         } else {
             // Destructuring pattern (`for (k, v) in items`): bind the element to a synthetic
@@ -1169,7 +1216,11 @@ pub(crate) fn lower_for(
             let elem_read =
                 NormNode::new(kind::VAR, None, span, Vec::new()).with_label(Label::Raw(temp));
             let destructure = make_assign(pat, elem_read, span);
-            let bind = make_assign(elem, call_ext("__next", iter, span), span);
+            let bind = make_assign(
+                elem,
+                call_ext("__next", iter, span, log.label_interner()),
+                span,
+            );
             body.children.insert(0, destructure);
             body.children.insert(0, bind);
         }
@@ -1184,9 +1235,14 @@ pub(crate) fn lower_for(
 }
 
 /// Synthesize `name(arg)` with an `External` callee (the `__has_next`/`__next` protocol).
-pub(crate) fn call_ext(name: &str, arg: NormNode, span: (u32, u32)) -> NormNode {
+pub(crate) fn call_ext(
+    name: &str,
+    arg: NormNode,
+    span: (u32, u32),
+    label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+) -> NormNode {
     let callee = NormNode::new(kind::VAR, Some("callee"), span, Vec::new())
-        .with_label(Label::External(name.into()));
+        .with_label(Label::External(label_interner.intern(name)));
     let mut a = arg;
     a.field = Some("arg".into());
     NormNode::new(kind::CALL, None, span, vec![callee, a])
@@ -1240,8 +1296,9 @@ pub(crate) fn lower_field(
     }
     if let Some(name) = node.child_by_field_name(name_f) {
         children.push(
-            NormNode::new(kind::VAR, Some("name"), span_of(name), Vec::new())
-                .with_label(Label::External(text(name, src).into())),
+            NormNode::new(kind::VAR, Some("name"), span_of(name), Vec::new()).with_label(
+                Label::External(log.label_interner().intern(text(name, src))),
+            ),
         );
     }
     NormNode::new(kind::FIELD, field, span, children)

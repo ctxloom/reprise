@@ -186,7 +186,17 @@ pub trait LanguageProfile: Sync {
     fn collect_declared(&self, root: &NormNode, out: &mut Vec<Box<str>>);
 
     /// Loop decomposition into the per-language minimal core (spec §5.2.2).
-    fn lower_loops(&self, node: NormNode) -> NormNode;
+    ///
+    /// `label_interner` (interning WP): the historical normalizer has no `TransformLog`
+    /// seam, so the per-scan `LabelInterner` is threaded explicitly here — only Kotlin's
+    /// `externalize_nav` (a pre-`abstract_idents` forced-External rewrite that a bare
+    /// declared-name collision would otherwise misfire on) actually uses it; every other
+    /// language's impl ignores the parameter.
+    fn lower_loops(
+        &self,
+        node: NormNode,
+        label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+    ) -> NormNode;
 
     // ---- Phase 2 ----
 
@@ -195,8 +205,14 @@ pub trait LanguageProfile: Sync {
     fn lower_recursion(&self, root: NormNode) -> NormNode;
 
     /// Iteration-protocol rewrite: index-over-length → iterated form (§5.2.2).
-    /// Runs before loop lowering (needs intact `for` nodes).
-    fn rewrite_iteration(&self, root: NormNode) -> NormNode;
+    /// Runs before loop lowering (needs intact `for` nodes). `label_interner`: see
+    /// [`lower_loops`](Self::lower_loops)'s doc comment — every language's
+    /// implementation synthesizes an External `__has_next`/`__next` callee here.
+    fn rewrite_iteration(
+        &self,
+        root: NormNode,
+        label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
+    ) -> NormNode;
 
     /// Loop-exit normalization: trailing `break`+`return E` → `return E` at the
     /// break site (§5.2.2 companion rule). Runs after loop lowering.
@@ -267,10 +283,11 @@ pub(crate) fn synth_call(
     name: &str,
     field: Option<&str>,
     arg: NormNode,
+    label_interner: &std::sync::Arc<crate::intern::LabelInterner>,
 ) -> NormNode {
     let span = arg.span;
     let callee = NormNode::new("identifier", Some("function"), span, Vec::new())
-        .with_label(crate::tree::Label::External(name.into()));
+        .with_label(crate::tree::Label::External(label_interner.intern(name)));
     let args = NormNode::new(args_kind, Some("arguments"), span, vec![arg]);
     NormNode::new(call_kind, field, span, vec![callee, args])
 }

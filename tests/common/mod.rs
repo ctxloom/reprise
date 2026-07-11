@@ -85,9 +85,14 @@ pub fn assert_no_orphan_continue(src: &str, lang: Lang) {
         1 + n.children.iter().map(node_count).sum::<usize>()
     }
     fn is_continue(n: &NormNode) -> bool {
-        n.kind.as_ref() == "continue_statement"
-            || (n.kind.as_ref() == "identifier"
-                && matches!(&n.label, Some(Label::Raw(t) | Label::External(t)) if t.as_ref() == "continue"))
+        if n.kind.as_ref() != "identifier" {
+            return n.kind.as_ref() == "continue_statement";
+        }
+        match &n.label {
+            Some(Label::Raw(t)) => t.as_ref() == "continue",
+            Some(Label::External(t)) => t.as_ref() == "continue",
+            _ => false,
+        }
     }
     fn is_callable(kind: &str) -> bool {
         matches!(
@@ -141,9 +146,10 @@ pub fn assert_no_orphan_continue(src: &str, lang: Lang) {
         .max_by_key(node_count)
         .unwrap();
     let profile = lang.profile();
+    let label_interner = reprise::intern::LabelInterner::new();
     let tree = profile.lower_recursion(outer);
-    let tree = profile.rewrite_iteration(tree);
-    let tree = profile.lower_loops(tree);
+    let tree = profile.rewrite_iteration(tree, &label_interner);
+    let tree = profile.lower_loops(tree, &label_interner);
     let tree = profile.normalize_loop_exit(tree);
     walk(&tree, 0);
 }

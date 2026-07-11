@@ -14,6 +14,7 @@ pub mod formats;
 pub mod frontend;
 pub mod group;
 pub mod inline;
+pub mod intern;
 pub mod ir;
 pub mod lang;
 pub mod matchtree;
@@ -62,6 +63,11 @@ pub struct CorpusUnits {
     pub repeats: Vec<unit::InternalRepeat>,
     pub source_digests: HashMap<std::path::PathBuf, u128>,
     pub stats: report::Stats,
+    /// The per-scan label interner used to build every `Unit`/`raw_trees` tree above
+    /// (interning WP, session `stark-mixed-front`). `scan()`'s later inline phase
+    /// (§5.4) reuses this SAME instance for variant trees, so a variant's identifiers
+    /// dedupe against the rest of the scan instead of paying for a second table.
+    pub label_interner: std::sync::Arc<crate::intern::LabelInterner>,
 }
 
 /// Walk `root` (respecting `config`'s excludes) and extract every unit, reusing the
@@ -73,6 +79,13 @@ pub struct CorpusUnits {
 /// D19 cache-reuse (docs/SERVERS.md §7 M1, DECISIONS.md D46).
 pub fn corpus_units(root: &Path, config: &Config) -> anyhow::Result<CorpusUnits> {
     let files = walk::collect_files(root, config)?;
+
+    // Interning WP (session `stark-mixed-front`): ONE fresh per-scan `LabelInterner`
+    // for this whole `corpus_units` call — scoped exactly to this call (per the
+    // preamble), never global, so a long-lived server (`reprise-mcp`) calling this
+    // repeatedly never leaks label ids across scans. `Arc` clones cheaply into every
+    // rayon worker closure below.
+    let label_interner = crate::intern::LabelInterner::new();
 
     // `normalizer = "historical"` has no `LanguageProfile` for C (WP-K1a: C is IR-frontend
     // only — CLAUDE.md, the historical per-grammar layer is retired for new languages).
@@ -117,15 +130,20 @@ pub fn corpus_units(root: &Path, config: &Config) -> anyhow::Result<CorpusUnits>
                     let cached = config
                         .cache
                         .enabled
-                        .then(|| cache::load(cache_root, key, path))
+                        .then(|| cache::load(cache_root, key, path, &label_interner))
                         .flatten();
                     let digest = xxhash_rust::xxh3::xxh3_128(src.as_bytes());
                     let line_count = src.lines().count();
                     match cached {
                         Some(extracted) => FileOutcome::Units(extracted, digest, line_count, true),
                         None => {
-                            let extracted =
-                                unit::extract_file_units_keep_raw(path, &src, *lang, config);
+                            let extracted = unit::extract_file_units_keep_raw(
+                                path,
+                                &src,
+                                *lang,
+                                config,
+                                &label_interner,
+                            );
                             if config.cache.enabled {
                                 cache::store(cache_root, key, &extracted);
                             }
@@ -179,6 +197,7 @@ pub fn corpus_units(root: &Path, config: &Config) -> anyhow::Result<CorpusUnits>
         repeats,
         source_digests,
         stats,
+        label_interner,
     })
 }
 
@@ -191,6 +210,7 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
         repeats: internal_repeats,
         source_digests,
         mut stats,
+        label_interner,
     } = corpus_units(root, config)?;
     let plain_count = units.len();
 
@@ -240,7 +260,9 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
                 let tree = exp
                     .tree
                     .expect("calls_inlined > 0 implies expand_unit produced a tree");
-                let Some(mut variant) = unit::finish_variant(i, &units[i], tree, config) else {
+                let Some(mut variant) =
+                    unit::finish_variant(i, &units[i], tree, config, &label_interner)
+                else {
                     // inlining changed nothing post-normalization
                     return VariantOutcome {
                         ambiguity_skips,
