@@ -15,10 +15,12 @@ use crate::config::{Config, MemoryCfg};
 use crate::unit::Unit;
 
 /// All-in resident bytes per normalized token for a canonical tree, validated
-/// against measured peaks at two kernel scales (mem-arch report §5: the
-/// ~150 B/node model reconciled within ~8% and <1%). Re-measure after the
-/// interning WP lands (P2) — the constant, not the model, will move.
-pub const PER_TOKEN_TREE_BYTES: u64 = 150;
+/// against measured peaks at kernel scale (rung report, stark-mixed-front
+/// session, §4: fs/ derives 355.6 B/token, drivers/net 351.6 B/token — the two
+/// measurements agree within 1.1%). The prior 150 B/token model undershot
+/// measured VmHWM by ~55%; re-measure after any further extraction/interning
+/// change — the constant, not the model, will move.
+pub const PER_TOKEN_TREE_BYTES: u64 = 355;
 
 /// Inline-variant inflation: variants measure ~49-55% of plain-unit count at
 /// kernel scales (mem-arch report §0, two corroborating measurements), applied

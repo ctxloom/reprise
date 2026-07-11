@@ -8,14 +8,24 @@
 //!   makes collision semantics correct by construction and gives byte-identical
 //!   values (a clone detector's staple) free dedup.
 //! - **Value**: bincode bytes appended to one anonymous temp file
-//!   (`tempfile::tempfile()`, unlinked at creation — the pack cannot outlive the
-//!   scan even on abnormal exit), `pread` at offset on miss.
+//!   (`tempfile::tempfile_in(dir)`, unlinked at creation — the pack cannot
+//!   outlive the scan even on abnormal exit), `pread` at offset on miss. `dir`
+//!   is scan-root-relative by default (`resolve_pack_dir`), never the process
+//!   temp dir: on many systems `/tmp` is a RAM-backed tmpfs, so spilling
+//!   "to disk" there both risks ENOSPC on a large scan and keeps the bytes in
+//!   RAM — defeating the point of spilling.
 //! - **Residency**: a `HashMap<key, (offset, len)>` index (tens of bytes per
 //!   entry) plus a byte-bounded, sharded, `Sync` LRU of decoded `Arc<T>` values.
 //!   Eviction only drops the cache's own `Arc`; a caller-held `Arc` from an
 //!   in-flight verify stays valid — Rust ownership, not cache policy, is the
 //!   correctness mechanism. The byte bound floors at 2× the largest entry per
 //!   shard so a verify PAIR can't thrash (a performance floor, not a safety one).
+//! - **Failure**: a write failure (e.g. the backing volume fills) is NEVER a
+//!   panic. The first I/O error on [`Pack::store`] latches a poisoned-state
+//!   flag ([`PackStoreError`], held in a `OnceLock`) so every subsequent
+//!   `store` fails fast with the SAME clean error instead of retrying a
+//!   doomed write or touching a poisoned `Mutex` — the caller propagates it
+//!   through the normal `anyhow` error path (no cascade, no silent exit).
 //!
 //! The pack is one generic mechanism: `Pack<NormNode>` for trees (plain trees
 //! spill at gate-trip, variant trees at `finish_variant` — same store, P3
@@ -29,8 +39,9 @@ use serde::de::DeserializeOwned;
 type Decoder<T> = Box<dyn Fn(&[u8]) -> T + Send + Sync>;
 use std::collections::HashMap;
 use std::fs::File;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 /// A content-addressed store of serialized `T` values in one scan-scoped temp
 /// file, fronted by a byte-bounded sharded LRU of decoded values.
@@ -42,22 +53,70 @@ use std::sync::{Arc, Mutex, RwLock};
 /// the decoder is exactly right. Plain-data payloads use [`Pack::new`].
 pub struct Pack<T> {
     file: File,
+    /// The directory the backing file lives under (or, for [`Pack::over_file`]
+    /// test injection, a caller-supplied label) — surfaced in [`PackStoreError`]
+    /// so a write failure names an actionable remedy.
+    dir: PathBuf,
     /// key → (offset, len) for every stored value. Read-mostly.
     index: RwLock<HashMap<u128, (u64, u32)>>,
     /// Append cursor; also serializes writers (index double-check under this lock).
     append: Mutex<u64>,
+    /// Set on the FIRST write failure; every later `store` returns this same
+    /// error immediately instead of re-attempting a doomed write or ever
+    /// touching a poisoned `Mutex` (we never panic while `append` is held).
+    failure: OnceLock<PackStoreError>,
     lru: ShardedLru<T>,
     hits: AtomicU64,
     misses: AtomicU64,
     decode: Decoder<T>,
 }
 
+/// A pack write failure — clean, never a panic (see the module doc's
+/// "Failure" bullet). Carries enough to make the scan's abort message
+/// actionable: where the pack lives, how much it had written before the
+/// failure, and the remedy (`[memory] pack_dir`).
+#[derive(Debug, Clone)]
+pub struct PackStoreError {
+    pub dir: PathBuf,
+    pub bytes_written: u64,
+    source: String,
+}
+
+impl std::fmt::Display for PackStoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "pack write failed after {} bytes written (pack dir: {}): {} — if this directory is \
+             small or RAM-backed (e.g. a tmpfs /tmp), point the pack at real disk with \
+             `[memory] pack_dir` in reprise.toml",
+            self.bytes_written,
+            self.dir.display(),
+            self.source,
+        )
+    }
+}
+
+impl std::error::Error for PackStoreError {}
+
 impl<T: Serialize + DeserializeOwned + Send + Sync> Pack<T> {
     /// `lru_bytes` bounds the decoded-value cache (split across `shards`; each
     /// shard floors at 2× its largest entry so a verify pair always fits);
-    /// `shards` bounds lock contention from parallel verify workers.
-    pub fn new(lru_bytes: u64, shards: usize) -> std::io::Result<Self> {
-        Self::with_decoder(lru_bytes, shards, |bytes| {
+    /// `shards` bounds lock contention from parallel verify workers. `dir` is
+    /// the pack's backing directory (see `resolve_pack_dir`) — the file itself
+    /// is anonymous (`tempfile_in`), `dir` only chooses its volume.
+    pub fn new(lru_bytes: u64, shards: usize, dir: &Path) -> std::io::Result<Self> {
+        Self::with_decoder(lru_bytes, shards, dir, |bytes| {
+            bincode::deserialize(bytes).expect("pack value decodes")
+        })
+    }
+
+    /// Test/diagnostic hook: build a pack directly over an already-open file,
+    /// bypassing `tempfile_in` entirely — lets tests exercise the store-failure
+    /// path deterministically (e.g. against `/dev/full`, which always errors
+    /// ENOSPC on write) without needing a real full filesystem. `dir` is used
+    /// only for the error message (see [`PackStoreError`]).
+    pub fn over_file(file: File, dir: impl Into<PathBuf>, lru_bytes: u64, shards: usize) -> Self {
+        Self::over_file_with_decoder(file, dir, lru_bytes, shards, |bytes| {
             bincode::deserialize(bytes).expect("pack value decodes")
         })
     }
@@ -69,41 +128,91 @@ impl<T: Serialize + Send + Sync> Pack<T> {
     pub fn with_decoder(
         lru_bytes: u64,
         shards: usize,
+        dir: &Path,
         decode: impl Fn(&[u8]) -> T + Send + Sync + 'static,
     ) -> std::io::Result<Self> {
-        Ok(Pack {
-            file: tempfile::tempfile()?,
+        let file = tempfile::tempfile_in(dir)?;
+        Ok(Self::from_parts(
+            file,
+            dir.to_path_buf(),
+            lru_bytes,
+            shards,
+            decode,
+        ))
+    }
+
+    /// [`Pack::over_file`] with an explicit decoder (see [`Pack::with_decoder`]).
+    pub fn over_file_with_decoder(
+        file: File,
+        dir: impl Into<PathBuf>,
+        lru_bytes: u64,
+        shards: usize,
+        decode: impl Fn(&[u8]) -> T + Send + Sync + 'static,
+    ) -> Self {
+        Self::from_parts(file, dir.into(), lru_bytes, shards, decode)
+    }
+
+    fn from_parts(
+        file: File,
+        dir: PathBuf,
+        lru_bytes: u64,
+        shards: usize,
+        decode: impl Fn(&[u8]) -> T + Send + Sync + 'static,
+    ) -> Self {
+        Pack {
+            file,
+            dir,
             index: RwLock::new(HashMap::new()),
             append: Mutex::new(0),
+            failure: OnceLock::new(),
             lru: ShardedLru::new(lru_bytes, shards),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             decode: Box::new(decode),
-        })
+        }
     }
 
     /// Serialize, key by exact content, and store (byte-identical values dedup
-    /// to the existing entry). Returns the pack key.
-    pub fn store(&self, value: &T) -> u128 {
+    /// to the existing entry). Returns the pack key, or a latched
+    /// [`PackStoreError`] on write failure (clean — never a panic; see the
+    /// module doc's "Failure" bullet).
+    pub fn store(&self, value: &T) -> Result<u128, PackStoreError> {
+        if let Some(err) = self.failure.get() {
+            return Err(err.clone()); // already doomed — fail fast, no I/O retry
+        }
         let bytes = bincode::serialize(value).expect("pack value serializes");
         let key = xxhash_rust::xxh3::xxh3_128(&bytes);
         if self.index.read().expect("pack index").contains_key(&key) {
-            return key; // dedup: same bytes, same key, stored once
+            return Ok(key); // dedup: same bytes, same key, stored once
         }
         let mut end = self.append.lock().expect("pack append");
         // Double-check under the append lock: a racing writer may have stored
-        // the same bytes between the read above and taking this lock.
+        // the same bytes (or latched a failure) between the checks above and
+        // taking this lock.
+        if let Some(err) = self.failure.get() {
+            return Err(err.clone());
+        }
         if self.index.read().expect("pack index").contains_key(&key) {
-            return key;
+            return Ok(key);
         }
         let offset = *end;
-        write_all_at(&self.file, &bytes, offset).expect("pack append write");
+        if let Err(e) = write_all_at(&self.file, &bytes, offset) {
+            let err = PackStoreError {
+                dir: self.dir.clone(),
+                bytes_written: offset,
+                source: e.to_string(),
+            };
+            // Best-effort latch: if a racing writer set it first, reuse theirs
+            // (both describe the same doomed pack).
+            let _ = self.failure.set(err.clone());
+            return Err(self.failure.get().cloned().unwrap_or(err));
+        }
         *end += bytes.len() as u64;
         self.index
             .write()
             .expect("pack index")
             .insert(key, (offset, bytes.len() as u32));
-        key
+        Ok(key)
     }
 
     /// Materialize a stored value: LRU hit, or `pread` + decode on miss (then
@@ -140,6 +249,75 @@ impl<T: Serialize + Send + Sync> Pack<T> {
     }
     pub fn lru_misses(&self) -> u64 {
         self.misses.load(Ordering::Relaxed)
+    }
+}
+
+/// Where a scan's pack should resolve, and (if the default location was
+/// unreachable) the warning to print before the scan proceeds.
+#[derive(Debug, Clone)]
+pub struct ResolvedPackDir {
+    pub dir: PathBuf,
+    /// `Some` exactly when the default `<root>/.reprise/tmp/` directory could
+    /// not be created (typically a read-only scan root) AND no `pack_dir`
+    /// override was configured — the caller should print this to stderr
+    /// once, before the scan proceeds on the `std::env::temp_dir()` fallback.
+    pub warning: Option<String>,
+    /// True exactly when `dir` is the scan-owned default (`<root>/.reprise/tmp`)
+    /// — never an explicit `pack_dir` override, never the `temp_dir()`
+    /// fallback (neither is ours to remove). The caller should best-effort
+    /// `remove_dir` it once the scan's packs are done (it will only actually
+    /// disappear if empty), so a scan never leaves scratch directories behind
+    /// in a scanned repo — unlike the durable `.reprise/cache`, this dir is
+    /// pure scan-scoped scratch space.
+    pub owned: bool,
+}
+
+/// Resolve the scan-scoped pack's backing directory (the fix for the
+/// tmpfs-ENOSPC failure mode: `src/pack.rs`'s previous `tempfile::tempfile()`
+/// always used the process temp dir, which on many systems is a RAM-backed
+/// tmpfs — spilling "to disk" there both risks ENOSPC on a large scan and
+/// keeps the bytes in RAM, defeating the point of spilling).
+///
+/// Mirrors the D19 cache's root convention (`crate::cache`): same
+/// scan-root-relative default, same `.reprise/` volume. Unlike the cache
+/// (which degrades silently to a cold scan on a read-only root — a cache is
+/// optional), a pack MUST have somewhere to write, so an unwritable root
+/// falls back to `std::env::temp_dir()` with a NAMED warning instead of
+/// silence.
+///
+/// - `override_dir` (`cfg.memory.pack_dir`) wins unconditionally when set —
+///   trusted as-is; if it turns out unwritable, `Pack::new`/`with_decoder`
+///   surfaces that as a clean `io::Error` (never a silent fallback of an
+///   explicit setting).
+/// - Otherwise `<root>/.reprise/tmp/` is created and used.
+/// - If that creation fails (unwritable root, no override), fall back to
+///   `std::env::temp_dir()` and return a warning naming the risk.
+pub fn resolve_pack_dir(root: &Path, override_dir: Option<&Path>) -> ResolvedPackDir {
+    if let Some(dir) = override_dir {
+        return ResolvedPackDir {
+            dir: dir.to_path_buf(),
+            warning: None,
+            owned: false,
+        };
+    }
+    let default_dir = root.join(".reprise").join("tmp");
+    if std::fs::create_dir_all(&default_dir).is_ok() {
+        return ResolvedPackDir {
+            dir: default_dir,
+            warning: None,
+            owned: true,
+        };
+    }
+    let fallback = std::env::temp_dir();
+    let warning = format!(
+        "pack falling back to {}; if this is tmpfs, spilled trees still occupy RAM and large \
+         scans may fail with ENOSPC — set [memory] pack_dir",
+        fallback.display(),
+    );
+    ResolvedPackDir {
+        dir: fallback,
+        warning: Some(warning),
+        owned: false,
     }
 }
 

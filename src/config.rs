@@ -33,6 +33,13 @@ pub struct MemoryCfg {
     /// `REPRISE_MEMORY_FORCE_GATE` env var outranks this key (the harness knob
     /// for forcing the spill path on small corpora without a config file).
     pub force_gate: String,
+    /// Explicit directory for the scan-scoped content-addressed pack's
+    /// backing file(s) (`src/pack.rs`) — outranks the default `<scan root>/
+    /// .reprise/tmp/`. Pin this to a real-disk path when the scan root's
+    /// volume is small or RAM-backed (e.g. a tmpfs `/tmp`): spilling "to disk"
+    /// onto tmpfs still occupies RAM (defeating the point of spilling) and
+    /// can exhaust a small tmpfs outright (ENOSPC) on large scans.
+    pub pack_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for MemoryCfg {
@@ -41,6 +48,7 @@ impl Default for MemoryCfg {
             budget_fraction: 0.5,
             budget_bytes: None,
             force_gate: "auto".into(),
+            pack_dir: None,
         }
     }
 }

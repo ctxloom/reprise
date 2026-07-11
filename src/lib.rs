@@ -254,6 +254,33 @@ struct ScanPacks {
     seqs: pack::Pack<digest::SeqStream>,
 }
 
+/// Best-effort cleanup of the pack's OWNED default directory
+/// (`<root>/.reprise/tmp`, `pack::resolve_pack_dir`'s `owned: true` case) —
+/// never a `[memory] pack_dir` override, never the `temp_dir()` fallback
+/// (neither is ours to remove). `remove_dir` only succeeds if the directory
+/// is empty, which it will be (the pack's backing file(s) are anonymous,
+/// unlinked at creation — this directory is scan-scoped scratch space, not
+/// the durable D19 cache, and must not outlive the scan). A plain struct
+/// field (not a closure) so `Drop` runs on every exit from `scan()` —
+/// success, an early `?` return, or a panic unwind — matching the pack's own
+/// "cannot outlive the scan even on abnormal exit" invariant.
+struct PackDirCleanup(Option<std::path::PathBuf>);
+impl Drop for PackDirCleanup {
+    fn drop(&mut self) {
+        if let Some(dir) = self.0.take() {
+            let _ = std::fs::remove_dir(&dir);
+            // Best-effort: also tidy away the now-possibly-empty `.reprise`
+            // parent (a no-op, harmlessly, if it still holds the durable D19
+            // cache or anything else) — a scan with caching disabled should
+            // leave NO trace under `.reprise/` at all, not an empty `tmp/`'s
+            // empty parent.
+            if let Some(parent) = dir.parent() {
+                let _ = std::fs::remove_dir(parent);
+            }
+        }
+    }
+}
+
 /// Full-repo scan (spec §2 `reprise scan`).
 pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
     let started = Instant::now();
@@ -285,7 +312,20 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
     // near-tier verify materializes pairs through the pack LRU and the
     // sequence tier bulk-loads per language partition. Either way the OUTPUT
     // is byte-identical — the gate changes performance, never output. ----
+    let mut pack_dir_owned: Option<std::path::PathBuf> = None;
     let packs = if gate.over {
+        // The pack's backing directory (the tmpfs-ENOSPC fix): scan-root-
+        // relative by default, `[memory] pack_dir` override outranks it, an
+        // unwritable root falls back to the process temp dir with a named
+        // warning (never silence — a pack MUST have somewhere to write).
+        let resolved = pack::resolve_pack_dir(root, config.memory.pack_dir.as_deref());
+        if let Some(warning) = &resolved.warning {
+            eprintln!("warning: {warning}");
+        }
+        if resolved.owned {
+            pack_dir_owned = Some(resolved.dir.clone());
+        }
+        let pack_dir = resolved.dir;
         // Tree LRU: a budget-derived slice, floored so verify pairs fit
         // comfortably; the seq pack needs no real LRU (one bulk load per
         // partition, handles owned by the loop) so it gets a token bound.
@@ -294,30 +334,46 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
         let tree_lru_bytes = (gate.budget_bytes / 8).clamp(64 << 20, 1 << 30);
         let li = std::sync::Arc::clone(&label_interner);
         Some(ScanPacks {
-            trees: pack::Pack::with_decoder(tree_lru_bytes, 16, move |bytes| {
+            trees: pack::Pack::with_decoder(tree_lru_bytes, 16, &pack_dir, move |bytes| {
                 let wire: tree::NormNodeWire =
                     bincode::deserialize(bytes).expect("pack tree decodes");
                 wire.into_real(&li)
             })
-            .map_err(|e| anyhow::anyhow!("creating scan tree pack: {e}"))?,
-            seqs: pack::Pack::new(1 << 20, 4)
-                .map_err(|e| anyhow::anyhow!("creating scan seq pack: {e}"))?,
+            .map_err(|e| {
+                anyhow::anyhow!("creating scan tree pack under {}: {e}", pack_dir.display())
+            })?,
+            seqs: pack::Pack::new(1 << 20, 4, &pack_dir).map_err(|e| {
+                anyhow::anyhow!("creating scan seq pack under {}: {e}", pack_dir.display())
+            })?,
         })
     } else {
         None
     };
+    // Declared once `pack_dir_owned` is settled; drops (and best-effort
+    // removes the directory) on every exit from `scan()` below, success or
+    // error.
+    let _pack_dir_cleanup = PackDirCleanup(pack_dir_owned);
     let mut spilled_trees = 0usize;
     if let Some(p) = &packs {
         // Spill moment 1 (P3): one sequential pass over the already-
-        // materialized plain units. (Variants spill at creation, below.)
+        // materialized plain units. (Variants spill at creation, below.) A
+        // store failure (e.g. the pack's volume fills) aborts the scan
+        // cleanly through `?` — never a panic, never a poisoned mutex (see
+        // `pack::PackStoreError`).
         for (u, d) in units.iter_mut().zip(digests.iter_mut()) {
             if let unit::TreeSlot::Resident(t) = &u.tree {
-                let key = p.trees.store(t);
+                let key = p
+                    .trees
+                    .store(t)
+                    .map_err(|e| anyhow::anyhow!("spilling a plain unit's tree: {e}"))?;
                 u.tree = unit::TreeSlot::Spilled(key);
                 spilled_trees += 1;
             }
             if let digest::SeqSlot::Resident(s) = &d.seq_tokens {
-                let key = p.seqs.store(s);
+                let key = p
+                    .seqs
+                    .store(s)
+                    .map_err(|e| anyhow::anyhow!("spilling a plain unit's token stream: {e}"))?;
                 d.seq_tokens = digest::SeqSlot::Spilled(key);
             }
         }
@@ -346,17 +402,22 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
             /// this fresh tree is still resident.
             variant: Option<(Unit, Option<digest::UnitDigest>)>,
         }
+        // Each closure below returns `anyhow::Result<VariantOutcome>` — a variant
+        // spill failure (spill moment 2, P3) must abort the scan cleanly, not
+        // panic, so it's threaded through as a `Result` and short-circuited by
+        // `collect::<anyhow::Result<Vec<_>>>()` (rayon's `Result`
+        // `FromParallelIterator`), same as the sequential spill above.
         let outcomes: Vec<VariantOutcome> = expansions
             .into_par_iter()
             .enumerate()
-            .map(|(i, exp)| {
+            .map(|(i, exp)| -> anyhow::Result<VariantOutcome> {
                 let ambiguity_skips = exp.ambiguity_skips;
                 if exp.calls_inlined == 0 {
-                    return VariantOutcome {
+                    return Ok(VariantOutcome {
                         ambiguity_skips,
                         calls_inlined: 0,
                         variant: None,
-                    };
+                    });
                 }
                 // calls_inlined > 0 (checked above) guarantees expand_unit produced
                 // a spliced tree (see inline::any_resolvable_call / Expansion::tree).
@@ -367,11 +428,11 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
                     unit::finish_variant(i, &units[i], tree, config, &label_interner)
                 else {
                     // inlining changed nothing post-normalization
-                    return VariantOutcome {
+                    return Ok(VariantOutcome {
                         ambiguity_skips,
                         calls_inlined: 0,
                         variant: None,
-                    };
+                    });
                 };
                 let expanded_fps: Vec<u128> = exp
                     .expanded_units
@@ -380,11 +441,11 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
                     .collect();
                 if expanded_fps.contains(&variant.fingerprint) {
                     // D3: a pure wrapper's variant IS its callee
-                    return VariantOutcome {
+                    return Ok(VariantOutcome {
                         ambiguity_skips,
                         calls_inlined: 0,
                         variant: None,
-                    };
+                    });
                 }
                 let tag = variant.variant.as_mut().expect("finish_variant tags");
                 tag.chain = exp.chain;
@@ -400,16 +461,19 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
                 if let Some(p) = &packs
                     && let unit::TreeSlot::Resident(t) = &variant.tree
                 {
-                    let key = p.trees.store(t);
+                    let key = p
+                        .trees
+                        .store(t)
+                        .map_err(|e| anyhow::anyhow!("spilling an inline variant's tree: {e}"))?;
                     variant.tree = unit::TreeSlot::Spilled(key);
                 }
-                VariantOutcome {
+                Ok(VariantOutcome {
                     ambiguity_skips,
                     calls_inlined: exp.calls_inlined,
                     variant: Some((variant, vd)),
-                }
+                })
             })
-            .collect();
+            .collect::<anyhow::Result<Vec<_>>>()?;
         let mut variants: Vec<Unit> = Vec::new();
         let mut variant_digests: Vec<digest::UnitDigest> = Vec::new();
         for outcome in outcomes {
