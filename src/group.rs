@@ -341,7 +341,8 @@ pub fn dedupe_subset_groups(groups: Vec<Group>) -> Vec<Group> {
             Tier::ExactNormalized | Tier::NearNormalized | Tier::InlineAssisted
         )
     }
-    type MemberKey = BTreeSet<(String, String, (u32, u32))>;
+    type MemberElem = (String, String, (u32, u32));
+    type MemberKey = BTreeSet<MemberElem>;
     fn members_key(g: &Group) -> MemberKey {
         g.members
             .iter()
@@ -354,6 +355,31 @@ pub fn dedupe_subset_groups(groups: Vec<Group>) -> Vec<Group> {
             })
             .collect()
     }
+    /// Position in `kept` of the first (lowest-index / earliest-inserted)
+    /// entry whose key is a superset of `key` — identical semantics to
+    /// `kept.iter().find(|(_, kj)| key.is_subset(kj))`, using `member_index`
+    /// to skip entries that cannot possibly qualify.
+    fn find_superset_position(
+        kept: &[(usize, MemberKey)],
+        member_index: &HashMap<MemberElem, Vec<usize>>,
+        key: &MemberKey,
+    ) -> Option<usize> {
+        if key.is_empty() {
+            // An empty key is trivially a subset of anything; mirror
+            // `.find()`'s first-entry semantics directly. Never hit by real
+            // findings (every group has >= 2 members) — kept for exact
+            // equivalence with the brute-force reference.
+            return if kept.is_empty() { None } else { Some(0) };
+        }
+        let pivot = key
+            .iter()
+            .min_by_key(|elem| member_index.get(*elem).map_or(0, Vec::len))?;
+        let candidates = member_index.get(pivot)?;
+        candidates
+            .iter()
+            .copied()
+            .find(|&pos| key.is_subset(&kept[pos].1))
+    }
     // Largest membership first, stronger tier first among equals.
     let mut order: Vec<usize> = (0..groups.len()).collect();
     order.sort_by_key(|&i| {
@@ -363,6 +389,24 @@ pub fn dedupe_subset_groups(groups: Vec<Group>) -> Vec<Group> {
         )
     });
     let mut kept: Vec<(usize, MemberKey)> = Vec::new();
+    // Inverted index: one member-tuple -> the (ascending, insertion-order)
+    // `kept` positions whose key contains it. `key.is_subset(kj)` can only
+    // hold when `kj` contains EVERY element of `key`, so the candidates for
+    // ANY single element of `key` are a superset of every actual match —
+    // scanning just one element's posting list (the smallest, to minimize
+    // work) instead of rescanning the whole of `kept` mirrors the
+    // e787158/77f820f idiom (index once, look up instead of a full rescan)
+    // applied to a subset-of-a-set query. `kept.iter().find(..)` here used to
+    // rescan every already-kept group per candidate — O(participating²),
+    // measured as ~80% of the assemble phase and the dominant superlinear
+    // cost at kernel scale (`sleek-glade-assemble` perf writeup). Posting
+    // lists are appended in the same order `kept` grows, so they stay
+    // ascending — scanning one in order and taking the first full match
+    // reproduces `.find()`'s "first entry in `kept`" tie-break exactly (every
+    // full-superset position necessarily appears in each of `key`'s
+    // elements' posting lists, since it must contain them too, so
+    // restricting to one list never misses — and never reorders — a match).
+    let mut member_index: HashMap<(String, String, (u32, u32)), Vec<usize>> = HashMap::new();
     let mut notes: Vec<Option<String>> = vec![None; groups.len()];
     let mut dropped = vec![false; groups.len()];
     for &i in &order {
@@ -370,9 +414,9 @@ pub fn dedupe_subset_groups(groups: Vec<Group>) -> Vec<Group> {
             continue;
         }
         let key = members_key(&groups[i]);
-        let swallowed_by = kept.iter().find(|(_, kj)| key.is_subset(kj));
-        if let Some((j, _)) = swallowed_by {
-            let j: usize = *j;
+        let swallowed_by = find_superset_position(&kept, &member_index, &key);
+        if let Some(pos) = swallowed_by {
+            let j = kept[pos].0;
             // Note the loss only when the subset carried a STRONGER tier.
             let stronger = groups[i].tier.fail_rank().unwrap_or(u32::MAX)
                 < groups[j].tier.fail_rank().unwrap_or(u32::MAX);
@@ -391,6 +435,10 @@ pub fn dedupe_subset_groups(groups: Vec<Group>) -> Vec<Group> {
             }
             dropped[i] = true;
         } else {
+            let pos = kept.len();
+            for elem in &key {
+                member_index.entry(elem.clone()).or_default().push(pos);
+            }
             kept.push((i, key));
         }
     }
@@ -568,6 +616,194 @@ mod tests {
         ];
         let raw_groups = vec![vec![0], vec![1, 2]];
         assert_eq!(contained_flags(&units, &raw_groups), vec![false, false]);
+    }
+
+    /// The original O(participating²) all-pairs rescan, kept only here as the
+    /// differential-test oracle for the indexed `dedupe_subset_groups`.
+    fn brute_dedupe_subset_groups(groups: Vec<Group>) -> Vec<Group> {
+        use std::collections::BTreeSet;
+        fn participates(t: Tier) -> bool {
+            matches!(
+                t,
+                Tier::ExactNormalized | Tier::NearNormalized | Tier::InlineAssisted
+            )
+        }
+        type MemberKey = BTreeSet<(String, String, (u32, u32))>;
+        fn members_key(g: &Group) -> MemberKey {
+            g.members
+                .iter()
+                .map(|m| {
+                    (
+                        m.file.to_string_lossy().to_string(),
+                        m.name.clone(),
+                        m.line_span,
+                    )
+                })
+                .collect()
+        }
+        let mut order: Vec<usize> = (0..groups.len()).collect();
+        order.sort_by_key(|&i| {
+            (
+                std::cmp::Reverse(groups[i].members.len()),
+                groups[i].tier.fail_rank().unwrap_or(u32::MAX),
+            )
+        });
+        let mut kept: Vec<(usize, MemberKey)> = Vec::new();
+        let mut notes: Vec<Option<String>> = vec![None; groups.len()];
+        let mut dropped = vec![false; groups.len()];
+        for &i in &order {
+            if !participates(groups[i].tier) {
+                continue;
+            }
+            let key = members_key(&groups[i]);
+            let swallowed_by = kept.iter().find(|(_, kj)| key.is_subset(kj));
+            if let Some((j, _)) = swallowed_by {
+                let j: usize = *j;
+                let stronger = groups[i].tier.fail_rank().unwrap_or(u32::MAX)
+                    < groups[j].tier.fail_rank().unwrap_or(u32::MAX);
+                if stronger {
+                    let extra = format!(
+                        "subsumes a {}-member {} group ({} of these members also group without inlining)",
+                        groups[i].members.len(),
+                        groups[i].tier,
+                        groups[i].members.len(),
+                    );
+                    let slot = &mut notes[j];
+                    *slot = Some(match slot.take() {
+                        Some(prev) => format!("{prev}; {extra}"),
+                        None => extra,
+                    });
+                }
+                dropped[i] = true;
+            } else {
+                kept.push((i, key));
+            }
+        }
+        let mut out = Vec::with_capacity(groups.len());
+        for (i, mut g) in groups.into_iter().enumerate() {
+            if dropped[i] {
+                continue;
+            }
+            if let Some(n) = notes[i].take() {
+                g.note = Some(match g.note.take() {
+                    Some(prev) => format!("{prev}; {n}"),
+                    None => n,
+                });
+            }
+            out.push(g);
+        }
+        out
+    }
+
+    type MemberSignature = (String, String, (u32, u32));
+    type GroupSignature = (Tier, Option<String>, Vec<MemberSignature>);
+
+    /// Projection used to compare oracle vs. indexed output without requiring
+    /// `Group: PartialEq` — tier, note, and the member key set are the only
+    /// fields `dedupe_subset_groups` can affect.
+    fn group_signature(g: &Group) -> GroupSignature {
+        let mut members: Vec<MemberSignature> = g
+            .members
+            .iter()
+            .map(|m| {
+                (
+                    m.file.to_string_lossy().to_string(),
+                    m.name.clone(),
+                    m.line_span,
+                )
+            })
+            .collect();
+        members.sort();
+        (g.tier, g.note.clone(), members)
+    }
+
+    fn mk_at(tier: Tier, members: &[(&str, &str, (u32, u32))]) -> Group {
+        Group {
+            id: String::new(),
+            tier,
+            fingerprint: String::new(),
+            token_count: 50,
+            value: 50.0,
+            note: None,
+            divergence: 0.0,
+            template: None,
+            inline_chain: None,
+            members: members
+                .iter()
+                .map(|(file, name, span)| Member {
+                    file: PathBuf::from(*file),
+                    lang: "rust".into(),
+                    name: (*name).to_string(),
+                    line_span: *span,
+                    parse_degraded: false,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn dedupe_subset_groups_matches_brute_force_oracle() {
+        // Deterministic LCG (no external rand dependency), mirroring the
+        // `contained_flags`/`test_unit_key_index` oracle tests: many random
+        // group shapes over a small file/name/span alphabet so subset
+        // relations (and ties) actually occur, checked against the original
+        // O(participating²) rescan.
+        struct Lcg(u64);
+        impl Lcg {
+            fn next(&mut self) -> u64 {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                self.0
+            }
+            fn range(&mut self, n: u32) -> u32 {
+                (self.next() % u64::from(n)) as u32
+            }
+        }
+        let tiers = [
+            Tier::ExactNormalized,
+            Tier::NearNormalized,
+            Tier::InlineAssisted,
+            Tier::ExactRegion, // non-participating control
+            Tier::WeakSimilarity,
+        ];
+
+        for seed in 0..200u64 {
+            let mut rng = Lcg(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1));
+            let file_count = 1 + rng.range(2);
+            let files: Vec<String> = (0..file_count).map(|i| format!("f{i}.rs")).collect();
+            let name_count = 1 + rng.range(3);
+            let names: Vec<String> = (0..name_count).map(|i| format!("n{i}")).collect();
+
+            let group_count = 1 + rng.range(10);
+            let mut groups: Vec<Group> = Vec::new();
+            for _ in 0..group_count {
+                let tier = tiers[rng.range(tiers.len() as u32) as usize];
+                // Small member alphabet + small span alphabet so members
+                // frequently coincide across groups, producing real subset
+                // and tie shapes rather than all-disjoint sets.
+                let member_count = 1 + rng.range(4);
+                let mut members: Vec<(&str, &str, (u32, u32))> = Vec::new();
+                for _ in 0..member_count {
+                    let file = &files[rng.range(file_count) as usize];
+                    let name = &names[rng.range(name_count) as usize];
+                    let start = rng.range(3) * 10;
+                    members.push((file.as_str(), name.as_str(), (start, start + 10)));
+                }
+                groups.push(mk_at(tier, &members));
+            }
+
+            let expected: Vec<_> = brute_dedupe_subset_groups(groups.clone())
+                .iter()
+                .map(group_signature)
+                .collect();
+            let actual: Vec<_> = dedupe_subset_groups(groups)
+                .iter()
+                .map(group_signature)
+                .collect();
+            assert_eq!(actual, expected, "seed {seed}");
+        }
     }
 
     #[test]
