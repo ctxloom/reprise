@@ -196,7 +196,12 @@ mod tests {
         let cfg = Config::default();
         let path = PathBuf::from(format!("t.{ext}"));
         let (units, _) = unit::extract_file_units(&path, src, lang, &cfg);
-        units.into_iter().next().expect("one unit").tree
+        units
+            .into_iter()
+            .next()
+            .expect("one unit")
+            .tree
+            .into_resident()
     }
 
     #[test]

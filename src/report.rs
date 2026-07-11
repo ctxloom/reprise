@@ -194,6 +194,21 @@ pub struct Stats {
     /// Wall time per pipeline phase (extract, inline, near, sequence, api…).
     pub phase_ms: BTreeMap<String, u64>,
     pub duration_ms: u64,
+    /// Gate 2 (memory architecture P2) observability — which path ran, and the
+    /// spill/reload traffic when the gate tripped. These `memory_*` fields are
+    /// the WP's only permitted output addition; the byte-identity harness
+    /// strips `stats.phase_ms`, `stats.duration_ms` and `stats.memory_*`.
+    pub memory_budget_bytes: u64,
+    pub memory_estimated_bytes: u64,
+    pub memory_gate_tripped: bool,
+    /// Trees spilled to the scan-scoped pack (plain at gate-trip + variants at
+    /// `finish_variant`); 0 under the gate.
+    pub memory_spilled_trees: usize,
+    /// Total serialized bytes across the scan's packs (trees + seq streams).
+    pub memory_pack_bytes: u64,
+    /// Tree-pack LRU traffic during near-tier verify (hit-rate = hits/(hits+misses)).
+    pub memory_lru_hits: u64,
+    pub memory_lru_misses: u64,
 }
 
 /// Minimal per-unit coordinates check mode needs to map baseline member

@@ -17,12 +17,30 @@ use crate::tree::{Label, NormNode};
 use crate::unit::{self, Unit};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-/// Signature element: callee name + control context.
-type Elem = (Box<str>, u8, bool, bool);
+/// Signature element: callee name + control context. Public because the fused
+/// digest pass ([`crate::digest`]) carries each plain unit's call multiset.
+pub type Elem = (Box<str>, u8, bool, bool);
 
-struct Signature {
+/// One unit's raw call multiset — the per-unit walk this tier's signatures are
+/// built from, before the corpus-wide IDF/rarity filtering (which stays in
+/// `api_groups_for_lang`, where document frequency exists). Public so the fused
+/// digest pass computes it with the SAME extractor at unit-creation time.
+pub fn call_elems(tree: &NormNode, lang: Lang, cfg: &Config) -> BTreeMap<Elem, u32> {
+    let shapes = Shapes::for_lang(lang, cfg);
+    let mut elems = BTreeMap::new();
+    // The unit body's final statement/expression is a tail position, like
+    // returns: `return f(x)` and block-tail `f(x)` must agree.
+    let tail_node = shapes.tail_node(tree);
+    extract_calls(tree, shapes, Flags::default(), tail_node, &mut elems);
+    elems
+}
+
+struct Signature<'d> {
     unit_idx: usize,
-    elems: BTreeMap<Elem, u32>,
+    /// Over the memory gate: borrowed from the unit's fused digest
+    /// (`UnitDigest::api_elems`). Under it: computed here from the resident
+    /// tree (same `call_elems` walk as before the memory work).
+    elems: std::borrow::Cow<'d, BTreeMap<Elem, u32>>,
     rare_names: Vec<Box<str>>,
 }
 
@@ -33,6 +51,7 @@ const MAX_LOOP_DEPTH: u8 = 3;
 
 pub fn find_api_groups(
     units: &[Unit],
+    digests: Option<&[crate::digest::UnitDigest]>,
     cfg: &Config,
     excluded_pairs: &HashSet<(usize, usize)>,
     signatures_emitted: &mut usize,
@@ -47,6 +66,7 @@ pub fn find_api_groups(
     for lang in langs {
         groups.extend(api_groups_for_lang(
             units,
+            digests,
             lang,
             cfg,
             excluded_pairs,
@@ -58,12 +78,12 @@ pub fn find_api_groups(
 
 fn api_groups_for_lang(
     units: &[Unit],
+    digests: Option<&[crate::digest::UnitDigest]>,
     lang: Lang,
     cfg: &Config,
     excluded_pairs: &HashSet<(usize, usize)>,
     signatures_emitted: &mut usize,
 ) -> Vec<Group> {
-    let shapes = Shapes::for_lang(lang, cfg);
     // Eligible population: plain units at or above the size floor.
     let eligible: Vec<usize> = (0..units.len())
         .filter(|&i| {
@@ -77,20 +97,31 @@ fn api_groups_for_lang(
         return Vec::new();
     }
 
-    // Callee multisets (parallel) + document frequency over the population.
+    // Callee multisets: over the gate, read off the fused digests (computed at
+    // digest time — trees may already be spilled; every eligible unit is plain,
+    // so the field is always present). Under the gate, walk the resident trees
+    // in parallel with the SAME `call_elems` extractor, exactly as this tier
+    // did before the memory work. Then document frequency over the population.
     use rayon::prelude::*;
-    let raw: Vec<(usize, BTreeMap<Elem, u32>)> = eligible
-        .par_iter()
-        .map(|&i| {
-            let mut elems = BTreeMap::new();
-            let tree = &units[i].tree;
-            // The unit body's final statement/expression is a tail position,
-            // like returns: `return f(x)` and block-tail `f(x)` must agree.
-            let tail_node = shapes.tail_node(tree);
-            extract_calls(tree, shapes, Flags::default(), tail_node, &mut elems);
-            (i, elems)
-        })
-        .collect();
+    let raw: Vec<(usize, std::borrow::Cow<'_, BTreeMap<Elem, u32>>)> = match digests {
+        Some(digests) => eligible
+            .iter()
+            .map(|&i| {
+                let elems = digests[i]
+                    .api_elems
+                    .as_ref()
+                    .expect("plain unit's digest carries api_elems");
+                (i, std::borrow::Cow::Borrowed(elems))
+            })
+            .collect(),
+        None => eligible
+            .par_iter()
+            .map(|&i| {
+                let elems = call_elems(units[i].tree.expect_resident(), lang, cfg);
+                (i, std::borrow::Cow::Owned(elems))
+            })
+            .collect(),
+    };
     let mut df: HashMap<Box<str>, usize> = HashMap::new();
     for (_, elems) in &raw {
         let names: HashSet<&Box<str>> = elems.keys().map(|(name, ..)| name).collect();
@@ -107,7 +138,7 @@ fn api_groups_for_lang(
         (1.0 + n as f64 / d as f64).ln()
     };
 
-    let sigs: Vec<Signature> = raw
+    let sigs: Vec<Signature<'_>> = raw
         .into_iter()
         .filter_map(|(unit_idx, elems)| {
             let mut rare_names: Vec<Box<str>> = elems

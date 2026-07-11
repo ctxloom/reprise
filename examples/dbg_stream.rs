@@ -39,7 +39,7 @@ fn main() {
             None => &units[0],
         };
         let mut toks = Vec::new();
-        serialize(&unit.tree, &mut toks);
+        serialize(unit.tree.expect_resident(), &mut toks);
         eprintln!("{}: unit {} with {} tokens", path, unit.name, toks.len());
         streams.push(toks);
     }

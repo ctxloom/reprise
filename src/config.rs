@@ -17,6 +17,32 @@ pub struct Config {
     pub api_profile: ApiProfileCfg,
     pub baseline: BaselineCfg,
     pub cache: CacheCfg,
+    pub memory: MemoryCfg,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct MemoryCfg {
+    /// Fraction of detected system RAM to budget for the scan (Gate 2,
+    /// `src/memory.rs`). The default path on machines without a pinned budget.
+    pub budget_fraction: f64,
+    /// Explicit budget in bytes — outranks `budget_fraction`; pin it for
+    /// reproducible gate decisions (CI, cross-machine comparisons).
+    pub budget_bytes: Option<u64>,
+    /// "auto" (default: gate on the estimate) | "always" | "never". The
+    /// `REPRISE_MEMORY_FORCE_GATE` env var outranks this key (the harness knob
+    /// for forcing the spill path on small corpora without a config file).
+    pub force_gate: String,
+}
+
+impl Default for MemoryCfg {
+    fn default() -> Self {
+        MemoryCfg {
+            budget_fraction: 0.5,
+            budget_bytes: None,
+            force_gate: "auto".into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -477,6 +503,14 @@ impl Config {
             "[report] sarif_fingerprint",
             &self.report.sarif_fingerprint,
             &["structural", "line"],
+        )?;
+        // `memory.force_gate`'s consumer (src/memory.rs `force_override`) treats an
+        // unknown value as "auto" — a typo like "alway" would silently gate on the
+        // estimate instead of forcing the spill path.
+        validate_enum(
+            "[memory] force_gate",
+            &self.memory.force_gate,
+            &["auto", "always", "never"],
         )?;
         // `fold_min_repeats` is a run-length floor AND the divisor in fold.rs's period loop
         // (`(n - i) / min_repeats`). Zero divides by zero and panics mid-scan, so reject it at

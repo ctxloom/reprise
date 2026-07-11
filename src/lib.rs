@@ -8,6 +8,7 @@ pub mod baseline;
 pub mod cache;
 pub mod check;
 pub mod config;
+pub mod digest;
 pub mod fingerprint;
 pub mod fold;
 pub mod formats;
@@ -18,7 +19,9 @@ pub mod intern;
 pub mod ir;
 pub mod lang;
 pub mod matchtree;
+pub mod memory;
 pub mod normalize;
+pub mod pack;
 pub mod report;
 pub mod seq;
 pub mod stream;
@@ -59,6 +62,19 @@ use std::time::Instant;
 /// silently rendering against stale-vs-fresh mismatched content.
 pub struct CorpusUnits {
     pub units: Vec<Unit>,
+    /// Gate 2 (memory architecture P2), decided here — a phase boundary, from
+    /// exact post-extraction counts. `scan()` reads this instead of re-deciding.
+    pub gate: memory::GateDecision,
+    /// Per-unit fused digests (`digest::compute`), index-aligned with `units`:
+    /// everything the single-tree consumers (exact ranking, near-tier substrate,
+    /// sequence stream, api multiset) read instead of walking `Unit::tree` once
+    /// trees spill. **Populated ONLY over the memory gate** (`gate.over`) —
+    /// under the gate this is EMPTY and every consumer walks the resident trees
+    /// exactly as before the drop-trees work (P2: "under budget → today's
+    /// residency, zero new work"; also the Tier-2 join contract — digests exist
+    /// exactly when a gate is over). NOT part of the D19 cache (a pure recompute
+    /// from the tree; P4 freezes the cache format).
+    pub digests: Vec<digest::UnitDigest>,
     pub raw_trees: Vec<tree::NormNode>,
     pub repeats: Vec<unit::InternalRepeat>,
     pub source_digests: HashMap<std::path::PathBuf, u128>,
@@ -191,8 +207,35 @@ pub fn corpus_units(root: &Path, config: &Config) -> anyhow::Result<CorpusUnits>
     raw_trees.shrink_to_fit();
     repeats.shrink_to_fit();
 
+    // ---- Gate 2 (memory architecture P2): ONE decision, at this phase
+    // boundary, from exact post-extraction counts. Under the gate the fused
+    // digests are NOT computed — every downstream consumer walks the resident
+    // trees exactly as it did before the drop-trees work (zero new work, zero
+    // new residency: the common case pays nothing). Over the gate, one
+    // parallel pass computes every plain unit's digest while the trees are
+    // still resident (variants get theirs at the `finish_variant` tail), and
+    // `scan()` spills the trees to the scan-scoped pack. ----
+    let gate = memory::decide(&units, config);
+    let digests: Vec<digest::UnitDigest> = if gate.over {
+        units
+            .par_iter()
+            .map(|u| {
+                digest::compute(
+                    u.tree.expect_resident(),
+                    u.lang,
+                    config,
+                    u.variant.is_none(),
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     Ok(CorpusUnits {
         units,
+        gate,
+        digests,
         raw_trees,
         repeats,
         source_digests,
@@ -201,11 +244,23 @@ pub fn corpus_units(root: &Path, config: &Config) -> anyhow::Result<CorpusUnits>
     })
 }
 
+/// The scan-scoped packs (memory architecture P3), created only over the
+/// memory gate: one for canonical trees (near-tier verify materializes pairs
+/// through its LRU), one for sequence streams (bulk-loaded per language
+/// partition). Both die with the scan — anonymous temp files, never the D19
+/// cache.
+struct ScanPacks {
+    trees: pack::Pack<tree::NormNode>,
+    seqs: pack::Pack<digest::SeqStream>,
+}
+
 /// Full-repo scan (spec §2 `reprise scan`).
 pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
     let started = Instant::now();
     let CorpusUnits {
         mut units,
+        gate,
+        mut digests,
         raw_trees,
         repeats: internal_repeats,
         source_digests,
@@ -222,6 +277,51 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
         phase_started = now;
     };
     phase("extract", &mut stats, Instant::now());
+
+    // ---- Gate 2 (memory architecture P2): ONE decision, at this phase
+    // boundary, from exact post-extraction counts. Under the gate nothing
+    // below changes (trees resident, zero new work). Over it, trees and
+    // sequence streams spill to the scan-scoped content-addressed pack (P3);
+    // near-tier verify materializes pairs through the pack LRU and the
+    // sequence tier bulk-loads per language partition. Either way the OUTPUT
+    // is byte-identical — the gate changes performance, never output. ----
+    let packs = if gate.over {
+        // Tree LRU: a budget-derived slice, floored so verify pairs fit
+        // comfortably; the seq pack needs no real LRU (one bulk load per
+        // partition, handles owned by the loop) so it gets a token bound.
+        // The tree decoder re-interns labels through THIS scan's interner
+        // (post-interning, `NormNode` deserializes only via the wire path).
+        let tree_lru_bytes = (gate.budget_bytes / 8).clamp(64 << 20, 1 << 30);
+        let li = std::sync::Arc::clone(&label_interner);
+        Some(ScanPacks {
+            trees: pack::Pack::with_decoder(tree_lru_bytes, 16, move |bytes| {
+                let wire: tree::NormNodeWire =
+                    bincode::deserialize(bytes).expect("pack tree decodes");
+                wire.into_real(&li)
+            })
+            .map_err(|e| anyhow::anyhow!("creating scan tree pack: {e}"))?,
+            seqs: pack::Pack::new(1 << 20, 4)
+                .map_err(|e| anyhow::anyhow!("creating scan seq pack: {e}"))?,
+        })
+    } else {
+        None
+    };
+    let mut spilled_trees = 0usize;
+    if let Some(p) = &packs {
+        // Spill moment 1 (P3): one sequential pass over the already-
+        // materialized plain units. (Variants spill at creation, below.)
+        for (u, d) in units.iter_mut().zip(digests.iter_mut()) {
+            if let unit::TreeSlot::Resident(t) = &u.tree {
+                let key = p.trees.store(t);
+                u.tree = unit::TreeSlot::Spilled(key);
+                spilled_trees += 1;
+            }
+            if let digest::SeqSlot::Resident(s) = &d.seq_tokens {
+                let key = p.seqs.store(s);
+                d.seq_tokens = digest::SeqSlot::Spilled(key);
+            }
+        }
+    }
 
     // ---- P5: best-effort inliner (spec §5.4) — variants appended, tagged ----
     if config.inline.enabled {
@@ -241,7 +341,10 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
         struct VariantOutcome {
             ambiguity_skips: u32,
             calls_inlined: u32,
-            variant: Option<Unit>,
+            /// The variant unit plus (over the gate only) its fused digest —
+            /// the variant analog of the gate-trip digest moment, computed while
+            /// this fresh tree is still resident.
+            variant: Option<(Unit, Option<digest::UnitDigest>)>,
         }
         let outcomes: Vec<VariantOutcome> = expansions
             .into_par_iter()
@@ -287,36 +390,67 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
                 tag.chain = exp.chain;
                 tag.expanded_fps = expanded_fps;
                 tag.scc = exp.scc;
+                // Over the gate only: fuse the digest while this fresh tree is
+                // resident, then spill it (spill moment 2, P3 — the pack doesn't
+                // care where a tree came from: plain and variant, one mechanism).
+                // Under the gate: no digest, no spill — zero new work (P2).
+                let vd = packs.is_some().then(|| {
+                    digest::compute(variant.tree.expect_resident(), variant.lang, config, false)
+                });
+                if let Some(p) = &packs
+                    && let unit::TreeSlot::Resident(t) = &variant.tree
+                {
+                    let key = p.trees.store(t);
+                    variant.tree = unit::TreeSlot::Spilled(key);
+                }
                 VariantOutcome {
                     ambiguity_skips,
                     calls_inlined: exp.calls_inlined,
-                    variant: Some(variant),
+                    variant: Some((variant, vd)),
                 }
             })
             .collect();
         let mut variants: Vec<Unit> = Vec::new();
+        let mut variant_digests: Vec<digest::UnitDigest> = Vec::new();
         for outcome in outcomes {
             stats.ambiguity_skips += outcome.ambiguity_skips as usize;
             stats.calls_inlined += outcome.calls_inlined as usize;
-            if let Some(variant) = outcome.variant {
+            if let Some((variant, vd)) = outcome.variant {
                 variants.push(variant);
+                if let Some(vd) = vd {
+                    variant_digests.push(vd);
+                }
             }
         }
         stats.inline_variants = variants.len(); // ≤1 per unit: the §12 cap
+        if packs.is_some() {
+            spilled_trees += variants.len(); // every variant spilled at creation
+        }
         units.extend(variants);
+        digests.extend(variant_digests);
         // Lever 4: `units` just grew ~1.5x (plain + variants) via `extend`'s own
         // doubling growth; this is its last growth point for the rest of `scan()`,
         // so reclaim the slack here once rather than carry it through every
         // downstream tier.
         units.shrink_to_fit();
+        digests.shrink_to_fit();
     }
+    debug_assert!(
+        if gate.over {
+            units.len() == digests.len()
+        } else {
+            digests.is_empty()
+        },
+        "digests exist (index-aligned) exactly when the gate is over"
+    );
     drop(raw_trees);
     phase("inline", &mut stats, Instant::now());
 
     // ---- exact tier (P7 bucketing; plain) + inline-assisted exact matches ----
-    let (exact, below_floor) = group::build_exact_groups(&units, config);
+    let digests_opt = gate.over.then_some(digests.as_slice());
+    let (exact, below_floor) = group::build_exact_groups(&units, digests_opt, config);
     stats.units_below_floor = below_floor;
-    let inline_exact = group::build_inline_exact_groups(&units, config);
+    let inline_exact = group::build_inline_exact_groups(&units, digests_opt, config);
 
     let pair_key = |set: &mut HashSet<(usize, usize)>, indices: &[usize]| {
         for i in 0..indices.len() {
@@ -340,7 +474,14 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
     phase("exact", &mut stats, Instant::now());
 
     // ---- near-miss tier (retrieval → histogram → AU; plain + variants) ----
-    let near = matchtree::find_near_groups(&units, config, &mut stats.retrieval, &exact_pairs);
+    let near = matchtree::find_near_groups(
+        &units,
+        digests_opt,
+        config,
+        &mut stats.retrieval,
+        &exact_pairs,
+        packs.as_ref().map(|p| &p.trees),
+    );
     phase("near", &mut stats, Instant::now());
 
     // Pairs co-grouped by a tree tier — sequence regions between them are
@@ -388,8 +529,53 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
             if part.len() < 2 {
                 continue;
             }
-            let refs: Vec<&Unit> = part.iter().map(|&i| &units[i]).collect();
-            let corpus = stream::build_corpus(&refs);
+            // Under the gate: serialize this partition's streams from the
+            // resident trees, in parallel — exactly the walk the old
+            // `build_corpus(&[&Unit])` did internally, same serializer, same
+            // transient lifetime (dropped with the partition). Over the gate:
+            // streams were fused at digest time and spilled; bulk-load them
+            // from the seq pack for exactly this partition (`handles` owns
+            // them; both drop with the iteration — P3's per-partition
+            // load/drop points).
+            let owned: Vec<digest::SeqStream> = if gate.over {
+                Vec::new()
+            } else {
+                part.par_iter()
+                    .map(|&i| stream::unit_stream(units[i].tree.expect_resident()))
+                    .collect()
+            };
+            let handles: Vec<Option<std::sync::Arc<digest::SeqStream>>> = if gate.over {
+                part.iter()
+                    .map(|&i| match &digests[i].seq_tokens {
+                        digest::SeqSlot::Spilled(key) => Some(
+                            packs
+                                .as_ref()
+                                .expect("spilled stream but no scan pack — gate wiring bug")
+                                .seqs
+                                .load(*key),
+                        ),
+                        digest::SeqSlot::Resident(_) => None,
+                        digest::SeqSlot::Absent => {
+                            unreachable!("sequence partition holds plain units only")
+                        }
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let streams: Vec<&[(u64, (u32, u32))]> = if gate.over {
+                part.iter()
+                    .zip(&handles)
+                    .map(|(&i, handle)| match (&digests[i].seq_tokens, handle) {
+                        (digest::SeqSlot::Resident(v), _) => v.as_slice(),
+                        (digest::SeqSlot::Spilled(_), Some(h)) => h.as_slice(),
+                        _ => unreachable!("plain unit's digest carries a seq stream"),
+                    })
+                    .collect()
+            } else {
+                owned.iter().map(Vec::as_slice).collect()
+            };
+            let corpus = stream::build_corpus(&streams);
             for r in seq::maximal_repeats(&corpus, config.thresholds.min_seq_tokens as usize) {
                 stats.sequence_regions_found += 1;
                 let ua = part[r.unit_a as usize];
@@ -464,8 +650,13 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
     phase("sequence", &mut stats, Instant::now());
 
     // ---- api-profile tier (spec §5.7): own section, never fails CI ----
-    let mut api_groups =
-        api::find_api_groups(&units, config, &api_excluded, &mut stats.api_signatures);
+    let mut api_groups = api::find_api_groups(
+        &units,
+        digests_opt,
+        config,
+        &api_excluded,
+        &mut stats.api_signatures,
+    );
     phase("api", &mut stats, Instant::now());
 
     // ---- assemble, apply test policy, rank ----
@@ -648,6 +839,18 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
     phase("assemble", &mut stats, Instant::now());
     stats.duration_ms = started.elapsed().as_millis() as u64;
 
+    // Gate-2 observability (approved amendment: `memory_*` are the WP's only
+    // output additions; the identity harness strips them alongside timing).
+    stats.memory_budget_bytes = gate.budget_bytes;
+    stats.memory_estimated_bytes = gate.estimated_bytes;
+    stats.memory_gate_tripped = gate.over;
+    stats.memory_spilled_trees = spilled_trees;
+    if let Some(p) = &packs {
+        stats.memory_pack_bytes = p.trees.stored_bytes() + p.seqs.stored_bytes();
+        stats.memory_lru_hits = p.trees.lru_hits();
+        stats.memory_lru_misses = p.trees.lru_misses();
+    }
+
     // Plain-unit coordinates for check mode's baseline-member mapping.
     let unit_index: Vec<report::UnitSummary> = units
         .iter()
@@ -719,7 +922,7 @@ mod tests {
             is_test,
             accept_drift: false,
             fingerprint: 0,
-            tree: tree::NormNode::new("Unit", None, (0, 0), Vec::new()),
+            tree: unit::TreeSlot::Resident(tree::NormNode::new("Unit", None, (0, 0), Vec::new())),
             variant: None,
         }
     }

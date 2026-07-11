@@ -1,0 +1,339 @@
+#### w1_gin_marshalxml ####
+== groups (1) ==
+g1 tier=near-normalized fp=35d5f94854ec65eae8bdaa17f310ff26 tokens=157 value=157.0 div=0.006369426751592357 note=None chain=None template_hash=Some(690178368242291107)
+  member a.go:MarshalXML span=(7, 26) lang=go degraded=false
+  member b.go:MarshalXML span=(7, 26) lang=go degraded=false
+== test_groups (0) ==
+== api_groups (0) ==
+== weak_groups (0) ==
+== unit_index (2) ==
+a.go:MarshalXML span=(7, 26) fp=e809d717acb71a605097e6e54905aadc accept_drift=false
+b.go:MarshalXML span=(7, 26) fp=063592bfc4416faed4c81adfb81c838d accept_drift=false
+== stats ==
+files_scanned=2
+files_skipped_generated=0
+files_unreadable=0
+units_indexed=2
+units_below_floor=0
+parse_degraded_units=0
+test_units=0
+findings_by_tier={"near-normalized": 1}
+sequence_regions_found=1
+sequence_regions_subsumed=1
+regions_substantial=0
+groups_subsumed_subset=0
+inline_variants=0
+ambiguity_skips=0
+calls_inlined=0
+scc_units=0
+api_signatures=0
+suppressed_units=0
+retrieval=RetrievalStats { candidates_bag: 1, candidates_landmark: 1, candidates_landmark_coverage_gated: 0, candidates_total: 1, offset_histogram_rejected: 0, htree_rejected: 0, divergence_rejected: 0, verified_pairs: 1, verified_only_landmark: 0, landmark_index_size: 424 }
+total_lines=52
+total_tokens=314
+duplicated_lines=40
+duplicated_lines_pct=76.92307692307692
+duplicated_tokens=157
+duplicated_tokens_pct=50.0
+clones_per_kloc=19.23076923076923
+#### w2_ripgrep_bytecount ####
+== groups (1) ==
+g1 tier=exact-normalized fp=388d9f30ecb538f1249da02c999fc53c tokens=46 value=46.0 div=0.0 note=None chain=None template_hash=None
+  member a.rs:byte_count span=(2, 7) lang=rust degraded=false
+  member a.rs:byte_count span=(11, 16) lang=rust degraded=false
+== test_groups (0) ==
+== api_groups (0) ==
+== weak_groups (0) ==
+== unit_index (2) ==
+a.rs:byte_count span=(2, 7) fp=388d9f30ecb538f1249da02c999fc53c accept_drift=false
+a.rs:byte_count span=(11, 16) fp=388d9f30ecb538f1249da02c999fc53c accept_drift=false
+== stats ==
+files_scanned=1
+files_skipped_generated=0
+files_unreadable=0
+units_indexed=2
+units_below_floor=0
+parse_degraded_units=0
+test_units=0
+findings_by_tier={"exact-normalized": 1}
+sequence_regions_found=1
+sequence_regions_subsumed=1
+regions_substantial=0
+groups_subsumed_subset=0
+inline_variants=0
+ambiguity_skips=0
+calls_inlined=0
+scc_units=0
+api_signatures=0
+suppressed_units=0
+retrieval=RetrievalStats { candidates_bag: 0, candidates_landmark: 0, candidates_landmark_coverage_gated: 0, candidates_total: 0, offset_histogram_rejected: 0, htree_rejected: 0, divergence_rejected: 0, verified_pairs: 0, verified_only_landmark: 0, landmark_index_size: 0 }
+total_lines=17
+total_tokens=92
+duplicated_lines=12
+duplicated_lines_pct=70.58823529411765
+duplicated_tokens=46
+duplicated_tokens_pct=50.0
+clones_per_kloc=58.8235294117647
+#### w3_ripgrep_sort ####
+== groups (1) ==
+g1 tier=exact-normalized fp=3066ac532fb63856cd1a447d6aa9814f tokens=104 value=104.0 div=0.0 note=None chain=None template_hash=None
+  member a.rs:update span=(2, 16) lang=rust degraded=false
+  member a.rs:update span=(20, 34) lang=rust degraded=false
+== test_groups (0) ==
+== api_groups (0) ==
+== weak_groups (0) ==
+== unit_index (2) ==
+a.rs:update span=(2, 16) fp=3066ac532fb63856cd1a447d6aa9814f accept_drift=false
+a.rs:update span=(20, 34) fp=3066ac532fb63856cd1a447d6aa9814f accept_drift=false
+== stats ==
+files_scanned=1
+files_skipped_generated=0
+files_unreadable=0
+units_indexed=2
+units_below_floor=0
+parse_degraded_units=0
+test_units=0
+findings_by_tier={"exact-normalized": 1}
+sequence_regions_found=1
+sequence_regions_subsumed=1
+regions_substantial=0
+groups_subsumed_subset=0
+inline_variants=0
+ambiguity_skips=0
+calls_inlined=0
+scc_units=0
+api_signatures=2
+suppressed_units=0
+retrieval=RetrievalStats { candidates_bag: 0, candidates_landmark: 0, candidates_landmark_coverage_gated: 0, candidates_total: 0, offset_histogram_rejected: 0, htree_rejected: 0, divergence_rejected: 0, verified_pairs: 0, verified_only_landmark: 0, landmark_index_size: 0 }
+total_lines=35
+total_tokens=208
+duplicated_lines=30
+duplicated_lines_pct=85.71428571428571
+duplicated_tokens=104
+duplicated_tokens_pct=50.0
+clones_per_kloc=28.571428571428573
+#### w4_serde_end ####
+== groups (1) ==
+g1 tier=exact-normalized fp=06778e3f9f6799ff3aaa2acf3d1d1984 tokens=56 value=56.0 div=0.0 note=None chain=None template_hash=None
+  member a.rs:end span=(5, 17) lang=rust degraded=false
+  member a.rs:end span=(24, 36) lang=rust degraded=false
+== test_groups (0) ==
+== api_groups (0) ==
+== weak_groups (0) ==
+== unit_index (2) ==
+a.rs:end span=(5, 17) fp=06778e3f9f6799ff3aaa2acf3d1d1984 accept_drift=false
+a.rs:end span=(24, 36) fp=06778e3f9f6799ff3aaa2acf3d1d1984 accept_drift=false
+== stats ==
+files_scanned=1
+files_skipped_generated=0
+files_unreadable=0
+units_indexed=2
+units_below_floor=0
+parse_degraded_units=0
+test_units=0
+findings_by_tier={"exact-normalized": 1}
+sequence_regions_found=1
+sequence_regions_subsumed=1
+regions_substantial=0
+groups_subsumed_subset=0
+inline_variants=0
+ambiguity_skips=0
+calls_inlined=0
+scc_units=0
+api_signatures=2
+suppressed_units=0
+retrieval=RetrievalStats { candidates_bag: 0, candidates_landmark: 0, candidates_landmark_coverage_gated: 0, candidates_total: 0, offset_histogram_rejected: 0, htree_rejected: 0, divergence_rejected: 0, verified_pairs: 0, verified_only_landmark: 0, landmark_index_size: 0 }
+total_lines=37
+total_tokens=112
+duplicated_lines=26
+duplicated_lines_pct=70.27027027027027
+duplicated_tokens=56
+duplicated_tokens_pct=50.0
+clones_per_kloc=27.027027027027028
+#### w5_serde_tagorcontent ####
+== groups (1) ==
+g1 tier=near-normalized fp=032609d14d7bbfabcee641fe64f8be99 tokens=61 value=61.0 div=0.01639344262295082 note=None chain=None template_hash=Some(18091572329375648869)
+  member a.rs:visit_str span=(2, 13) lang=rust degraded=false
+  member a.rs:visit_borrowed_str span=(15, 26) lang=rust degraded=false
+== test_groups (0) ==
+== api_groups (0) ==
+== weak_groups (0) ==
+== unit_index (2) ==
+a.rs:visit_str span=(2, 13) fp=c2f96fc70c4a34da433c92843128464b accept_drift=false
+a.rs:visit_borrowed_str span=(15, 26) fp=50cecb71da17eb7af41a787b79472d99 accept_drift=false
+== stats ==
+files_scanned=1
+files_skipped_generated=0
+files_unreadable=0
+units_indexed=2
+units_below_floor=0
+parse_degraded_units=0
+test_units=0
+findings_by_tier={"near-normalized": 1}
+sequence_regions_found=1
+sequence_regions_subsumed=1
+regions_substantial=0
+groups_subsumed_subset=0
+inline_variants=0
+ambiguity_skips=0
+calls_inlined=0
+scc_units=0
+api_signatures=2
+suppressed_units=0
+retrieval=RetrievalStats { candidates_bag: 0, candidates_landmark: 1, candidates_landmark_coverage_gated: 0, candidates_total: 1, offset_histogram_rejected: 0, htree_rejected: 0, divergence_rejected: 0, verified_pairs: 1, verified_only_landmark: 1, landmark_index_size: 168 }
+total_lines=27
+total_tokens=122
+duplicated_lines=24
+duplicated_lines_pct=88.88888888888889
+duplicated_tokens=61
+duplicated_tokens_pct=50.0
+clones_per_kloc=37.03703703703704
+#### w6_flask_maxprops ####
+== groups (1) ==
+g1 tier=near-normalized fp=4f54f186497619b63456c39e9c9e5fc6 tokens=40 value=40.0 div=0.05 note=None chain=None template_hash=Some(15726458288538339345)
+  member a.py:max_content_length span=(3, 29) lang=python degraded=false
+  member a.py:max_form_memory_size span=(32, 52) lang=python degraded=false
+== test_groups (0) ==
+== api_groups (0) ==
+== weak_groups (0) ==
+== unit_index (2) ==
+a.py:max_content_length span=(3, 29) fp=612a5e5528e32e89d26a43c1d1d51c7f accept_drift=false
+a.py:max_form_memory_size span=(32, 52) fp=bc3cc38c80671ac3d09a0fb831aa0857 accept_drift=false
+== stats ==
+files_scanned=1
+files_skipped_generated=0
+files_unreadable=0
+units_indexed=2
+units_below_floor=0
+parse_degraded_units=0
+test_units=0
+findings_by_tier={"near-normalized": 1}
+sequence_regions_found=0
+sequence_regions_subsumed=0
+regions_substantial=0
+groups_subsumed_subset=0
+inline_variants=0
+ambiguity_skips=0
+calls_inlined=0
+scc_units=0
+api_signatures=0
+suppressed_units=0
+retrieval=RetrievalStats { candidates_bag: 0, candidates_landmark: 1, candidates_landmark_coverage_gated: 0, candidates_total: 1, offset_histogram_rejected: 0, htree_rejected: 0, divergence_rejected: 0, verified_pairs: 1, verified_only_landmark: 1, landmark_index_size: 96 }
+total_lines=52
+total_tokens=80
+duplicated_lines=48
+duplicated_lines_pct=92.3076923076923
+duplicated_tokens=40
+duplicated_tokens_pct=50.0
+clones_per_kloc=19.23076923076923
+#### w7_click_chunkpump ####
+== groups (1) ==
+g1 tier=exact-region fp=f61e74dca3e28934268d8f78578c52cf tokens=30 value=30.0 div=0.0 note=None chain=None template_hash=None
+  member a.py:cli span=(20, 25) lang=python degraded=false
+  member b.py:test span=(4, 9) lang=python degraded=false
+== test_groups (0) ==
+== api_groups (0) ==
+== weak_groups (0) ==
+== unit_index (2) ==
+a.py:cli span=(2, 25) fp=f0133c1bf8f47f2e2dd67c121f238b2b accept_drift=false
+b.py:test span=(1, 9) fp=313ef4b57072fc259d3767240a6a1bf9 accept_drift=false
+== stats ==
+files_scanned=2
+files_skipped_generated=0
+files_unreadable=0
+units_indexed=2
+units_below_floor=0
+parse_degraded_units=0
+test_units=0
+findings_by_tier={"exact-region": 1}
+sequence_regions_found=1
+sequence_regions_subsumed=0
+regions_substantial=0
+groups_subsumed_subset=0
+inline_variants=0
+ambiguity_skips=0
+calls_inlined=0
+scc_units=0
+api_signatures=2
+suppressed_units=0
+retrieval=RetrievalStats { candidates_bag: 0, candidates_landmark: 1, candidates_landmark_coverage_gated: 0, candidates_total: 1, offset_histogram_rejected: 0, htree_rejected: 0, divergence_rejected: 1, verified_pairs: 0, verified_only_landmark: 0, landmark_index_size: 123 }
+total_lines=34
+total_tokens=108
+duplicated_lines=12
+duplicated_lines_pct=35.294117647058826
+duplicated_tokens=30
+duplicated_tokens_pct=27.77777777777778
+clones_per_kloc=29.41176470588235
+#### w8_ripgrep_convert ####
+== groups (0) ==
+== test_groups (0) ==
+== api_groups (0) ==
+== weak_groups (0) ==
+== unit_index (4) ==
+a.rs:str span=(6, 11) fp=de0fc80e9e22b6521e8cd07d3b6124af accept_drift=false
+a.rs:string span=(13, 18) fp=1bb96beed6b99fd83754534459cdfd1a accept_drift=false
+a.rs:usize span=(20, 22) fp=5674d5ebf40829313d0f38332a24abc4 accept_drift=false
+a.rs:u64 span=(24, 26) fp=713569586ae3dcd52f13380b1bc5bdfa accept_drift=false
+== stats ==
+files_scanned=1
+files_skipped_generated=0
+files_unreadable=0
+units_indexed=4
+units_below_floor=4
+parse_degraded_units=0
+test_units=0
+findings_by_tier={}
+sequence_regions_found=0
+sequence_regions_subsumed=0
+regions_substantial=0
+groups_subsumed_subset=0
+inline_variants=0
+ambiguity_skips=0
+calls_inlined=0
+scc_units=0
+api_signatures=0
+suppressed_units=0
+retrieval=RetrievalStats { candidates_bag: 0, candidates_landmark: 0, candidates_landmark_coverage_gated: 0, candidates_total: 0, offset_histogram_rejected: 0, htree_rejected: 0, divergence_rejected: 0, verified_pairs: 0, verified_only_landmark: 0, landmark_index_size: 0 }
+total_lines=28
+total_tokens=132
+duplicated_lines=0
+duplicated_lines_pct=0.0
+duplicated_tokens=0
+duplicated_tokens_pct=0.0
+clones_per_kloc=0.0
+#### w9_ripgrep_cpufeatures ####
+== groups (1) ==
+g1 tier=internal-repeat fp=e882f2f90e76dc8bc732469361a81ced tokens=20 value=40.0 div=0.0 note=None chain=None template_hash=None
+  member a.rs:runtime_cpu_features span=(6, 13) lang=rust degraded=false
+== test_groups (0) ==
+== api_groups (0) ==
+== weak_groups (0) ==
+== unit_index (1) ==
+a.rs:runtime_cpu_features span=(1, 34) fp=dce370b5ad3944c0dda6e761bb482309 accept_drift=false
+== stats ==
+files_scanned=1
+files_skipped_generated=0
+files_unreadable=0
+units_indexed=1
+units_below_floor=0
+parse_degraded_units=0
+test_units=0
+findings_by_tier={"internal-repeat": 1}
+sequence_regions_found=0
+sequence_regions_subsumed=0
+regions_substantial=0
+groups_subsumed_subset=0
+inline_variants=0
+ambiguity_skips=0
+calls_inlined=0
+scc_units=0
+api_signatures=0
+suppressed_units=0
+retrieval=RetrievalStats { candidates_bag: 0, candidates_landmark: 0, candidates_landmark_coverage_gated: 0, candidates_total: 0, offset_histogram_rejected: 0, htree_rejected: 0, divergence_rejected: 0, verified_pairs: 0, verified_only_landmark: 0, landmark_index_size: 0 }
+total_lines=34
+total_tokens=71
+duplicated_lines=8
+duplicated_lines_pct=23.529411764705884
+duplicated_tokens=0
+duplicated_tokens_pct=0.0
+clones_per_kloc=29.41176470588235

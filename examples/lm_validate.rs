@@ -118,8 +118,11 @@ fn main() {
         let mut reps: Vec<Rep> = eligible
             .par_iter()
             .map(|&idx| {
-                let inv: Vec<Subtree> =
-                    fingerprint::subtree_inventory(&units[idx].tree, 3, HashMode::MaskedLocals);
+                let inv: Vec<Subtree> = fingerprint::subtree_inventory(
+                    units[idx].tree.expect_resident(),
+                    3,
+                    HashMode::MaskedLocals,
+                );
                 let mut flat: Vec<(u128, u32)> = inv.iter().map(|s| (s.hash, s.offset)).collect();
                 flat.sort_unstable();
                 let mut offsets: Vec<(u128, Vec<u32>)> = Vec::new();
@@ -209,8 +212,14 @@ fn main() {
         // ---- sequence tier: exact-region recurrence for independent class-3 labeling ----
         // frag_units[frag_fp] = distinct corpus units containing that exact run.
         let part = &eligible; // plain units only here (all variant.is_none)
-        let refs: Vec<&Unit> = eligible.iter().map(|&i| &units[i]).collect();
-        let corpus = stream::build_corpus(&refs);
+        // build_corpus consumes per-unit streams since the drop-trees work;
+        // derive them with the same production serializer.
+        let unit_streams: Vec<Vec<(u64, (u32, u32))>> = eligible
+            .iter()
+            .map(|&i| stream::unit_stream(units[i].tree.expect_resident()))
+            .collect();
+        let streams: Vec<&[(u64, (u32, u32))]> = unit_streams.iter().map(Vec::as_slice).collect();
+        let corpus = stream::build_corpus(&streams);
         // map (min rep-index, max rep-index) -> (best_len, frag_fp)
         let rep_of_unit: HashMap<usize, u32> = reps
             .iter()
@@ -493,7 +502,12 @@ fn verify(
     if !offset_histogram_passes(a, b, cfg) {
         return Verdict::HistRej;
     }
-    let outcome = au::anti_unify(&ua.tree, &ub.tree, (!ir).then_some(profile), ir);
+    let outcome = au::anti_unify(
+        ua.tree.expect_resident(),
+        ub.tree.expect_resident(),
+        (!ir).then_some(profile),
+        ir,
+    );
     if outcome.divergence > cfg.thresholds.max_divergence {
         return Verdict::DivRej;
     }

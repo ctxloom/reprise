@@ -26,6 +26,112 @@ pub struct VariantTag {
     pub scc: bool,
 }
 
+/// A unit's canonical tree across the memory gate's two residency states
+/// (memory architecture P1/P3). Under the gate every tree is `Resident` —
+/// today's behavior, zero new work. Over the gate `scan()` spills trees to the
+/// scan-scoped content-addressed pack ([`crate::pack::Pack`]) and keeps only
+/// the exact-content key; near-tier verify (the one pair-of-trees consumer)
+/// materializes through the pack's LRU.
+///
+/// Everything OUTSIDE `scan()`'s gated pipeline — extraction, the D19 cache,
+/// `corpus_units` consumers (reprise-mcp, the frozen-index builder), tests —
+/// only ever sees `Resident`: spilling happens strictly after `corpus_units`
+/// returns, and `cache::store` runs strictly before it. That invariant is what
+/// makes the serialize shim below sound (and [`UnitWire`] always deserializes
+/// to `Resident`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum TreeSlot {
+    Resident(NormNode),
+    /// Exact-content pack key (xxh3-128 of the tree's serialized bytes —
+    /// never a masked matching hash).
+    Spilled(u128),
+}
+
+impl TreeSlot {
+    /// The tree, when resident.
+    pub fn resident(&self) -> Option<&NormNode> {
+        match self {
+            TreeSlot::Resident(t) => Some(t),
+            TreeSlot::Spilled(_) => None,
+        }
+    }
+
+    /// The tree, for callers that run strictly before any spill can have
+    /// happened (extraction, `corpus_units` consumers, the inline tail) —
+    /// see the type doc for why that set is closed. Panics on a spilled slot:
+    /// reaching one here is a pipeline-ordering bug, not a recoverable state.
+    #[track_caller]
+    pub fn expect_resident(&self) -> &NormNode {
+        self.resident()
+            .expect("tree was spilled before a resident-only consumer read it")
+    }
+
+    /// Owning variant of [`Self::expect_resident`] (test helpers).
+    #[track_caller]
+    pub fn into_resident(self) -> NormNode {
+        match self {
+            TreeSlot::Resident(t) => t,
+            TreeSlot::Spilled(_) => panic!("tree was spilled; no resident tree to take"),
+        }
+    }
+
+    /// The tree, wherever it lives: borrowed when resident (under-gate — zero
+    /// new work), or materialized through the scan pack's LRU when spilled
+    /// (over-gate near-tier verify). Panics if a spilled slot meets no pack —
+    /// `scan()` creates the pack in the same branch that spills.
+    #[track_caller]
+    pub fn materialize<'a>(&'a self, pack: Option<&crate::pack::Pack<NormNode>>) -> TreeRef<'a> {
+        match self {
+            TreeSlot::Resident(t) => TreeRef::Borrowed(t),
+            TreeSlot::Spilled(key) => TreeRef::Loaded(
+                pack.expect("spilled tree but no scan pack — gate wiring bug")
+                    .load(*key),
+            ),
+        }
+    }
+}
+
+/// A materialized tree: a plain borrow (resident) or a shared handle out of
+/// the pack LRU (spilled). Derefs to `NormNode` either way, so `anti_unify`'s
+/// call sites are residency-agnostic. Holding a `Loaded` handle keeps the
+/// decoded tree alive regardless of LRU eviction (the in-flight-verify
+/// guarantee).
+pub enum TreeRef<'a> {
+    Borrowed(&'a NormNode),
+    Loaded(std::sync::Arc<NormNode>),
+}
+
+impl std::ops::Deref for TreeRef<'_> {
+    type Target = NormNode;
+    fn deref(&self) -> &NormNode {
+        match self {
+            TreeRef::Borrowed(t) => t,
+            TreeRef::Loaded(a) => a,
+        }
+    }
+}
+
+/// Serialize shim keeping `Unit`'s D19 cache bytes EXACTLY as they were when
+/// `tree` was a bare `NormNode` (P4: no `EXTRACTION_VERSION` bump — verified
+/// against a real pre-change cache blob by tests/cache_compat.rs). `Unit`
+/// reaches the wire only via the D19 cache, which stores strictly pre-spill
+/// units, so `Resident` is the only serializable state; the deserialize
+/// direction lives on [`UnitWire`] (interning WP), whose `into_real` always
+/// reconstructs `Resident`.
+mod tree_slot_wire {
+    use super::TreeSlot;
+    use serde::{Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(slot: &TreeSlot, s: S) -> Result<S::Ok, S::Error> {
+        match slot {
+            TreeSlot::Resident(tree) => tree.serialize(s),
+            TreeSlot::Spilled(_) => Err(serde::ser::Error::custom(
+                "a spilled tree reached the cache wire — units are cached strictly pre-spill",
+            )),
+        }
+    }
+}
+
 /// `Deserialize` is NOT derived (see `tree::Label`'s doc comment: `NormNode`'s own
 /// `Deserialize` isn't derived either, since `Label::External`/`LitKept` need the
 /// current scan's `LabelInterner`) — deserialize through [`UnitWire`] instead.
@@ -43,7 +149,10 @@ pub struct Unit {
     /// report inconsistent-update as info instead of failing.
     pub accept_drift: bool,
     pub fingerprint: u128,
-    pub tree: NormNode,
+    /// The canonical tree (resident, or spilled to the scan pack over the
+    /// memory gate). On the D19 wire this is a bare `NormNode`, unchanged.
+    #[serde(serialize_with = "tree_slot_wire::serialize")]
+    pub tree: TreeSlot,
     /// Some for inline-expanded variants; None for plain units.
     pub variant: Option<VariantTag>,
 }
@@ -78,7 +187,7 @@ impl UnitWire {
             is_test: self.is_test,
             accept_drift: self.accept_drift,
             fingerprint: self.fingerprint,
-            tree: self.tree.into_real(label_interner),
+            tree: TreeSlot::Resident(self.tree.into_real(label_interner)),
             variant: self.variant,
         }
     }
@@ -333,7 +442,7 @@ fn extract_ir_file_units(
             is_test: u.is_test,
             accept_drift,
             fingerprint,
-            tree,
+            tree: TreeSlot::Resident(tree),
             variant: None,
         });
     }
@@ -456,7 +565,7 @@ fn unit_from_tree(
         is_test: raw.is_test,
         accept_drift,
         fingerprint: fingerprint::merkle(&tree),
-        tree,
+        tree: TreeSlot::Resident(tree),
         variant: None,
     }
 }
@@ -496,7 +605,7 @@ pub fn finish_variant(
         is_test: base.is_test,
         accept_drift: base.accept_drift,
         fingerprint,
-        tree,
+        tree: TreeSlot::Resident(tree),
         variant: Some(VariantTag {
             base: base_idx,
             chain: Vec::new(),
@@ -553,7 +662,7 @@ mod tests {
         assert_eq!(cfg.normalize.normalizer, Normalizer::Ir);
         let units = units_from_source("fn add(a: i32) -> i32 { return a + 1; }", Lang::Rust, &cfg);
         assert_eq!(units.len(), 1);
-        assert_eq!(units[0].tree.kind.as_ref(), "Unit");
+        assert_eq!(units[0].tree.expect_resident().kind.as_ref(), "Unit");
     }
 
     #[test]
@@ -564,7 +673,7 @@ mod tests {
         cfg.normalize.normalizer = Normalizer::Historical;
         let units = units_from_source("fn add(a: i32) -> i32 { return a + 1; }", Lang::Rust, &cfg);
         assert_eq!(units.len(), 1);
-        assert_ne!(units[0].tree.kind.as_ref(), "Unit");
+        assert_ne!(units[0].tree.expect_resident().kind.as_ref(), "Unit");
     }
 
     #[test]
@@ -572,7 +681,7 @@ mod tests {
         // C is IR-frontend-only (WP-K1a): `normalizer = "ir"` (the default) works normally...
         let units = units_from_source("int add(int a) { return a + 1; }", Lang::C, &ir_cfg());
         assert_eq!(units.len(), 1);
-        assert_eq!(units[0].tree.kind.as_ref(), "Unit");
+        assert_eq!(units[0].tree.expect_resident().kind.as_ref(), "Unit");
     }
 
     #[test]
@@ -598,7 +707,7 @@ mod tests {
             &ir_cfg(),
         );
         assert_eq!(units.len(), 1);
-        assert_eq!(units[0].tree.kind.as_ref(), "Unit");
+        assert_eq!(units[0].tree.expect_resident().kind.as_ref(), "Unit");
     }
 
     #[test]
@@ -618,7 +727,10 @@ mod tests {
             &cfg,
             &label_interner,
         );
-        assert!(has_repeat(&fu.units[0].tree), "run did not fold to REPEAT");
+        assert!(
+            has_repeat(fu.units[0].tree.expect_resident()),
+            "run did not fold to REPEAT"
+        );
 
         // A run of substantial statements also clears the reporting floor → a finding.
         let big = "fn f(a: i32, xs: &[i32]) { let t = a + xs[a] * 7 + xs[a]; let t = a + xs[a] * 7 + xs[a]; let t = a + xs[a] * 7 + xs[a]; let t = a + xs[a] * 7 + xs[a]; }";

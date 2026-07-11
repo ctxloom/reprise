@@ -30,7 +30,7 @@ fn main() {
     }
     let inv = |u: &reprise::Unit| {
         fingerprint::subtree_inventory(
-            &u.tree,
+            u.tree.expect_resident(),
             cfg.thresholds.bag_min_subtree_tokens,
             HashMode::MaskedLocals,
         )
@@ -54,7 +54,12 @@ fn main() {
     );
     let ir = cfg.normalize.normalizer == Normalizer::Ir && reprise::frontend::has_ir_frontend(lang);
     let profile = (!ir).then(|| lang.profile());
-    let outcome = reprise::au::anti_unify(&ua.tree, &ub.tree, profile, ir);
+    let outcome = reprise::au::anti_unify(
+        ua.tree.expect_resident(),
+        ub.tree.expect_resident(),
+        profile,
+        ir,
+    );
     println!(
         "AU: divergence={:.3} (max {}), holes={} (max {}), factorable={}",
         outcome.divergence,

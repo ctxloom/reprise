@@ -1,0 +1,81 @@
+== groups (9) ==
+g1 tier=exact-normalized fp=0302d379acc13bf95324ae72fd9adfa0 tokens=149 value=149.0 div=0.0 note=None chain=None template_hash=None
+  member w3_ripgrep_sort/a.rs:update span=(2, 16) lang=rust degraded=false
+  member w3_ripgrep_sort/a.rs:update span=(20, 34) lang=rust degraded=false
+g2 tier=exact-normalized fp=9913a7c2997a683353d6cf7b5b3f970f tokens=110 value=92.0 div=0.0 note=None chain=None template_hash=None
+  member w1_gin_marshalxml/a.go:MarshalXML span=(7, 26) lang=go degraded=false
+  member w1_gin_marshalxml/b.go:MarshalXML span=(7, 26) lang=go degraded=false
+g3 tier=near-normalized fp=a42866c6aa92572b84aa35b1ebcdca1c tokens=73 value=73.0 div=0.0273972602739726 note=None chain=None template_hash=Some(1462007809742714808)
+  member wc2_ext4_mbbits/a.c:mb_clear_bits span=(1, 17) lang=c degraded=false
+  member wc2_ext4_mbbits/a.c:mb_set_bits span=(19, 35) lang=c degraded=false
+g4 tier=exact-normalized fp=3bc1782f71de90c0ec5c4c771407f9c4 tokens=49 value=49.0 div=0.0 note=None chain=None template_hash=None
+  member wc1_ext4_extspaceroot/a.c:ext4_ext_space_root span=(1, 13) lang=c degraded=false
+  member wc1_ext4_extspaceroot/a.c:ext4_ext_space_root_idx span=(15, 27) lang=c degraded=false
+g5 tier=exact-normalized fp=ebfb0748b4bb555117a070799d9de169 tokens=43 value=43.0 div=0.0 note=None chain=None template_hash=None
+  member w4_serde_end/a.rs:end span=(5, 17) lang=rust degraded=false
+  member w4_serde_end/a.rs:end span=(24, 36) lang=rust degraded=false
+g6 tier=exact-normalized fp=e4d909fce7f8a11c8de99e2fb0b1f3e0 tokens=39 value=39.0 div=0.0 note=None chain=None template_hash=None
+  member w2_ripgrep_bytecount/a.rs:byte_count span=(2, 7) lang=rust degraded=false
+  member w2_ripgrep_bytecount/a.rs:byte_count span=(11, 16) lang=rust degraded=false
+g7 tier=internal-repeat fp=2cd382ea97bd378e2762b950d218b5a1 tokens=18 value=36.0 div=0.0 note=None chain=None template_hash=None
+  member w9_ripgrep_cpufeatures/a.rs:runtime_cpu_features span=(6, 13) lang=rust degraded=false
+g8 tier=near-normalized fp=019a86b0ef1c62405424baa0e7b931fe tokens=34 value=34.0 div=0.058823529411764705 note=None chain=None template_hash=Some(1976688396362393903)
+  member w6_flask_maxprops/a.py:max_content_length span=(3, 29) lang=python degraded=false
+  member w6_flask_maxprops/a.py:max_form_memory_size span=(32, 52) lang=python degraded=false
+g9 tier=near-normalized fp=7b6323c1d0de1b25ff60a4deaf908419 tokens=33 value=33.0 div=0.030303030303030304 note=None chain=None template_hash=Some(12897673265312942338)
+  member w5_serde_tagorcontent/a.rs:visit_str span=(2, 13) lang=rust degraded=false
+  member w5_serde_tagorcontent/a.rs:visit_borrowed_str span=(15, 26) lang=rust degraded=false
+== test_groups (0) ==
+== api_groups (0) ==
+== weak_groups (0) ==
+== unit_index (23) ==
+w1_gin_marshalxml/a.go:MarshalXML span=(7, 26) fp=9913a7c2997a683353d6cf7b5b3f970f accept_drift=false
+w1_gin_marshalxml/b.go:MarshalXML span=(7, 26) fp=9913a7c2997a683353d6cf7b5b3f970f accept_drift=false
+w2_ripgrep_bytecount/a.rs:byte_count span=(2, 7) fp=e4d909fce7f8a11c8de99e2fb0b1f3e0 accept_drift=false
+w2_ripgrep_bytecount/a.rs:byte_count span=(11, 16) fp=e4d909fce7f8a11c8de99e2fb0b1f3e0 accept_drift=false
+w3_ripgrep_sort/a.rs:update span=(2, 16) fp=0302d379acc13bf95324ae72fd9adfa0 accept_drift=false
+w3_ripgrep_sort/a.rs:update span=(20, 34) fp=0302d379acc13bf95324ae72fd9adfa0 accept_drift=false
+w4_serde_end/a.rs:end span=(5, 17) fp=ebfb0748b4bb555117a070799d9de169 accept_drift=false
+w4_serde_end/a.rs:end span=(24, 36) fp=ebfb0748b4bb555117a070799d9de169 accept_drift=false
+w5_serde_tagorcontent/a.rs:visit_str span=(2, 13) fp=2356636751f15424019c8a3158353186 accept_drift=false
+w5_serde_tagorcontent/a.rs:visit_borrowed_str span=(15, 26) fp=d6889799123f63a1c452ce1f7b9f5f0f accept_drift=false
+w6_flask_maxprops/a.py:max_content_length span=(3, 29) fp=62a2bc4ff4e65c641d24245c660f0bfb accept_drift=false
+w6_flask_maxprops/a.py:max_form_memory_size span=(32, 52) fp=8d196836605b82642b9a48f93ff92704 accept_drift=false
+w7_click_chunkpump/a.py:cli span=(2, 25) fp=946738b5a23d448b2487fe21be75dba8 accept_drift=false
+w7_click_chunkpump/b.py:test span=(1, 9) fp=c5ebb3430948346a8f16051ce74dfe14 accept_drift=false
+w8_ripgrep_convert/a.rs:str span=(6, 11) fp=6847017b5fe0efa1a4f4380f514b2fa5 accept_drift=false
+w8_ripgrep_convert/a.rs:string span=(13, 18) fp=16f65687941a7cf85cf443f13e11178d accept_drift=false
+w8_ripgrep_convert/a.rs:usize span=(20, 22) fp=8562acbaa3f12ca44e4398128116f355 accept_drift=false
+w8_ripgrep_convert/a.rs:u64 span=(24, 26) fp=8562acbaa3f12ca44e4398128116f355 accept_drift=false
+w9_ripgrep_cpufeatures/a.rs:runtime_cpu_features span=(1, 34) fp=ef5e3088bb47a25e8a39a571f20bc98d accept_drift=false
+wc1_ext4_extspaceroot/a.c:ext4_ext_space_root span=(1, 13) fp=3bc1782f71de90c0ec5c4c771407f9c4 accept_drift=false
+wc1_ext4_extspaceroot/a.c:ext4_ext_space_root_idx span=(15, 27) fp=3bc1782f71de90c0ec5c4c771407f9c4 accept_drift=false
+wc2_ext4_mbbits/a.c:mb_clear_bits span=(1, 17) fp=45f52fc08de0ac51a7ab084ad9670f28 accept_drift=false
+wc2_ext4_mbbits/a.c:mb_set_bits span=(19, 35) fp=bb1210a061ce996ddb829572b4bcaf9f accept_drift=false
+== stats ==
+files_scanned=13
+files_skipped_generated=0
+files_unreadable=0
+units_indexed=23
+units_below_floor=4
+parse_degraded_units=0
+test_units=0
+findings_by_tier={"exact-normalized": 5, "internal-repeat": 1, "near-normalized": 3}
+sequence_regions_found=6
+sequence_regions_subsumed=6
+regions_substantial=0
+groups_subsumed_subset=0
+inline_variants=0
+ambiguity_skips=0
+calls_inlined=0
+scc_units=0
+api_signatures=8
+suppressed_units=0
+retrieval=RetrievalStats { candidates_bag: 0, candidates_landmark: 4, candidates_landmark_coverage_gated: 0, candidates_total: 4, offset_histogram_rejected: 0, htree_rejected: 0, divergence_rejected: 1, verified_pairs: 3, verified_only_landmark: 3, landmark_index_size: 836 }
+total_lines=378
+total_tokens=1266
+duplicated_lines=248
+duplicated_lines_pct=65.60846560846561
+duplicated_tokens=530
+duplicated_tokens_pct=41.864139020537124
+clones_per_kloc=23.80952380952381

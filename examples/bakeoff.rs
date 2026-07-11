@@ -30,6 +30,7 @@
 use rayon::prelude::*;
 use reprise::au;
 use reprise::config::{Config, Normalizer};
+use reprise::digest::UnitDigest;
 use reprise::lang::Lang;
 use reprise::matchtree::{self, RepData, RetrievalStats, Retriever};
 use reprise::unit::{self, Unit};
@@ -50,19 +51,37 @@ fn fold128(h: u128) -> u64 {
 /// One language partition: the REAL production reps (`matchtree::build_reps`) plus the
 /// language metadata the oracle's anti_unify needs. Every retriever and the oracle read
 /// this same substrate, so any difference is attributable to the retrieval *scheme*.
-struct LangCorpus {
+struct LangCorpus<'d> {
     lang: Lang,
     ir: bool,
-    reps: Vec<RepData>,
+    reps: Vec<RepData<'d>>,
 }
 
-fn build_lang_corpus(units: &[Unit], lang: Lang, cfg: &Config) -> Option<LangCorpus> {
-    let reps = matchtree::build_reps(units, lang, cfg);
+fn build_lang_corpus<'d>(
+    units: &[Unit],
+    digests: &'d [UnitDigest],
+    lang: Lang,
+    cfg: &Config,
+) -> Option<LangCorpus<'d>> {
+    // The bake-off races the over-gate (borrowed-substrate) shape — the
+    // under-gate path recomputes via the same `rep_substrate` either way.
+    let reps = matchtree::build_reps(units, Some(digests), lang, cfg);
     if reps.len() < 2 {
         return None;
     }
     let ir = cfg.normalize.normalizer == Normalizer::Ir && reprise::frontend::has_ir_frontend(lang);
     Some(LangCorpus { lang, ir, reps })
+}
+
+/// The fused per-unit digests (production `digest::compute`) the substrate borrows
+/// from — the bake-off feeds `build_reps` exactly what `scan()` feeds it.
+fn build_digests(units: &[Unit], cfg: &Config) -> Vec<UnitDigest> {
+    units
+        .iter()
+        .map(|u| {
+            reprise::digest::compute(u.tree.expect_resident(), u.lang, cfg, u.variant.is_none())
+        })
+        .collect()
 }
 
 // ============================ bench-side alternative retrievers ============================
@@ -404,7 +423,12 @@ fn verify(
     if !offset_histogram_passes(a, b, cfg) {
         return Verdict::HistRej;
     }
-    let outcome = au::anti_unify(&ua.tree, &ub.tree, (!ir).then_some(profile), ir);
+    let outcome = au::anti_unify(
+        ua.tree.expect_resident(),
+        ub.tree.expect_resident(),
+        (!ir).then_some(profile),
+        ir,
+    );
     if outcome.divergence > cfg.thresholds.max_divergence {
         return Verdict::DivRej;
     }
@@ -424,14 +448,14 @@ struct Cost {
     index_entries: usize,
 }
 
-struct CorpusRun {
-    langs: Vec<LangCorpus>,
+struct CorpusRun<'d> {
+    langs: Vec<LangCorpus<'d>>,
     retr_pairs: HashMap<String, PairSet>, // retriever name -> unit-pair set (union across langs)
     retr_cost: HashMap<String, Cost>,
 }
 
 /// Run one retriever over one lang's reps, returning unit-index pairs (min,max) + timing.
-fn run_retriever(r: &dyn Retriever, lc: &LangCorpus, cfg: &Config) -> (PairSet, Cost) {
+fn run_retriever(r: &dyn Retriever, lc: &LangCorpus<'_>, cfg: &Config) -> (PairSet, Cost) {
     let mut stats = RetrievalStats::default();
     let t = Instant::now();
     let raw = r.candidates(&lc.reps, cfg, &mut stats);
@@ -452,13 +476,13 @@ fn run_retriever(r: &dyn Retriever, lc: &LangCorpus, cfg: &Config) -> (PairSet, 
     )
 }
 
-fn run_corpus(units: &[Unit], cfg: &Config) -> CorpusRun {
+fn run_corpus<'d>(units: &[Unit], digests: &'d [UnitDigest], cfg: &Config) -> CorpusRun<'d> {
     let mut langs_present: Vec<Lang> = units.iter().map(|u| u.lang).collect();
     langs_present.sort();
     langs_present.dedup();
-    let langs: Vec<LangCorpus> = langs_present
+    let langs: Vec<LangCorpus<'d>> = langs_present
         .iter()
-        .filter_map(|&l| build_lang_corpus(units, l, cfg))
+        .filter_map(|&l| build_lang_corpus(units, digests, l, cfg))
         .collect();
 
     let mut retr_pairs: HashMap<String, PairSet> = HashMap::new();
@@ -484,7 +508,7 @@ fn run_corpus(units: &[Unit], cfg: &Config) -> CorpusRun {
 
 /// Verify the union of candidate pairs (verify-on-union oracle A). Returns the ACCEPT and
 /// WEAK positive sets as unit-pair sets.
-fn verify_union(units: &[Unit], run: &CorpusRun, cfg: &Config) -> (PairSet, PairSet) {
+fn verify_union(units: &[Unit], run: &CorpusRun<'_>, cfg: &Config) -> (PairSet, PairSet) {
     let mut rep_of_unit: HashMap<usize, (usize, usize)> = HashMap::new();
     for (li, lc) in run.langs.iter().enumerate() {
         for (ri, rep) in lc.reps.iter().enumerate() {
@@ -778,7 +802,8 @@ fn main() {
         }
     }
     let n_units = units.len();
-    let run = run_corpus(&units, &cfg);
+    let digests = build_digests(&units, &cfg);
+    let run = run_corpus(&units, &digests, &cfg);
     let (accept, weak) = verify_union(&units, &run, &cfg);
     let names: Vec<String> = retrievers().iter().map(|(n, _)| n.to_string()).collect();
 
@@ -868,7 +893,8 @@ fn main() {
 
     // ---- oracle B ----
     let (syn_units, syn_pairs) = build_synthetic(&cfg);
-    let syn_run = run_corpus(&syn_units, &cfg);
+    let syn_digests = build_digests(&syn_units, &cfg);
+    let syn_run = run_corpus(&syn_units, &syn_digests, &cfg);
     #[derive(Default)]
     struct BClass {
         near: Vec<(usize, usize)>,

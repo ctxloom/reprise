@@ -53,7 +53,7 @@ fn main() {
                     v.token_count, v.fingerprint
                 );
                 let mut s = String::new();
-                render(&v.tree, 2, &mut s);
+                render(v.tree.expect_resident(), 2, &mut s);
                 println!("{s}");
             } else {
                 println!("  variant == base (dropped)");
@@ -62,7 +62,7 @@ fn main() {
     }
     for (i, u) in units.iter().enumerate() {
         let mut s = String::new();
-        render(&u.tree, 1, &mut s);
+        render(u.tree.expect_resident(), 1, &mut s);
         println!("== plain unit {i} {} ==\n{s}", u.name);
     }
 }

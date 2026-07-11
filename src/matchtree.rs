@@ -59,19 +59,25 @@ pub struct RetrievalStats {
 /// generation) and the verify chain. Retriever-specific indexes (e.g. the
 /// landmark constellation hashes) are built inside the retriever from this
 /// substrate, not stored here — the substrate stays neutral.
-pub struct RepData {
+///
+/// Since the fused digest pass (`crate::digest`), the substrate itself lives in
+/// each unit's [`crate::digest::UnitDigest`] (computed once, at unit creation);
+/// a `RepData` BORROWS it rather than recomputing from the tree — near tier no
+/// longer reads `Unit::tree` outside `anti_unify`, and building reps costs a
+/// pointer copy, not a walk.
+pub struct RepData<'d> {
     unit_idx: usize,
-    bag_set: Vec<u128>,
+    bag_set: std::borrow::Cow<'d, [u128]>,
     /// Subtree hash → (pre-order offsets, tree depths), the two parallel per
     /// hash and in ascending-offset order, sorted by hash: the verify cascade
     /// intersects two of these by a single linear merge, no hashing (M3b/D22 —
     /// the per-candidate HashMap probes dominated 500k-LOC scans). Offsets feed
     /// the Shazam offset-delta diagonal; depths feed the H-tree-verify depth-delta
     /// criterion (§0.5) — both derived from the one shared-subtree evidence pass.
-    offsets: Vec<(u128, Vec<u32>, Vec<u16>)>,
+    offsets: std::borrow::Cow<'d, [SubtreeOffsetsEntry]>,
 }
 
-impl RepData {
+impl<'d> RepData<'d> {
     /// Index into the `units` slice this rep was built from.
     pub fn unit_idx(&self) -> usize {
         self.unit_idx
@@ -99,16 +105,26 @@ struct VerifiedPair {
 
 pub fn find_near_groups(
     units: &[Unit],
+    digests: Option<&[crate::digest::UnitDigest]>,
     cfg: &Config,
     stats: &mut RetrievalStats,
     exact_pairs: &HashSet<(usize, usize)>,
+    tree_pack: Option<&crate::pack::Pack<crate::tree::NormNode>>,
 ) -> Vec<NearGroup> {
     let mut groups = Vec::new();
     let langs: HashSet<Lang> = units.iter().map(|u| u.lang).collect();
     let mut langs: Vec<Lang> = langs.into_iter().collect();
     langs.sort();
     for lang in langs {
-        groups.extend(near_groups_for_lang(units, lang, cfg, stats, exact_pairs));
+        groups.extend(near_groups_for_lang(
+            units,
+            digests,
+            lang,
+            cfg,
+            stats,
+            exact_pairs,
+            tree_pack,
+        ));
     }
     groups
 }
@@ -118,7 +134,17 @@ pub fn find_near_groups(
 /// This is the neutral input every [`Retriever`] and the verify chain read; it is
 /// public so the retrieval bake-off races the REAL substrate + real retrievers,
 /// not a reconstruction. Returns fewer than 2 reps when there is nothing to pair.
-pub fn build_reps(units: &[Unit], lang: Lang, cfg: &Config) -> Vec<RepData> {
+/// Over the memory gate the substrate is BORROWED from the units' fused digests
+/// (index-aligned with `units`, carrying [`rep_substrate`] computed at digest
+/// time — trees may already be spilled); under the gate there are no digests and
+/// the substrate is computed here from the resident trees, exactly as before the
+/// memory work (same [`rep_substrate`], zero new work for the common case — P2).
+pub fn build_reps<'d>(
+    units: &[Unit],
+    digests: Option<&'d [crate::digest::UnitDigest]>,
+    lang: Lang,
+    cfg: &Config,
+) -> Vec<RepData<'d>> {
     let floor = cfg.min_unit_floor();
     // One representative per exact fingerprint (exact tiers own equal units;
     // plain units precede variants in `units`, so a variant that exactly
@@ -131,56 +157,84 @@ pub fn build_reps(units: &[Unit], lang: Lang, cfg: &Config) -> Vec<RepData> {
         .filter(|(_, u)| seen_fp.insert(u.fingerprint))
         .map(|(idx, _)| idx)
         .collect();
-    eligible
-        .par_iter()
-        .map(|&idx| {
-            // Histogram offsets use a finer inventory (floor 3) than the bag
-            // (small units would otherwise starve the vote count); the bag
-            // itself keeps the §9 floor.
-            let inv: Vec<Subtree> =
-                fingerprint::subtree_inventory(&units[idx].tree, 3, HashMode::MaskedLocals);
-            // Pre-order depth per node offset (same numbering as `walk_inventory`:
-            // node before children), so each subtree's root depth is `depths[offset]`.
-            let depth_by_offset = preorder_depths(&units[idx].tree);
-            // (hash, offset, depth) sorted by hash then offset — depth rides the
-            // offset it belongs to so the two stay paired through the grouping.
-            let mut flat: Vec<(u128, u32, u16)> = inv
-                .iter()
-                .map(|s| (s.hash, s.offset, depth_by_offset[s.offset as usize]))
-                .collect();
-            flat.sort_unstable();
-            let mut offsets: Vec<(u128, Vec<u32>, Vec<u16>)> = Vec::new();
-            for (h, o, d) in flat {
-                match offsets.last_mut() {
-                    Some((last, offs, deps)) if *last == h => {
-                        offs.push(o);
-                        deps.push(d);
-                    }
-                    _ => offsets.push((h, vec![o], vec![d])),
-                }
-            }
-            let mut bag_set: Vec<u128> = inv
-                .iter()
-                .filter(|s| s.tokens >= cfg.thresholds.bag_min_subtree_tokens)
-                .map(|s| s.hash)
-                .collect();
-            bag_set.sort_unstable();
-            bag_set.dedup();
-            RepData {
+    match digests {
+        Some(digests) => eligible
+            .into_iter()
+            .map(|idx| RepData {
                 unit_idx: idx,
-                bag_set,
-                offsets,
-            }
-        })
-        .collect()
+                bag_set: std::borrow::Cow::Borrowed(&digests[idx].bag_set),
+                offsets: std::borrow::Cow::Borrowed(&digests[idx].offsets),
+            })
+            .collect(),
+        None => eligible
+            .par_iter()
+            .map(|&idx| {
+                let (bag_set, offsets) = rep_substrate(units[idx].tree.expect_resident(), cfg);
+                RepData {
+                    unit_idx: idx,
+                    bag_set: std::borrow::Cow::Owned(bag_set),
+                    offsets: std::borrow::Cow::Owned(offsets),
+                }
+            })
+            .collect(),
+    }
 }
 
+/// One shared-subtree entry: (hash, pre-order offsets, tree depths).
+pub type SubtreeOffsetsEntry = (u128, Vec<u32>, Vec<u16>);
+
+/// Subtree hash → (pre-order offsets, tree depths) inventory, sorted by hash —
+/// the verify-substrate half of a rep (see [`RepData::offsets`]).
+pub type SubtreeOffsets = Vec<SubtreeOffsetsEntry>;
+
+/// One unit's retrieval substrate — the (bag_set, offsets) pair [`RepData`] carries —
+/// from its canonical tree. Lifted verbatim out of [`build_reps`] so the fused digest
+/// pass ([`crate::digest`]) and `build_reps` share the ONE implementation (the digest
+/// invariant: existing functions, never a reimplementation).
+pub fn rep_substrate(tree: &crate::tree::NormNode, cfg: &Config) -> (Vec<u128>, SubtreeOffsets) {
+    // Histogram offsets use a finer inventory (floor 3) than the bag
+    // (small units would otherwise starve the vote count); the bag
+    // itself keeps the §9 floor.
+    let inv: Vec<Subtree> = fingerprint::subtree_inventory(tree, 3, HashMode::MaskedLocals);
+    // Pre-order depth per node offset (same numbering as `walk_inventory`:
+    // node before children), so each subtree's root depth is `depths[offset]`.
+    let depth_by_offset = preorder_depths(tree);
+    // (hash, offset, depth) sorted by hash then offset — depth rides the
+    // offset it belongs to so the two stay paired through the grouping.
+    let mut flat: Vec<(u128, u32, u16)> = inv
+        .iter()
+        .map(|s| (s.hash, s.offset, depth_by_offset[s.offset as usize]))
+        .collect();
+    flat.sort_unstable();
+    let mut offsets: Vec<(u128, Vec<u32>, Vec<u16>)> = Vec::new();
+    for (h, o, d) in flat {
+        match offsets.last_mut() {
+            Some((last, offs, deps)) if *last == h => {
+                offs.push(o);
+                deps.push(d);
+            }
+            _ => offsets.push((h, vec![o], vec![d])),
+        }
+    }
+    let mut bag_set: Vec<u128> = inv
+        .iter()
+        .filter(|s| s.tokens >= cfg.thresholds.bag_min_subtree_tokens)
+        .map(|s| s.hash)
+        .collect();
+    bag_set.sort_unstable();
+    bag_set.dedup();
+    (bag_set, offsets)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn near_groups_for_lang(
     units: &[Unit],
+    digests: Option<&[crate::digest::UnitDigest]>,
     lang: Lang,
     cfg: &Config,
     stats: &mut RetrievalStats,
     exact_pairs: &HashSet<(usize, usize)>,
+    tree_pack: Option<&crate::pack::Pack<crate::tree::NormNode>>,
 ) -> Vec<NearGroup> {
     let ir = crate::unit::is_ir(lang, cfg);
     // The historical `LanguageProfile` is anti_unify's structural oracle ONLY on the historical
@@ -196,7 +250,7 @@ fn near_groups_for_lang(
         t = std::time::Instant::now();
     };
 
-    let reps = build_reps(units, lang, cfg);
+    let reps = build_reps(units, digests, lang, cfg);
     if reps.len() < 2 {
         return Vec::new();
     }
@@ -208,7 +262,7 @@ fn near_groups_for_lang(
     // the verify chain below is identical for whichever retriever proposes the pairs.
     let df_cap = 50usize;
     let window = cfg.retrieval.owner_pair_window;
-    let bag_pairs = shared_count_pairs(reps.len(), |i| reps[i].bag_set.as_slice(), df_cap, window);
+    let bag_pairs = shared_count_pairs(reps.len(), |i| &reps[i].bag_set, df_cap, window);
     let mut candidates: BTreeMap<(usize, usize), (bool, bool)> = BTreeMap::new();
     for ((i, j), shared) in bag_pairs {
         let union = reps[i].bag_set.len() + reps[j].bag_set.len() - shared;
@@ -268,7 +322,13 @@ fn near_groups_for_lang(
         //      pruning ~8k raw candidates to the few AU actually verifies. So it runs
         //      ONCE, last, only on filter-survivors.
         let (ua, ub) = (reps[i].unit_idx, reps[j].unit_idx);
-        let outcome = au::anti_unify(&units[ua].tree, &units[ub].tree, profile, ir);
+        // Materialize the PAIR (the one true pair-of-trees consumer): a plain
+        // borrow under the gate, an `Arc` handle out of the pack LRU over it.
+        // The handles live for exactly this call — eviction can't invalidate
+        // them, and dropping them returns the memory bound to the LRU.
+        let ta = units[ua].tree.materialize(tree_pack);
+        let tb = units[ub].tree.materialize(tree_pack);
+        let outcome = au::anti_unify(&ta, &tb, profile, ir);
         if outcome.divergence > cfg.thresholds.max_divergence {
             return Verify::DivergenceRejected;
         }
@@ -460,7 +520,7 @@ impl Retriever for Landmark {
         // shared substrate and owned by the retriever (not stored on RepData).
         let mut df: HashMap<u128, u32> = HashMap::new();
         for rep in reps {
-            for h in &rep.bag_set {
+            for h in rep.bag_set.iter() {
                 *df.entry(*h).or_insert(0) += 1;
             }
         }
@@ -793,15 +853,15 @@ fn depth_consistency(ev: &[SharedSubtree], needed: u32) -> bool {
 /// one merge-join, not one walk per filter. Filters are PURE predicates over this —
 /// interior mutability (`OnceCell`) keeps memoization behind a shared `&Ctx`.
 struct Ctx<'a> {
-    a: &'a RepData,
-    b: &'a RepData,
+    a: &'a RepData<'a>,
+    b: &'a RepData<'a>,
     cfg: &'a Config,
     evidence: std::cell::OnceCell<Vec<SharedSubtree<'a>>>,
     needed: std::cell::OnceCell<u32>,
 }
 
 impl<'a> Ctx<'a> {
-    fn new(a: &'a RepData, b: &'a RepData, cfg: &'a Config) -> Self {
+    fn new(a: &'a RepData<'a>, b: &'a RepData<'a>, cfg: &'a Config) -> Self {
         Ctx {
             a,
             b,

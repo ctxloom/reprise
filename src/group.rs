@@ -12,8 +12,14 @@ use std::path::Path;
 
 /// Exact tier (plain units only): returns groups plus their member unit
 /// indices (the indices feed sequence-tier subsumption) and the below-floor
-/// count. Variants are handled by `build_inline_exact_groups`.
-pub fn build_exact_groups(units: &[Unit], cfg: &Config) -> (Vec<(Group, Vec<usize>)>, u32) {
+/// count. Variants are handled by `build_inline_exact_groups`. `digests` is
+/// index-aligned with `units` (the fused digest pass carries the ranking's
+/// boilerplate mass, so this tier reads no trees).
+pub fn build_exact_groups(
+    units: &[Unit],
+    digests: Option<&[crate::digest::UnitDigest]>,
+    cfg: &Config,
+) -> (Vec<(Group, Vec<usize>)>, u32) {
     let mut below_floor = 0u32;
     let mut buckets: BTreeMap<(Lang, u128), Vec<usize>> = BTreeMap::new();
     for (idx, unit) in units.iter().enumerate() {
@@ -57,9 +63,13 @@ pub fn build_exact_groups(units: &[Unit], cfg: &Config) -> (Vec<(Group, Vec<usiz
                     token_count,
                     value: consolidation_value(
                         &members,
+                        // Over the gate the fused digest carries the ranking's
+                        // boilerplate mass (== `boilerplate_mass(tree)`, pinned by
+                        // tests/digest_oracle.rs); under it the tree is resident
+                        // and walked directly, exactly as before the memory work.
                         substantive_tokens(
                             token_count,
-                            crate::ir::substance::boilerplate_mass(&members[0].tree),
+                            unit_boilerplate(digests, indices[0], &units[indices[0]]),
                         ),
                     ),
                     note: None,
@@ -80,7 +90,11 @@ pub fn build_exact_groups(units: &[Unit], cfg: &Config) -> (Vec<(Group, Vec<usiz
 /// variants' BASE units; the inline chain is the evidence. The D3
 /// pure-wrapper tautology cannot reach here — a variant exact-equal to a
 /// callee it inlined is dropped at creation (see lib.rs).
-pub fn build_inline_exact_groups(units: &[Unit], cfg: &Config) -> Vec<(Group, Vec<usize>)> {
+pub fn build_inline_exact_groups(
+    units: &[Unit],
+    digests: Option<&[crate::digest::UnitDigest]>,
+    cfg: &Config,
+) -> Vec<(Group, Vec<usize>)> {
     let mut buckets: BTreeMap<(Lang, u128), Vec<usize>> = BTreeMap::new();
     for (idx, unit) in units.iter().enumerate() {
         if unit.token_count < cfg.min_unit_floor() {
@@ -129,9 +143,11 @@ pub fn build_inline_exact_groups(units: &[Unit], cfg: &Config) -> Vec<(Group, Ve
                 token_count,
                 value: consolidation_value(
                     &member_refs,
+                    // Same dual-source rule; a variant can be the bucket
+                    // representative, which is why variants carry this field too.
                     substantive_tokens(
                         token_count,
-                        crate::ir::substance::boilerplate_mass(&units[members[0]].tree),
+                        unit_boilerplate(digests, members[0], &units[members[0]]),
                     ),
                 ),
                 note: None,
@@ -144,6 +160,17 @@ pub fn build_inline_exact_groups(units: &[Unit], cfg: &Config) -> Vec<(Group, Ve
         ));
     }
     out
+}
+
+/// The exact/inline-exact ranking's boilerplate mass for one unit: read off the
+/// fused digest over the memory gate, or computed from the resident tree under it
+/// (the SAME `ir::substance::boilerplate_mass` either way — the digest is pinned
+/// to it by tests/digest_oracle.rs).
+fn unit_boilerplate(digests: Option<&[crate::digest::UnitDigest]>, idx: usize, unit: &Unit) -> u32 {
+    match digests {
+        Some(d) => d[idx].boilerplate_mass,
+        None => crate::ir::substance::boilerplate_mass(unit.tree.expect_resident()),
+    }
 }
 
 pub fn member_of(unit: &Unit) -> Member {
@@ -463,7 +490,12 @@ mod tests {
             is_test: false,
             accept_drift: false,
             fingerprint: 0,
-            tree: crate::tree::NormNode::new("Unit", None, span, Vec::new()),
+            tree: crate::unit::TreeSlot::Resident(crate::tree::NormNode::new(
+                "Unit",
+                None,
+                span,
+                Vec::new(),
+            )),
             variant: None,
         }
     }

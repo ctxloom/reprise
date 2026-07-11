@@ -163,7 +163,12 @@ fn compare(
         return None;
     }
 
-    let outcome = reprise::au::anti_unify(&cand.tree, &u.tree, profile, ir);
+    let outcome = reprise::au::anti_unify(
+        cand.tree.expect_resident(),
+        u.tree.expect_resident(),
+        profile,
+        ir,
+    );
     if outcome.divergence <= cfg.thresholds.max_divergence
         && outcome.holes.len() as u32 <= cfg.thresholds.max_holes
     {

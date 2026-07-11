@@ -8,7 +8,6 @@
 //! no shared interner).
 
 use crate::tree::{Label, NormNode};
-use crate::unit::Unit;
 use rayon::prelude::*;
 
 pub struct Corpus {
@@ -25,17 +24,21 @@ pub struct Corpus {
 
 const SEP_BASE: u32 = u32::MAX / 2;
 
-pub fn build_corpus(units: &[&Unit]) -> Corpus {
-    let streams: Vec<Vec<(u64, (u32, u32))>> = units
-        .par_iter()
-        .map(|unit| {
-            let mut out = Vec::with_capacity(unit.token_count as usize);
-            let mut buf = String::with_capacity(64);
-            serialize(&unit.tree, &mut buf, &mut out);
-            out
-        })
-        .collect();
+/// One unit's sequence stream: (content hash, byte span) per node, pre-order — the
+/// exact per-unit slice [`build_corpus`] assembles. Public so the fused digest pass
+/// ([`crate::digest`]) computes it with the SAME serializer at unit-creation time.
+pub fn unit_stream(tree: &NormNode) -> Vec<(u64, (u32, u32))> {
+    let mut out = Vec::new();
+    let mut buf = String::with_capacity(64);
+    serialize(tree, &mut buf, &mut out);
+    out
+}
 
+/// Assemble one language partition's corpus from the units' per-unit streams
+/// (`unit_stream`, carried by the fused digests since the drop-trees work —
+/// this function no longer walks trees). `streams[i]`'s tokens are attributed
+/// to unit index `i` within the partition, mirroring the old `&[&Unit]` order.
+pub fn build_corpus(streams: &[&[(u64, (u32, u32))]]) -> Corpus {
     // Dense ids by rank in the sorted unique-hash list.
     let mut uniq: Vec<u64> = streams
         .par_iter()
@@ -53,7 +56,7 @@ pub fn build_corpus(units: &[&Unit]) -> Corpus {
         key_hash: Vec::with_capacity(total),
     };
     for (idx, stream) in streams.iter().enumerate() {
-        for &(h, span) in stream {
+        for &(h, span) in *stream {
             let id = uniq.binary_search(&h).expect("hash present") as u32;
             corpus.tokens.push(id);
             corpus.spans.push(span);

@@ -38,7 +38,12 @@ fn two_commutative_chains_anti_unify_is_sound_and_stable() {
     // The stale-memo corruption is nondeterministic in the allocator; loop so a
     // corrupting layout is hit with overwhelming probability on the old code.
     for iter in 0..500 {
-        let o = reprise::au::anti_unify(&ua.tree, &ub.tree, profile, ir);
+        let o = reprise::au::anti_unify(
+            ua.tree.expect_resident(),
+            ub.tree.expect_resident(),
+            profile,
+            ir,
+        );
 
         let mut holes: Vec<(u32, u32)> = o.holes.iter().map(|h| (h.tokens_a, h.tokens_b)).collect();
         holes.sort_unstable();
