@@ -193,12 +193,17 @@ impl Default for TestsCfg {
 pub struct RetrievalCfg {
     /// Which candidate-generation retriever runs. It is the SOLE source of near-tier
     /// candidates — retrieval is one candidate set, never a union of layers.
-    /// A **string-keyed, plugin-extensible** selector (mirrors `normalize.normalizer`),
-    /// NOT a two-way flag: further retrievers may register later. The default `"landmark"`
-    /// is the §5.5.4 rare-peak constellation retriever (the §7.4b rivalry winner). The
-    /// bake-off alternatives (minhash-lsh, winnowing, sourcerer-rare) implement the same
-    /// `matchtree::Retriever` trait bench-side. Matching-time only — retrieval is
-    /// post-fingerprint, so this NEVER enters the extraction cache key (hash-neutral).
+    /// **Validated at load** against the set the shipping binary actually honors
+    /// (`matchtree::KNOWN_RETRIEVERS`, currently just `"landmark"`): an unknown value
+    /// is an error, never a silent fallback to the default. The bake-off's entrants
+    /// (minhash-lsh, winnowing, sourcerer-rare) implement the same
+    /// `matchtree::Retriever` trait BENCH-SIDE (`examples/bakeoff.rs`) and are not
+    /// selectable here — if it does not run in the shipped binary, it is not valid
+    /// config. String-keyed so further retrievers can register later without a schema
+    /// break; widening the set is a one-line change to `KNOWN_RETRIEVERS`.
+    /// `"landmark"` is the §5.5.4 rare-peak constellation retriever (the §7.4b rivalry
+    /// winner). Matching-time only — retrieval is post-fingerprint, so this NEVER
+    /// enters the extraction cache key (hash-neutral).
     pub retriever: String,
     /// §5.5.4 landmark pairs — rivalry winner (§7.4b, see CALIBRATION.md;
     /// hole-context hashes were dropped per the §5.5 rivalry clause).
@@ -538,6 +543,13 @@ impl Config {
             .map_err(|e| anyhow::anyhow!("reprise.toml [report] fail_on: {e}"))?;
         crate::matchtree::validate_filters(&self.retrieval.filters)
             .map_err(|e| anyhow::anyhow!("reprise.toml [retrieval] filters: {e}"))?;
+        // The retriever must be one the SHIPPING binary actually runs. The bake-off's
+        // alternatives (minhash-lsh, winnowing, sourcerer-rare) exist bench-side only,
+        // so naming one here selected the landmark retriever anyway — silently ignoring
+        // the request. A config key that accepts a value it does not honor is worse than
+        // one that errors, so the accepted set is exactly `matchtree::KNOWN_RETRIEVERS`.
+        crate::matchtree::validate_retriever(&self.retrieval.retriever)
+            .map_err(|e| anyhow::anyhow!("reprise.toml [retrieval] retriever: {e}"))?;
         // Enumerated string keys whose consumer silently treats an unknown value
         // as a fallthrough default. `tests.mode` is the load-bearing one: an
         // unknown value falls through lib.rs's partition catch-all and routes
@@ -546,10 +558,6 @@ impl Config {
         // switch understands: `separate` / `exclude`, plus `normal` (the
         // catch-all's intent). `sarif_fingerprint`'s consumer is `!= "line"`, so
         // a typo silently reads as `structural`; its set is the documented pair.
-        //
-        // NOT validated here: `retrieval.retriever` is a deliberately string-keyed,
-        // plugin-extensible selector ("any value resolves to Landmark for now") — no
-        // bounded valid set to check against, so validating it would be a guess.
         // (`normalize.normalizer` IS bounded — the `Normalizer` enum — so serde
         // rejects an unknown value at deserialize time, before `validate` runs.)
         validate_enum(
@@ -657,6 +665,29 @@ mod tests {
                 "h-tree".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn validate_rejects_a_retriever_the_binary_does_not_honor() {
+        // `winnowing` is a BENCH-SIDE entrant (examples/bakeoff.rs), not something
+        // the shipping binary can select. Accepting it silently ran the landmark
+        // retriever anyway — a config that lies. It must fail at LOAD, naming the
+        // bad value and the set that actually works.
+        let toml = "[retrieval]\nretriever = \"winnowing\"\n";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("winnowing"), "error names the bad value: {err}");
+        assert!(err.contains("landmark"), "error lists the known set: {err}");
+        assert!(err.contains("retriever"), "error names the key: {err}");
+    }
+
+    #[test]
+    fn validate_accepts_the_shipping_retriever() {
+        let toml = "[retrieval]\nretriever = \"landmark\"\n";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(cfg.validate().is_ok());
+        // And it is the default.
+        assert_eq!(Config::default().retrieval.retriever, "landmark");
     }
 
     #[test]

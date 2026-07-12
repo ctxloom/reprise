@@ -256,13 +256,23 @@ and `weak-similarity` **never** fail CI regardless of `fail_on`.
 
 ## Supported languages
 
-Rust, Python, TypeScript (including TSX), Go, and Kotlin. Matching is
+Rust, Python, TypeScript (including TSX), Go, Kotlin, and C. Matching is
 **same-language only** — a Python unit is never compared against a Rust one — so
 multi-language repos scan cleanly with each language partitioned independently.
 
-**Planned:** Java, C#, C++, and C. A language is one `LanguageProfile` trait
-implementation plus a set of probed grammar rules, so additions are incremental
-— the five existing profiles are the templates.
+**C is IR-frontend-only.** It works on the `ir` normalizer, which is the default,
+so `reprise scan` and `reprise check` handle C out of the box with no
+configuration. It has no historical `LanguageProfile` and will not get one. If
+you set `[normalize] normalizer = "historical"` and the scan contains `.c`/`.h`
+files, reprise refuses the scan with an error naming the first such file, rather
+than skipping the files or degrading quietly. Either keep the default normalizer
+or exclude those files from the scan. `.h` parses as C until there is C++
+support.
+
+**Planned:** Java, C#, and C++. A new language is one IR frontend (`src/frontend`),
+which is where C came from; the older per-language `LanguageProfile` layer under
+`src/lang` still backs the five original languages on the `historical` path but is
+retired for new ones.
 
 ## Output formats
 

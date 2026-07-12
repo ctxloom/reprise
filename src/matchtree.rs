@@ -509,9 +509,31 @@ pub trait Retriever: Sync {
     ) -> Vec<(usize, usize)>;
 }
 
-/// Resolve the `retrieval.retriever` selector to a retriever. String-keyed and
-/// plugin-extensible (mirrors `normalize.normalizer`); production ships only the
-/// landmark retriever, so any value resolves to [`Landmark`] for now.
+/// The full set of `retrieval.retriever` values the SHIPPING binary honors (for
+/// load-time validation). The bake-off's entrants (minhash-lsh, winnowing,
+/// sourcerer-rare) implement [`Retriever`] bench-side only — they are registered in
+/// `examples/bakeoff.rs` and invoked directly there, never reachable through config —
+/// so they are NOT valid config values. A key that accepts a name it then ignores is
+/// a config that lies; the accepted set is exactly what [`select_retriever`] resolves.
+const KNOWN_RETRIEVERS: &[&str] = &["landmark"];
+
+/// Config load-time validation of the `retrieval.retriever` selector: the value must
+/// be one the binary actually runs. Keeps [`select_retriever`] total — by the time it
+/// is reached, the name is known.
+pub fn validate_retriever(name: &str) -> Result<(), String> {
+    if KNOWN_RETRIEVERS.contains(&name) {
+        Ok(())
+    } else {
+        Err(format!(
+            "unknown retriever `{name}` (known: {})",
+            KNOWN_RETRIEVERS.join(", ")
+        ))
+    }
+}
+
+/// Resolve the `retrieval.retriever` selector to a retriever. Unknown values are
+/// rejected at config load ([`validate_retriever`]), so the fallback is unreachable
+/// in practice and exists only to keep the match total.
 fn select_retriever(name: &str) -> Box<dyn Retriever> {
     match name {
         "landmark" => Box::new(Landmark),
