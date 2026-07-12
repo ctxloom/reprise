@@ -76,6 +76,10 @@ local-maxima) and measured three landmark invariants on a labeled set (27 genuin
   **181 / 192 verified pairs (94%)** on self/IR (212/221 historical) — the bag layer (Jaccard ≥ 0.70) alone
   recovers ~11; landmarks supply 16× more. Weakness: it *floods* — 30.5k candidates → 192 verified (~0.6%
   raw precision); **all** precision is downstream in histogram + AU, none in the peaks.
+  *(Read this measurement as the bag layer's death warrant, not just landmark's vindication: the 11 pairs
+  the bag "recovered" were pairs landmark ALSO proposed — its unique yield was 0. The bag layer has since
+  been deleted (D48), and with a single retriever `verified_only_landmark == verified_pairs` by
+  construction, so that stat no longer exists.)*
 - **Substantiality via better peaks — second, conclusive NO-GO.** Sweeping rareness (1/2/5/10%, abs df≤2/3/5),
   min-subtree (4/6/8/12), and a sparse **top-K-IDF salience** selection: the salience variant *did* break the
   size correlation (r: 0.995 → **−0.018** — the hypothesis's mechanism confirmed), but per-unit landmark count
@@ -213,7 +217,7 @@ reconstruction, and the trusted `size_gate → offset_histogram → anti_unify` 
 subtree bag** (slices documented in-file so a difference reflects the *scheme*, not the features):
 
 1. **reprise-landmark** — incumbent: rare-peak constellation triples (matchtree.rs verbatim).
-2. **minhash-lsh** — bag-Jaccard over the floor-6 `bag_set` (the D16 bag layer's features), MinHash + LSH banding.
+2. **minhash-lsh** — bag-Jaccard over the floor-6 `bag_set` (the features of the then-shipping bag layer, since deleted — D48), MinHash + LSH banding.
 3. **winnowing** — MOSS-style k-gram winnowing over the floor-3 ordered subtree stream.
 4. **sourcerer-rare** — inverted rare-feature overlap = **landmark's exact rare peaks WITHOUT the triples**: the ablation isolating whether the constellation earns its keep.
 
@@ -304,10 +308,16 @@ canonical-tree / cache-key move) and neither regresses recall. Branch:
 `src/matchtree.rs`: a landmark candidate is retained only when its shared constellation is at
 least `retrieval.landmark_coverage_min` (default **0.05**) of the smaller unit's landmark set —
 coverage = **full (df-uncapped) landmark intersection / min(|A|,|B|)**, the exact §0.3 definition.
-Pre-anti-unify, so it also saves the O(n·m) AU on the coincidences it drops. A pair also proposed
-by the bag layer keeps its bag flag and is still verified (the gate can only remove *landmark*
-candidacy) — the source of its recall-safety. New stat `candidates_landmark_coverage_gated` makes
-the cut a live number.
+Pre-anti-unify, so it also saves the O(n·m) AU on the coincidences it drops. New stat
+`candidates_landmark_coverage_gated` makes the cut a live number.
+
+> **Superseded detail.** As shipped at the time, the gate could only remove *landmark* candidacy: a
+> pair the bag-Jaccard layer also proposed entered the candidate union independently and survived a
+> coverage drop, and that exemption was cited as the source of the gate's recall-safety. **The bag
+> layer is gone** (D48), so there is no exemption and no union: the gate now applies
+> **unconditionally** to every candidate. This was measured, not assumed — with every pair
+> coverage-exposed the group set is byte-identical on self/fs/net, so the gate's recall-safety never
+> depended on the exemption.
 
 **Recall proof — direct, on the shipping pipeline.** `verified_pairs` (near-tier accept+weak) is
 **byte-identical with the gate off vs on, same corpus** — so no verified pair (hence no verify-union
@@ -455,6 +465,18 @@ ACCEPT, recall-B = synthetic near. Incumbent = `fan=3, ms=2`, flood **8 013**, r
    reaching `anti_unify` (the near tier's dominant cost) at zero recall loss. **Re-validate on
    whole-repo + inline-on before shipping** — the ACCEPT oracle is small (45/48), and the filter is a
    distinct structural axis.
+
+   > **SHIPPED OUTCOME — the −48% did NOT transfer, and the re-validation is why we know.** The
+   > −48% above is h-tree measured **standalone**, as the pre-filter on the *raw landmark stream*.
+   > It does not ship that way: it ships **stacked behind the offset-histogram**, which has already
+   > rejected most of what h-tree would reject. Its **marginal** cut in the shipped cascade is
+   > **≈2%** (measured on self: 8 224 → 8 088 pairs reaching `anti_unify`, −1.65%, `verified_pairs`
+   > identical at 453 — recall-neutral, as predicted). Do **not** quote −48% as h-tree's value in
+   > the product; that figure describes a configuration reprise does not run. h-tree is still
+   > **kept**: the residue it removes is genuinely orthogonal (Δdepth, not Δoffset) and it is
+   > near-free in the existing merge-join. It just is not a major cut. The general lesson is the
+   > project's first rule in miniature: **a filter's standalone power is not its marginal power
+   > behind another filter that is correlated with it.**
 3. **H-tree-constellation is NOT worth a production change** — a wash on flood, added tuple complexity
    for no gain. The structural signal pays off in *verify*, not in the constellation.
 4. **Do NOT touch peak selection.** Cap, floor-align, and salience each lose recall on both corpora.
@@ -553,7 +575,9 @@ replacing the `min_unit_tokens` / `min_seq_tokens` / `histogram_min_votes` size 
 
 A precision knob must not be taken on faith. Instrument the substantiality gate so its marginal value is
 a **reported number every scan**, modeled on the §7.4b retrieval rivalry (which already measures
-`candidates_landmark` / `verified_only_landmark` / `landmark_index_size` in `matchtree.rs::Stats` and
+`candidates_landmark` / `landmark_index_size` in `matchtree.rs::Stats`, and once measured
+`verified_only_landmark` — retired once the layer it arbitrated against was deleted (D48), since with a
+single retriever it equals `verified_pairs` by construction — and
 mandates dropping the loser). Emit, per scan:
 
 - **Marginal gate decisions vs the token floor.** Count units the substantiality gate decides

@@ -24,11 +24,20 @@ each discovered only by measuring, and every one load-bearing at the time:
   nobody's model.
 - *"Extraction is a 22.5 GB hump, near-tier is another."* They were the same bytes, counted twice
   in two different sessions. Extraction's own peak is 12.54 GB; the peak is set in the near phase.
-- *"The peak is 22.6 GB."* That is a **glibc dev-build artifact**. The shipped binary is
-  musl + mimalloc and peaks at 15.8 GB. A whole optimization campaign was aimed at a build no user
-  runs.
-- *"The bag layer catches clone families landmark misses."* It has never proposed a single pair
-  landmark did not. Zero yield, on every corpus, always on.
+- *"The peak is 22.6 GB."* That was a **glibc dev-build artifact**: the allocator was gated to musl,
+  so dev/CI/release-on-glibc ran plain glibc malloc (22.7 GB) while only the shipped musl binary got a
+  fast allocator (15.8 GB) — a **6.8 GB dev/prod skew**, and a whole optimization campaign aimed at a
+  build no user runs. The gate itself was the bug. reprise now runs **one allocator (jemalloc) on
+  every target that can build it** (all but Windows), so the profile you measure is the profile that
+  ships.
+- *"The bag layer catches clone families landmark misses."* It never proposed a single pair landmark
+  did not. Zero unique yield, on every corpus — and always on, for the life of the project, because
+  nothing counted it. It is deleted.
+- *"h-tree cuts the flood ~48%."* That was h-tree measured **standalone**, on the raw landmark
+  stream. It ships **stacked behind the offset-histogram**, which rejects most of the same pairs
+  first; its marginal cut is **≈2%**. A filter's standalone power is not its marginal power behind a
+  filter correlated with it. (h-tree stays — the residue is orthogonal and near-free — but the
+  *number* was a lie.)
 - *"`bench-retrieval` races real production code."* It **reimplements** the production helpers.
 
 The pattern is always the same: a plausible model, written down once, never checked, then built

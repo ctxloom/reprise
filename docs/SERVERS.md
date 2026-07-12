@@ -44,7 +44,7 @@ Two consumers, two surfaces, **one substrate**:
 - `Config` is programmatically constructible — `Default` + all-public fields
   (`src/config.rs:7`); `cache.enabled`, `cache.shared_root`, `thresholds.*`,
   `baseline.pinned` are the server knobs.
-- No global mutable state (only the musl `#[global_allocator]`); concurrent scans are safe.
+- No global mutable state (only the `#[global_allocator]` — jemalloc on every target but Windows); concurrent scans are safe.
 
 **One report model, all formats project from it.**
 - `Group { id, tier, fingerprint, token_count, value, divergence, template: Option<String>,

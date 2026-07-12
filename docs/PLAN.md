@@ -2,6 +2,7 @@
 sessions:
   - tidal-moral-chive
   - pulpy-wooly-list
+  - sixth-flaky-saint
 ---
 
 # Implementation Plan: Semantic-ish Duplicate Detection for LLM-Generated Code
@@ -16,6 +17,7 @@ sessions:
 **Rev 6 (same date):** Two extensions. (a) **Mutual recursion**: SCCs of the syntactic call graph are detected (Tarjan over the §5.4 definition table) and converged via *SCC-scoped inlining* — one expansion round within an SCC turns mutual recursion into self-recursion, feeding the Rev 5 lowering. (b) **API-profile tier** (`api-profile`, suspicion-only): static-birthmark-style matching on IDF-weighted (callee, control-context) multisets, targeting reimplemented-task duplication that survives structural rewriting. Explicitly weaker than Type-4 detection: blind to pure-computation functions, unverifiable by anti-unification, never fails CI. Affected: §5.2, §5.4, new §5.7, §6, §7, §8, §9, §12, §13.
 **Rev 7 (same date):** Output-format conformance to prior-art standards (new §6.1): SARIF 2.1.0 mapping with duplicate groups as multi-location results, **structural/template hash as `partialFingerprints`** (stable alerts across cosmetic drift — the key decision), CPD-XML and jscpd-JSON compatibility for pipeline drop-in and §7.3 baseline diffing, and standard clone-metric definitions for CALIBRATION.md comparability. Affected: §6 (new §6.1), §7, §13.
 **Rev 8 (same date):** Tool named **reprise** (was working name `dupfold`). Checked free on crates.io and PyPI; only collision is an unrelated npm package in a different ecosystem. Affected: §2, §9.
+**Rev 10 (2026-07-11, post-implementation correction):** The spec is brought back in line with the shipped system on three points where it had drifted. (a) **Retrieval is ONE candidate set, not a union.** The bag-Jaccard candidate layer (§5.5.2) was implemented, measured, and **deleted**: it never proposed a pair the landmark layer did not, on any corpus (zero unique verified yield; DECISIONS.md D48). §5.6's "union of both candidate sets" is gone — the landmark retriever is the sole source of near-tier candidates. The subtree hash *set* survives, but as the document-frequency substrate the landmark rarity gate is computed over, **not** as a retrieval layer; `candidate_sim` is no longer a retrieval threshold. (b) **The landmark layer's constants are config** (`[retrieval] landmark_*`, §9), defaulting to the former hard-coded values. (c) **The inliner's expansion is rationed** (§5.4): SCC partners are exempt from neither cap without limit — `max_scc_depth` bounds the SCC bypass and `max_expansion_nodes` is an aggregate backstop (DECISIONS.md D50). Affected: §5.4, §5.5, §5.6, §9.
 **Rev 9 (same date):** Review revision + audio-fingerprinting transfers. (a) **Window enumeration deleted** — replaced by generalized-suffix-array maximal-repeat discovery over the normalized token stream (exact sequence tier, linear-ish, no quadratic window sets). (b) **Baseline/suppression** (`reprise baseline`, `reprise:ignore` pragma) keyed on the Rev 7 structural fingerprints — without this the tool fails CI forever on any legacy repo. (c) **Drift tracking**: new top tier `inconsistent-update` fires when a diff modifies some but not all members of a known group (Juergens ICSE'09: 52% of clones changed inconsistently; ~half of unintentional inconsistencies are faults). (d) **Test-code policy** (separate section by default). (e) **Shazam transfers**: landmark-pair combinatorial hashing (§5.5, rival to hole hashes — loser is dropped), offset-histogram diagonal verification + region localization pre-AU (§5.6), Smith-Waterman graded-cost alignment replacing binary LCS at list nodes, greedy-string-tiling noted as the reorder option. (f) Version-keyed index caches. Affected: §2, §4, §5.1, §5.5, §5.6, §6, §7, §8, §9, §12, §13.
 
 ---
@@ -177,6 +179,7 @@ Purpose: converge "caller uses existing helper" with "LLM reimplemented the help
 - Build a repo-wide **definition table**: (name, arity, language, param names, body subtree) for every function-like unit. Resolution of a call site: match by callee name + arity within the same language; prefer same-module, then same-crate/package, then repo-wide. If >`inline_max_candidates` (default 3) candidates, skip the call. Do **not** integrate SCIP/LSP/stack-graphs in this phase — the stack-graphs project is archived (Sep 2025) and per-language index integration is a Phase-4+ option only if calibration shows resolution ambiguity is a real precision problem. Record ambiguity-skip counts in scan stats so that decision is data-driven.
 - Inline = substitute argument subtrees for parameter names in a copy of the callee's normalized body, splice into the caller at the call site (as an expression-block canonical node). Purely syntactic substitution; ignore side effects, evaluation order, aliasing — **by design** (see §1, insight 1).
 - Policy knobs: inline only callees ≤ `inline_max_callee_tokens` (default 120 normalized tokens); recurse to depth `inline_max_depth` (default 2); never inline direct self-recursive calls (the Rev 5 lowering consumes those instead); never inline across languages.
+- **The SCC bypass is rationed, and the size cap is a precision guard.** The SCC round (below) must bypass the depth and size caps to splice a partner at all — but that bypass is bounded by `max_scc_depth` (default 1: the "inline each partner once" intent stated below, and no more), never unbounded. Two things go wrong if it is not: (a) *memory* — an unbounded bypass lets a mutually-recursive unit expand without limit (measured: one unit reached 25.1M nodes, 22× the whole corpus, and exhausted the machine); (b) *precision* — `max_callee_tokens` is not only a cost cap, it is what stops a large shared helper's mass from being spliced into every caller and manufacturing false clones out of the shared bulk. An aggregate `max_expansion_nodes` (default 250,000) backstops the whole unit: over budget, the unit is **skipped whole** — never partially expanded, so the budget can never determine a fingerprint — and counted in `inline_budget_skipped_units`. Zero units truncate at the default on every corpus measured, so it is inert by measurement, not by hope.
 - **Call graph and SCCs:** the definition table plus name+arity resolution yields a syntactic call graph; compute its strongly connected components (Tarjan). SCCs of size ≥2 are mutually recursive groups. **SCC-scoped inlining:** within an SCC, allow exactly one expansion round (inline each SCC partner once, stopping when a cycle would repeat a member) — this converts mutual recursion into direct self-recursion, which the recursion lowering (§5.2.2) then converts to the loop core. Net effect: a mutually-recursive state-machine pair can converge with a loop-plus-state-variable implementation. The merged SCC unit also enters the index, enabling *group-vs-group* findings (SCC A duplicates SCC B). Clean (tail-position-after-expansion) cases only; non-tail residue falls to the api-profile tier (§5.7). Provenance: this chain composes three already-specified mechanisms and is untested as a whole; each link is separately gated, and the composition gets a dedicated mutation class (§7.1).
 - Each unit is fingerprinted **twice**: once un-inlined, once fully-inlined-per-policy. Both variants enter the index, tagged. A match involving an inlined variant is tier-labeled `inline-assisted` and the report must show the inline chain (which callees were expanded) so a human can judge it.
 - Determinism requirement: inlining decisions must depend only on the definition table and policy, never on iteration order. Sort candidate sets.
@@ -186,7 +189,7 @@ Purpose: converge "caller uses existing helper" with "LLM reimplemented the help
 Four representations per unit/window/variant. The design problem here is **hash amplification**: a single divergent leaf invalidates every ancestor Merkle hash up to the root, so exact hashing is maximally intolerant of small divergences. Layers 2–3 exist to make small divergences *indexable* rather than fatal.
 
 1. **Whole-unit exact structural hash:** Merkle-style over the normalized tree (node kind + child hashes + kept names/literals). Equal hash ⇒ converged duplicate, tier `exact-normalized`. 128-bit non-cryptographic hash (xxh3-128).
-2. **Subtree hash bag:** the multiset of Merkle hashes of all subtrees above a small size floor (`bag_min_subtree_tokens`, default 6). Near-duplicates share most of the bag; estimated Jaccard over bags (via MinHash) is the primary near-miss retrieval signal. Side benefit: for a candidate pair, the *unmatched* hashes localize the divergences before any pairwise work.
+2. **Subtree hash set:** the deduplicated set of Merkle hashes of all subtrees above a small size floor (`bag_min_subtree_tokens`, default 6). **This is not a retrieval layer.** It was specified as one — bag-Jaccard over these hashes as "the primary near-miss retrieval signal" — and was built that way; measurement retired it (§7.4(b), DECISIONS.md D48): its candidate set was a strict subset of the landmark layer's on every corpus, and it verified zero pairs landmark did not also propose. What the set is *for* now is the **document-frequency substrate**: the landmark layer's rarity gate (layer 4) computes `df` over it, so `bag_min_subtree_tokens` decides which subtrees are rarity-tested at all (see `retrieval.landmark_df_over_offsets`, §9). It is also a persisted digest field.
 3. **Hole-context hashes:** for each internal node, additionally emit its hash with each child slot replaced by a HOLE marker (k=1; k=2 for high-arity list nodes only if calibration shows recall need). Two trees differing in exactly one subtree under a node still share that node's 1-hole hash — the hole hash is a *template fingerprint*, making factored-out divergence a first-class index key. Cost is a bounded constant-factor blowup (≤ n × arity extra hashes); report index size in scan stats.
 4. **Landmark-pair hashes (Shazam transfer):** select *landmarks* — small subtrees that are both distinctive (high IDF over the repo's subtree-hash distribution; the IDF machinery is shared with §5.7) and stable under normalization — then emit combinatorial pair hashes `(anchor_hash, target_hash, structural_offset)` for each anchor and the landmarks in a bounded following region (offset = normalized-token distance, bucketed). Rationale, imported directly from audio fingerprinting: individually common landmarks become combinatorially rare in pairs, so pairs are highly discriminating while a local edit destroys only the pairs touching it — audio identification works from 1–2% surviving hash tokens. This is the principled attack on the convergent-trivia risk (§12): post-normalization small subtrees all look alike; pairs at specific offsets don't. Pair hashes also power the offset-histogram verification in §5.6.
    **Rivalry clause:** layers 3 and 4 are competing unpublished syntheses aimed at the same retrieval gap. Both run in Phase 2 under §7.4(b) measurement; whichever contributes less candidate recall per unit of index size is **dropped, not kept alongside** (record in DECISIONS.md). Do not ship both.
@@ -198,7 +201,7 @@ Four representations per unit/window/variant. The design problem here is **hash 
 
 **Tree tier (near-miss):**
 - Bucket whole-unit exact hashes → groups directly (tier `exact-normalized`).
-- Candidate retrieval: bag-Jaccard (§5.5.2) above `candidate_sim` (default 0.70 estimated), OR shared template/pair fingerprints (§5.5.3/4, whichever survives the rivalry) covering ≥ `hole_hash_min_cover` (default 0.5) of the smaller unit. Union of both candidate sets goes to histogram verification.
+- Candidate retrieval: **one candidate set, from one retriever.** Shared landmark-pair fingerprints (§5.5.4 — the rivalry winner; §5.5.3 hole-context hashes were dropped per the rivalry clause, DECISIONS.md D16), admitted on ≥ `shared_landmarks_min` shared constellation hashes and a shared-constellation coverage ≥ `retrieval.landmark_coverage_min` of the smaller unit's landmark set. That set goes to histogram verification. There is **no union**: the bag-Jaccard layer (§5.5.2) that this section originally unioned in was deleted for zero unique yield (D48), and `candidate_sim` is no longer a retrieval threshold. Because there is no second layer to re-propose a pair, the coverage gate is unconditional (measured recall-neutral).
 - **Offset-histogram verification and localization (Shazam transfer, pre-AU):** for each candidate pair, every shared fingerprint votes `(Δposition)` — the difference of its normalized-token offsets in the two units. A genuine clone produces a dominant histogram bin (the "diagonal": many fingerprints agreeing on one alignment offset); coincidental collisions scatter. Reject candidates with no bin ≥ `histogram_min_votes` (default 5) — this is O(shared fingerprints), far cheaper than AU on a false candidate. The winning bin's fingerprint span also **localizes the matched region** (the diagonal's extent = region boundaries), which both handles partial-function clones without windows and tells AU where to align. Lineage: clone research visualized exactly these diagonals in Duploc-style dotplots; the histogram trick makes diagonal-finding a linear hash-vote instead of an O(n²) matrix scan.
 - **Verification = anti-unification** on histogram-confirmed pairs (or confirmed regions), as before:
   - At **fixed-arity nodes**: classical positional anti-unification; mismatched kinds produce a hole.
@@ -287,8 +290,10 @@ generated_markers = ["@generated", "DO NOT EDIT"]
 [thresholds]
 min_unit_tokens        = 40    # post-normalization size floor
 min_seq_tokens         = 30    # sequence-tier maximal-repeat floor
-bag_min_subtree_tokens = 6     # subtree-hash bag floor
-candidate_sim          = 0.70  # bag-Jaccard retrieval threshold
+bag_min_subtree_tokens = 6     # subtree-hash-set floor; the landmark rarity `df` substrate,
+                               #   NOT a retrieval threshold (§5.5.2)
+candidate_sim          = 0.70  # NOT read by the core (the bag-Jaccard layer it thresholded is
+                               #   gone, D48); still read by reprise-mcp as a size-compat ratio
 hole_hash_min_cover    = 0.5   # template/pair fingerprint retrieval threshold
 histogram_min_votes    = 5     # offset-histogram diagonal acceptance
 max_divergence         = 0.15  # AU acceptance: (|σ1|+|σ2|)/(2|T|)
@@ -302,11 +307,25 @@ mode = "separate"   # separate (own section, never fails CI) | exclude | normal
 file = "reprise-baseline.json"
 track_drift = true  # inconsistent-update findings + divergence trend on baselined groups
 
+[retrieval]                       # the sole near-tier candidate source (§5.6)
+retriever             = "landmark"
+landmark_pairs        = true      # kill-switch: false = no retriever = no near candidates
+shared_landmarks_min  = 2
+landmark_coverage_min = 0.05      # §0.3 coverage fraction; unconditional, recall-neutral
+landmark_fan_out      = 3         # rare peaks each peak is paired with (index size ~linear)
+landmark_rare_floor   = 3         # rarity cap = landmark_rare_floor.max(n / landmark_rare_divisor)
+landmark_rare_divisor = 20        #   …unless landmark_rare_cap pins it outright
+# landmark_rare_cap   = 500       # unset (default) = derive it; set = pin it (index growth linear)
+landmark_df_over_offsets = false  # false preserves the E5b df/filter floor mismatch (see §5.5.2)
+
 [inline]
 enabled            = true
 max_callee_tokens  = 120
 max_depth          = 2
 max_candidates     = 3
+max_scc_depth      = 1        # SCC-partner splices allowed past the caps; the §5.4 "once" intent
+max_expansion_nodes = 250_000 # aggregate per-unit backstop; over budget ⇒ unit is skipped WHOLE
+                              #   (never partially expanded, so it is not fingerprint-determining)
 
 [api_profile]
 enabled              = true

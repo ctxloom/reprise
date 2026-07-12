@@ -1,11 +1,10 @@
 //! P7 tree tier (spec §5.6): candidate retrieval (§5.5.4 landmark pairs — the §7.4(b)
 //! rivalry winner), offset-histogram verification, then anti-unification.
 //!
-//! NOTE vs spec §5.5.2 / PLAN.md §201: retrieval is no longer a *union* of a bag-Jaccard
-//! layer and the landmark layer. The bag layer was measured to have zero unique yield —
-//! its candidate set was a strict subset of landmark's on every corpus — and was deleted.
-//! Retrieval is the landmark retriever alone. `bag_set` survives as the substrate for
-//! landmark's rarity `df` map. Measured in the rarity-sweep WP (2026-07); see CALIBRATION.md / DECISIONS.md when landed.
+//! Retrieval is the landmark retriever ALONE: **one candidate set, never a union.**
+//! `bag_set` is NOT a retrieval layer — it is the substrate the landmark rarity `df` map
+//! is built from (see `retrieval.landmark_df_over_offsets`) and a persisted `UnitDigest`
+//! field.
 //!
 //! Phase 3: inline-expanded variants
 //! (spec §5.4) enter retrieval alongside plain units; a verified pair
@@ -40,13 +39,15 @@ pub struct NearGroup {
 
 #[derive(Default, Debug, Clone, serde::Serialize)]
 pub struct RetrievalStats {
-    // `candidates_bag` and `verified_only_landmark` are GONE with the bag layer (see
-    // `near_groups_for_lang`). They existed to arbitrate a two-layer union that no longer
-    // exists: with a single retriever, `candidates_total == candidates_landmark` and
-    // "verified only by landmark" == `verified_pairs`, both by construction. The measurement
-    // that retired the bag layer — its unique verified yield was 0 on every corpus — is
-    // recorded in the rarity-sweep WP (2026-07). If a second candidate layer is ever
-    // added back, it MUST ship with a unique-yield counter; that was the lesson.
+    // With a single retriever, `candidates_total == candidates_landmark` and "verified
+    // only by landmark" == `verified_pairs`, both BY CONSTRUCTION — so neither is a
+    // counter worth carrying.
+    //
+    // INVARIANT: a second candidate layer, if one is ever added here, MUST ship with a
+    // unique-yield counter. A layer whose marginal contribution over the layers it runs
+    // beside is not a live, per-scan number cannot be shown to earn its keep — and an
+    // always-on join that yields nothing is indistinguishable from one that yields
+    // everything until someone counts.
     pub candidates_landmark: usize,
     /// Landmark candidates dropped by the coverage-fraction gate (§0.3): the
     /// recall-neutral pre-AU flood cut. Reported so the gate's marginal effect is
@@ -97,9 +98,9 @@ impl<'d> RepData<'d> {
         self.unit_idx
     }
     /// Floor-`bag_min_subtree_tokens` deduplicated subtree-hash set, sorted ascending.
-    /// Once the retired bag layer's Jaccard features; now the default substrate for the
-    /// landmark rarity `df` map (see `retrieval.landmark_df_over_offsets`), and available
-    /// to any `Retriever` building its own index.
+    /// The default substrate for the landmark rarity `df` map (see
+    /// `retrieval.landmark_df_over_offsets`), and available to any `Retriever` building
+    /// its own index. Not itself a retrieval layer.
     pub fn bag_set(&self) -> &[u128] {
         &self.bag_set
     }
@@ -215,8 +216,8 @@ pub fn rep_substrate(
     cfg: &Config,
     li: &crate::intern::LabelInterner,
 ) -> (Vec<u128>, SubtreeOffsets) {
-    // Histogram offsets use a finer inventory (floor 3) than the bag
-    // (small units would otherwise starve the vote count); the bag
+    // Histogram offsets use a finer inventory (floor 3) than `bag_set`
+    // (small units would otherwise starve the vote count); `bag_set`
     // itself keeps the §9 floor.
     let inv: Vec<Subtree> = fingerprint::subtree_inventory(tree, 3, HashMode::MaskedLocals, li);
     // Pre-order depth per node offset (same numbering as `walk_inventory`:
@@ -284,17 +285,13 @@ fn near_groups_for_lang(
     // Candidate generation only — the verify chain below is identical for whichever
     // retriever proposes the pairs.
     //
-    // There used to be a second, always-on "bag-Jaccard" layer here, unioned with the
-    // retriever's output. It was DELETED after being measured: its candidate set was a
-    // strict SUBSET of landmark's on every corpus (`candidates_total == candidates_landmark`
-    // exactly, on self/fs/net), it verified ZERO pairs landmark did not also propose
-    // (`verified_only_bag = 0`), and disabling it left every tier's group set byte-identical.
-    // The failure mode it existed for — a clone family so large its subtrees stop being rare,
-    // starving landmark — does not occur. It was an unswitchable corpus-wide par-sort join
-    // over `bag_set` contributing nothing. Measured in the rarity-sweep WP (2026-07); see CALIBRATION.md / DECISIONS.md when landed.
+    // ONE candidate set. There is no second layer to union with: the retriever's output IS
+    // the candidate set. The failure mode a second bag-Jaccard layer would nominally guard
+    // against — a clone family so large its subtrees stop being rare, starving landmark's
+    // rarity gate — does not occur on any measured corpus.
     //
-    // `bag_set` itself SURVIVES: it is still the substrate for the landmark rarity `df` map
-    // (see `Landmark::candidates`) and a persisted `UnitDigest` field. Only the JOIN is gone.
+    // `bag_set` is NOT a candidate layer: it is the substrate for the landmark rarity `df`
+    // map (see `Landmark::candidates`) and a persisted `UnitDigest` field.
     let mut candidates: BTreeSet<(usize, usize)> = BTreeSet::new();
     if cfg.retrieval.landmark_pairs {
         let retriever = select_retriever(&cfg.retrieval.retriever);
@@ -341,9 +338,13 @@ fn near_groups_for_lang(
         //      magnitude heavier than the cheap filters (hash-set intersections for
         //      coverage, one-vote-per-bin histogram counts for offset-histogram /
         //      h-tree). The ENTIRE filter cascade exists to minimize how many pairs
-        //      reach this call: coverage cuts ≈ −44% and h-tree ≈ −48% of the flood,
-        //      pruning ~8k raw candidates to the few AU actually verifies. So it runs
-        //      ONCE, last, only on filter-survivors.
+        //      reach this call: on self, 24.6k raw candidates prune to 8.1k AU calls
+        //      yielding 453 verified pairs. Coverage does nearly all of the cutting
+        //      (≈ −44% of the flood). h-tree, STACKED behind the offset-histogram as it
+        //      ships, adds only ≈2% more (recall-neutral) — most of what it can reject
+        //      the histogram has already rejected. It is kept because that residue is
+        //      genuinely orthogonal (Δdepth, not Δoffset) and near-free, not because it
+        //      is a major cut. So AU runs ONCE, last, only on filter-survivors.
         let (ua, ub) = (reps[i].unit_idx, reps[j].unit_idx);
         // Materialize the PAIR (the one true pair-of-trees consumer): a plain
         // borrow under the gate, an `Arc` handle out of the pack LRU over it.
@@ -626,11 +627,9 @@ impl Retriever for Landmark {
             // gate is never MORE aggressive than the validated definition. Pre-AU, so it
             // saves the O(n·m) anti-unification on the coincidences it drops.
             //
-            // This gate used to be softened by the bag layer: a pair the bag also proposed
-            // entered the candidate union independently and so survived a coverage drop.
-            // With the bag layer deleted the gate is now unconditional — which was measured
-            // to change NOTHING (the `candidate_sim = 1.01` arm, which likewise left every
-            // pair coverage-exposed, produced byte-identical group sets on self/fs/net).
+            // The gate is UNCONDITIONAL: every candidate is coverage-exposed, with no
+            // second layer to re-propose a pair it drops. Recall-neutral — leaving every
+            // pair coverage-exposed produces byte-identical group sets on self/fs/net.
             if coverage_min > 0.0 {
                 let denom = landmarks[i].len().min(landmarks[j].len()).max(1) as f64;
                 let full_shared = intersect_count(&landmarks[i], &landmarks[j]);

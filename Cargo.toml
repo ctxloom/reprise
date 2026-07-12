@@ -64,23 +64,22 @@ tree-sitter-rust = "0.24.2"
 tree-sitter-typescript = "0.23.2"
 xxhash-rust = { version = "0.8.16", features = ["xxh3"] }
 
-# The global allocator, on every target EXCEPT Windows (supersedes D42's musl-only
-# mimalloc gate). Two independent, separately-measured reasons — see src/main.rs and
-# DECISIONS.md D42:
-#  1. musl (D42's, unchanged in kind): musl's default allocator is ~16x slower than
-#     glibc under reprise's rayon-parallel scan.
-#  2. glibc (dev/CI build): glibc malloc cannot give back the millions of small
-#     `NormNode` chunks the memory gate frees mid-scan, so a later demand for large
-#     contiguous Vecs is served by fresh mmap instead of the freed space — both
-#     resident at once. jemalloc measured strictly better than mimalloc on both wall
-#     and peak RSS (drivers/ and fs/), with no fs-scale regression, so it replaces
-#     mimalloc everywhere it can, rather than just closing the musl-only gate.
+# The global allocator, on every target EXCEPT Windows — see src/main.rs for the full
+# reasoning. ONE allocator everywhere it builds, so dev/CI and the shipped binary share
+# a memory profile. Two independent, separately-measured reasons:
+#  1. musl: musl's default allocator is ~16x slower than glibc under reprise's
+#     rayon-parallel scan.
+#  2. glibc: glibc malloc cannot give back the millions of small `NormNode` chunks the
+#     memory gate frees mid-scan, so a later demand for large contiguous Vecs is served
+#     by fresh mmap instead of the freed space — both resident at once.
+# jemalloc measured strictly better than mimalloc on both wall and peak RSS (drivers/
+# and fs/), with no fs-scale regression.
 # Windows is excluded, not by choice: tikv-jemalloc-sys does not build for
 # x86_64-pc-windows-gnu (reprise's shipped Windows target) — "could not find native
 # static library `jemalloc`" — mirroring long-unresolved upstream Windows gaps in
 # jemalloc itself (MSVC is explicitly unsupported upstream; -gnu has an open,
 # unmerged fix attempt). This is a hard build failure, not a judgment call; Windows
-# keeps the system allocator, exactly as it did before this patch (no regression).
+# keeps the system allocator.
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 tikv-jemallocator = "0.7"
 

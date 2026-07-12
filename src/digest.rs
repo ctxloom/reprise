@@ -30,9 +30,8 @@ pub struct UnitDigest {
     /// any unit — plain or variant — can be a bucket representative).
     pub boilerplate_mass: u32,
     /// Floor-`bag_min_subtree_tokens` deduplicated subtree hashes, sorted ascending
-    /// (`RepData::bag_set`). Once the near-tier bag layer's Jaccard features; that layer
-    /// is gone (zero unique yield), but this survives as the default substrate for the
-    /// landmark rarity `df` map.
+    /// (`RepData::bag_set`). The default substrate for the landmark rarity `df` map —
+    /// not a retrieval layer in its own right.
     pub bag_set: Vec<u128>,
     /// Near-tier verify substrate: subtree hash → (pre-order offsets, tree depths),
     /// sorted by hash (`RepData::offsets`).

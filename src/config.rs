@@ -191,9 +191,8 @@ impl Default for TestsCfg {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct RetrievalCfg {
-    /// Which candidate-generation retriever runs. It is now the SOLE source of near-tier
-    /// candidates: the bag-Jaccard layer it once ran alongside was measured to add zero
-    /// unique candidates on every corpus and was deleted (see `matchtree`).
+    /// Which candidate-generation retriever runs. It is the SOLE source of near-tier
+    /// candidates — retrieval is one candidate set, never a union of layers.
     /// A **string-keyed, plugin-extensible** selector (mirrors `normalize.normalizer`),
     /// NOT a two-way flag: further retrievers may register later. The default `"landmark"`
     /// is the §5.5.4 rare-peak constellation retriever (the §7.4b rivalry winner). The
@@ -204,10 +203,10 @@ pub struct RetrievalCfg {
     /// §5.5.4 landmark pairs — rivalry winner (§7.4b, see CALIBRATION.md;
     /// hole-context hashes were dropped per the §5.5 rivalry clause).
     ///
-    /// Master on/off for the landmark layer. **Semantics changed when the bag layer was
-    /// deleted:** `false` used to leave the bag layer running alone; now it leaves the near
-    /// tier with NO retriever at all, so it proposes zero candidates and finds nothing.
-    /// It is effectively a kill-switch for near-tier retrieval. Default `true`.
+    /// Master on/off for the landmark layer. Since landmark is the only retriever, `false`
+    /// leaves the near tier with NO retriever at all: it proposes zero candidates and finds
+    /// nothing. This is a kill-switch for near-tier retrieval, not a layer selector.
+    /// Default `true`.
     pub landmark_pairs: bool,
     /// Minimum shared landmark-pair hashes for a candidate. The M3b value of 4
     /// cost real recall (D27 A/B: serde lost 15/43 pairs); 2 is recall-neutral.
@@ -232,10 +231,9 @@ pub struct RetrievalCfg {
     /// filters:
     ///   - `coverage` — the §0.3 coverage-fraction filter, scoped to LANDMARK candidacy
     ///     (threshold = `landmark_coverage_min`). It runs in the landmark retriever's
-    ///     phase, not as a per-pair `&Ctx` predicate. It used to be softened by the bag
-    ///     layer (a pair the bag also proposed entered the union anyway and survived a
-    ///     coverage drop); with the bag layer deleted it applies unconditionally — measured
-    ///     to change no output.
+    ///     phase, not as a per-pair `&Ctx` predicate. It applies UNCONDITIONALLY — there is
+    ///     no second layer to re-propose a pair it drops — and is recall-neutral (measured:
+    ///     no output change).
     ///   - `offset-histogram` — the Shazam Δoffset diagonal (spec §5.6), a consistency
     ///     predicate over the shared floor-3 subtree evidence.
     ///   - `h-tree` — H-tree-verify, the Δdepth diagonal (docs/substantiality-metric.md
@@ -380,21 +378,17 @@ pub struct Thresholds {
     /// parity at zero measured precision cost. See `Config::min_unit_floor`.
     pub min_unit_tokens_ir: u32,
     pub min_seq_tokens: u32,
-    /// Token floor for a subtree to enter `bag_set`. The bag-Jaccard RETRIEVAL layer this
-    /// once fed is gone (zero unique yield — see `matchtree`), but the key is still live:
-    /// `bag_set` is the default substrate for the landmark rarity `df` map, so this floor
-    /// still decides which subtrees are rarity-tested at all (`retrieval.
-    /// landmark_df_over_offsets` = the E5b defect this floor mismatch causes).
+    /// Token floor for a subtree to enter `bag_set`. NOT a retrieval threshold: `bag_set`
+    /// is the default substrate for the landmark rarity `df` map, so this floor decides
+    /// which subtrees are rarity-tested at all (`retrieval.landmark_df_over_offsets`
+    /// documents the E5b defect this floor mismatch causes).
     pub bag_min_subtree_tokens: u32,
-    /// **No longer a retrieval threshold.** This was the bag-Jaccard candidate threshold
-    /// (spec §9 / PLAN.md §201); that layer was deleted for zero unique yield, so nothing
-    /// in the core reads it any more.
+    /// **Not a retrieval threshold, and not read by the core at all.**
     ///
-    /// It survives only because `reprise-mcp` reuses the value as a **size-compatibility
+    /// It is live only because `reprise-mcp` reuses the value as a **size-compatibility
     /// ratio** in its own pre-AU prefilter (`size_compatible(a_tokens, b_tokens, ratio)`) —
     /// a semantically unrelated use that happens to want a number near 0.70. That coupling
-    /// is accidental and should get its own key; left alone here to avoid changing MCP
-    /// behavior as a side effect of deleting the bag layer.
+    /// is accidental: MCP should own its own key, and this one should then go.
     pub candidate_sim: f64,
     pub hole_hash_min_cover: f64,
     pub histogram_min_votes: u32,
@@ -681,8 +675,8 @@ mod tests {
 
     #[test]
     fn inline_scc_and_budget_defaults_are_pinned() {
-        // inliner-expansion-budget WP: `max_scc_depth = 1` restores the documented
-        // "inline SCC partner once" intent (src/inline.rs module doc); the aggregate
+        // `max_scc_depth = 1` is the documented "inline an SCC partner once" intent
+        // (src/inline.rs module doc); the aggregate
         // `max_expansion_nodes = 250_000` backstop sits 20x above the largest unit
         // measured on any of eight corpora (redis, 12,232 spliced nodes) and ~100x
         // below the 25.1 M-node pathology it exists to stop. Zero units truncate at

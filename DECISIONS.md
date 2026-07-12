@@ -178,6 +178,10 @@ Bag + landmark retrieval covers current scale; the vector/LSH layer (§5.5.5) wo
 add a third index with no demonstrated recall gap. Revisit if landmark candidate
 volume (the §7.4b watch item) forces banding anyway.
 
+> **Still not built; the premise narrowed.** The bag layer is since deleted (D48), so retrieval is
+> landmark alone — a vector/LSH layer would be a *second* index, not a third. The decision is
+> unchanged: no demonstrated recall gap.
+
 ## D13 — `max_divergence` = 0.18 (was spec-guessed 0.15)
 
 Set empirically per §7.4(c): the honest whole-expression hole for `X` vs `X op Y`
@@ -206,6 +210,12 @@ align flattened operand chains (order canonicalization can sort divergent operan
 differently on each side).
 
 ## D16 — Rivalry verdict (§5.5/§7.4b): landmark pairs KEPT, hole-context hashes DELETED
+
+> **Partially superseded by D48.** The hole-context verdict below stands. But this rivalry only asked
+> which *challenger* to keep **beside** the bag-Jaccard layer — it never asked whether the **bag
+> itself** earned its keep. It did not: measured later, its unique verified yield was **0** on every
+> corpus, and it is now deleted. Retrieval is the landmark retriever **alone** — there is no candidate
+> union. Do not read the "bag + landmark" configuration below as current.
 
 Measured 2026-07-02 (full table in CALIBRATION.md): landmark-only retrieval achieves
 100% Phase-2 benchmark recall; hole-context-only misses light-edit and unroll; on
@@ -843,6 +853,11 @@ at length — needs calibration against the M4a sample method.
 
 ## D42 — Linux ships musl-static (supersedes D34's glibc static-pie); mimalloc on musl (2026-07-02)
 
+> **The allocator half of this decision is SUPERSEDED by D49** (jemalloc on every target but
+> Windows). The *finding* below stands unchanged — musl's default allocator is ~16x slower under the
+> parallel scan — but the **musl-only gate** was wrong, and D49 explains why. The musl-static
+> shipping decision (the other half of D42) still stands.
+
 Supersedes the static-link half of D34. The shippable Linux binary is now
 **musl-static via cargo-zigbuild**, not glibc `+crt-static`. Trigger: a glibc
 binary built on a newer-glibc host (this dev host, trixie) links the host's
@@ -1083,3 +1098,132 @@ not a structural-rarity property the landmark/IDF layer can observe. **DECISION:
 token floors (`min_unit_tokens_ir`, `histogram_min_votes_ir`) as-is; do NOT swap. w7 stays a Decision-4
 hold-out; `elder-wow` is NOT subsumed.** A different axis (shared-fragment corpus-recurrence df, or callee
 semantics) would be a new design. Full data: docs/substantiality-metric.md §0.
+
+---
+
+## D48 — The bag-Jaccard candidate layer is DELETED; retrieval is landmark alone (2026-07-11)
+
+Near-tier retrieval was a **union of two candidate layers**: bag-Jaccard over the floor-6 subtree
+hash set (`bag_set`, spec §5.5.2, thresholded by `candidate_sim`) and the landmark constellation
+retriever (§5.5.4, the D16 rivalry winner). The union is gone. **The landmark retriever is the sole
+source of near-tier candidates.**
+
+**Measured, on every corpus (self/fs/net):**
+- `candidates_total == candidates_landmark` **exactly** — the bag layer's candidate set was a strict
+  *subset* of landmark's. It never proposed a pair landmark did not.
+- `verified_only_bag = 0` — zero unique verified yield, everywhere.
+- Disabling it left **every tier's group set byte-identical**. Output does not change.
+
+The failure mode it nominally existed for — a clone family so large that its subtrees stop being rare,
+starving landmark's rarity gate — **does not occur**. What the layer actually was: an unswitchable,
+always-on, corpus-wide par-sort join over `bag_set` that contributed nothing, for the life of the
+project.
+
+**What survives.** `bag_set` itself — it is still a `UnitDigest` field and, by default, the
+**document-frequency substrate** the landmark rarity gate is computed over (see
+`retrieval.landmark_df_over_offsets`). **Only the JOIN dies.** So `bag_min_subtree_tokens` is still
+live and still behavior-determining — it decides which subtrees are rarity-tested at all — it is just
+no longer a *retrieval* threshold. `candidate_sim` is now read by nothing in the core; it survives
+only because `reprise-mcp` reuses the value as an unrelated size-compatibility ratio (that coupling is
+accidental and should get its own key).
+
+**Consequences.**
+- The §0.3 coverage gate is now **unconditional**. It was previously softened by the union: a pair the
+  bag also proposed re-entered the candidate set independently and so survived a coverage drop, and
+  that exemption was documented as the source of the gate's recall-safety. It was not — with every
+  pair coverage-exposed, group sets are byte-identical.
+- Stats `candidates_bag` and `verified_only_landmark` are **removed**: with one retriever,
+  `candidates_total == candidates_landmark` and `verified_only_landmark == verified_pairs`, both by
+  construction.
+- The landmark layer's former hard-coded constants become config, all defaulting to the previous
+  values so the default path stays byte-identical: `retrieval.landmark_fan_out` (3),
+  `landmark_rare_floor` (3), `landmark_rare_divisor` (20), `landmark_rare_cap` (unset = derive), and
+  `landmark_df_over_offsets` (false).
+
+**Why this went unnoticed for so long — the lesson, and the invariant it buys.** The D16 rivalry
+measured which *challenger* (hole-context vs landmark) to keep **beside** the bag. It never asked
+whether the **incumbent** earned its own keep, and no counter existed that could have answered:
+`verified_only_bag` did not exist. **INVARIANT, now enforced in `matchtree.rs`: any second candidate
+layer added here MUST ship with a unique-yield counter.** A layer whose marginal contribution over the
+layers it runs beside is not a live, per-scan number cannot be shown to earn its keep — and an
+always-on join that yields nothing is indistinguishable from one that yields everything, until someone
+counts.
+
+Supersedes the retrieval-union half of D16 (its hole-context verdict stands). Spec §5.5.2/§5.6 updated
+(PLAN.md Rev 10); CALIBRATION.md §7.4(b) annotated.
+
+---
+
+## D49 — One allocator: jemalloc on every target but Windows (supersedes D42's musl-only mimalloc gate; 2026-07-11)
+
+D42 made mimalloc the `#[global_allocator]` **gated to `cfg(target_env = "musl")`**. glibc and macOS
+kept the system allocator. D42's *finding* was right and is unchanged: musl's default allocator is
+**~16x slower** than glibc under reprise's rayon-parallel scan (77 s vs 4.7 s on the 500k perf corpus).
+**The gate was the mistake.**
+
+**What the gate cost: a 6.8 GB dev/prod skew.** Dev, CI, and release-on-glibc all ran plain glibc
+malloc and peaked at **22.7 GB** on `drivers/`; only the shipped musl binary got a fast allocator and
+peaked at **15.8 GB**. Every Tier-2 memory budget was reasoned from a profile that **no shipped binary
+had**. A whole optimization campaign was aimed at a build no user runs — this is the entry CLAUDE.md's
+first rule cites.
+
+**glibc has its own, independent allocator problem** (this is the second, separately-measured reason —
+not a restatement of D42's): glibc malloc **cannot give back the trees the memory gate frees**.
+Extraction packs ~12.7 GB of `NormNode` (64 B each) into rayon's per-thread arenas as *millions* of
+small chunks; the gate spills and frees the trees, leaving ~8.7 GB of free chunks (18.3 M of them at
+`drivers/` scale) scattered **mid-arena** — so almost no page is wholly free and `malloc_trim` reclaims
+~nothing. The near tier then demands **large contiguous** Vecs (the landmark entries/events), which
+exceed the mmap threshold and are served by **fresh mmap** rather than out of that 8.7 GB. The freed
+memory is the wrong *shape* to satisfy the new demand, so both are resident at once. jemalloc's
+arena/extent reclaim returns it: **peak RSS 22.70 → 15.37 GB (−7.33 GB, −32%) and wall −29%** at
+`drivers/` scale, interleaved. Output identical.
+
+**DECISION: jemalloc (`tikv-jemallocator`) as `#[global_allocator]` on every target except Windows.**
+jemalloc measured strictly better than mimalloc on both `drivers/` and `fs/`, with no fs-scale
+regression, so it replaces mimalloc *everywhere it can* rather than merely closing the musl gate.
+
+**Windows keeps the system allocator — not by choice.** `tikv-jemalloc-sys` does not build for
+`x86_64-pc-windows-gnu` (reprise's shipped Windows target): "could not find native static library
+`jemalloc`", mirroring long-unresolved upstream Windows gaps in jemalloc itself (MSVC explicitly
+unsupported; `-gnu` has an open, unmerged fix attempt). This is a hard build failure, not a judgment
+call. Consequence to remember: **a Windows memory figure is not comparable to any other target's.**
+
+**The general rule this buys:** *the binary you measure must be the binary you ship.* A per-target
+allocator gate silently forks the memory profile, and the fork will be discovered — expensively — only
+after budgets have been built on the wrong branch of it.
+
+---
+
+## D50 — The inliner's SCC bypass is rationed (`max_scc_depth`), with an aggregate node backstop (2026-07-11)
+
+`resolve_policy` exempted mutual-recursion **SCC partners from BOTH `max_depth` and
+`max_callee_tokens`**. The intent (spec §5.4, and the inline module's own doc) was always "inline each
+SCC partner **once**" — but nothing enforced the *once*, so the exemption was effectively unbounded.
+
+**What that cost.** One redis unit expanded to **25.1 M nodes — 22× the entire corpus** — and exhausted
+the machine's memory. And the size cap was not only a cost cap: **`max_callee_tokens` is also the
+precision guard.** Skipping it splices a large shared helper's mass into every caller and *manufactures
+false clones out of the shared bulk* — observed concretely in btrfs, where `check_system_chunk` and
+`btrfs_reserve_chunk_metadata` were reported as clones purely on the mass of the 74-line
+`reserve_chunk_space` they both call. A cap that is bypassed for cost reasons silently takes a
+precision guarantee with it.
+
+**DECISION — ration the bypass, and backstop the unit:**
+- **`inline.max_scc_depth` (default 1).** The SCC bypass still exists (an SCC partner *must* be able to
+  bypass the caps or mutual recursion cannot be converted to self-recursion at all), but it is bounded:
+  at most `max_scc_depth` SCC-partner splices may be on the stack. Default 1 = exactly the "once" the
+  module always documented.
+- **`inline.max_expansion_nodes` (default 250,000).** A pure aggregate per-unit backstop, charged
+  across the whole expansion and checked **before** the SCC bypass (the SCC round does not get to
+  bypass the backstop). It sits ~20× above the largest unit measured on any of eight corpora (redis,
+  12,232 spliced nodes) and ~100× below the 25.1 M-node pathology it exists to stop. **Zero units
+  truncate at any value in [25k, 500k]** — so the default is inert *by measurement*, not by hope.
+
+**The budget is NOT fingerprint-determining, by policy.** Over budget, the unit is **skipped whole** —
+it gets no inline variant at all, never a *partially* expanded one. This is the load-bearing design
+choice: a partially-expanded unit would make the fingerprint a function of the budget (and thus of
+config, and of expansion order), which would make the cache key and the output depend on a resource
+limit. A whole-unit skip only ever *removes* an inline-assisted candidate; it can never alter one.
+
+New stat **`inline_budget_skipped_units`** reports when the backstop fires, so it cannot fire silently
+(it currently fires on nothing). Spec §5.4 updated (PLAN.md Rev 10).

@@ -98,6 +98,18 @@ Code deleted per the rivalry clause (DECISIONS.md D16). Watch item: landmark
 candidate volume (12k candidates on ripgrep → ~6.5k AU calls after histogram);
 raise the shared-pair threshold or add banding if scan time grows.
 
+**Follow-on: the bag layer went the same way (D48).** This table's arms all
+retain the bag as the baseline layer, and the rivalry only asked which
+*challenger* to keep beside it — it never asked whether the *bag* earned its own
+keep. It did not. Measured later, on every corpus: `candidates_total ==
+candidates_landmark` exactly (its candidate set was a strict subset of
+landmark's), `verified_only_bag = 0`, and disabling it left every tier's group
+set byte-identical. **The retrieval layer is now landmark alone** — the "bag +
+landmark" row above is the *former* shipping configuration, not the current one.
+The subtree hash set survives, but as the landmark rarity `df` substrate, not as
+a candidate source. The methodological error worth keeping: a rivalry between
+two challengers measured neither against *dropping the incumbent*.
+
 **(c) Divergence/hole distributions.** True-positive divergences observed:
 0.02–0.18. `max_divergence` raised 0.15 → **0.18** empirically (D13): honest
 whole-expression holes for `X` vs `X op Y` substitutions land at ~0.17 on
