@@ -106,8 +106,11 @@ candidates_landmark` exactly (its candidate set was a strict subset of
 landmark's), `verified_only_bag = 0`, and disabling it left every tier's group
 set byte-identical. **The retrieval layer is now landmark alone** — the "bag +
 landmark" row above is the *former* shipping configuration, not the current one.
-The subtree hash set survives, but as the landmark rarity `df` substrate, not as
-a candidate source. The methodological error worth keeping: a rivalry between
+The subtree hash set survives only as a persisted digest field — the landmark
+rarity gate it briefly fed is itself deleted (D51): measured inert as shipped,
+and unable to remove a single junk group even fixed to bind on the inventory it
+filtered. Every offset-sorted peak is now admitted; there is no `df`/`rare_cap`
+gate left to feed. The methodological error worth keeping: a rivalry between
 two challengers measured neither against *dropping the incumbent*.
 
 **(c) Divergence/hole distributions.** True-positive divergences observed:

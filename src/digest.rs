@@ -30,8 +30,9 @@ pub struct UnitDigest {
     /// any unit — plain or variant — can be a bucket representative).
     pub boilerplate_mass: u32,
     /// Floor-`bag_min_subtree_tokens` deduplicated subtree hashes, sorted ascending
-    /// (`RepData::bag_set`). The default substrate for the landmark rarity `df` map —
-    /// not a retrieval layer in its own right.
+    /// (`RepData::bag_set`). Not a retrieval layer in its own right — consumed by the
+    /// retrieval bake-off's comparison retrievers (`examples/bakeoff.rs`), not by the
+    /// production landmark retriever.
     pub bag_set: Vec<u128>,
     /// Near-tier verify substrate: subtree hash → (pre-order offsets, tree depths),
     /// sorted by hash (`RepData::offsets`).

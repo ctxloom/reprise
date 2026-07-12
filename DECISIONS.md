@@ -1227,3 +1227,52 @@ limit. A whole-unit skip only ever *removes* an inline-assisted candidate; it ca
 
 New stat **`inline_budget_skipped_units`** reports when the backstop fires, so it cannot fire silently
 (it currently fires on nothing). Spec §5.4 updated (PLAN.md Rev 10).
+
+---
+
+## D51 — The landmark rarity gate is DELETED, not tuned (2026-07-12)
+
+The landmark retriever (§5.5.4) gated which offset-sorted subtree peaks become constellation
+anchors on a document-frequency cap: `rare_cap = landmark_rare_floor.max(n_units /
+landmark_rare_divisor)` (historically `3.max(n/20)`), computed by default over `bag_set` rather
+than the `offsets` inventory the gate actually filters (the E5b defect: every 3-to-5-token subtree
+is absent from that `df` map, hits `unwrap_or(0)`, and is admitted as maximally rare regardless of
+its true frequency).
+
+**Measured, on real corpora (fs: 754,254 hashes; drivers/net):** the shipped gate is inert — it
+rejects 3 of 754,254 hashes on fs and has never rejected a subtree of ≥7 tokens. The derived cap
+sits 40–160× above the `df` distribution it gates (p99 of 3-token `df` is 46 on fs; the cap is
+~1,968). Fixing the E5b defect so the gate binds on the inventory it filters does not help: at
+every percentile tried, from the mildest (top 0.1%) up, it removes candidates and index rows but
+**zero junk groups** — every group it costs is a real, tight clone family (median divergence
+0.08–0.10), concentrated in units near the size floor (~46 median tokens: a unit that small has
+few peaks to begin with, so culling its common ones drops it below `shared_landmarks_min` and it
+stops being a candidate at all). `df` says nothing about whether the pair an anchor mints is real;
+no threshold on it can separate signal from noise.
+
+**DECISION: delete the gate outright, not tune it.** Every offset-sorted subtree peak is now
+admitted into the constellation. Deleted: the `df` map construction in `Landmark::candidates` (a
+754,254-entry `HashMap` per language, built solely to feed the gate), and the three config keys
+that existed only to parameterize it (`landmark_rare_floor`, `landmark_rare_divisor`,
+`landmark_rare_cap`, plus `landmark_df_over_offsets`, the E5b toggle). `landmark_fan_out` stays —
+it is the real memory/recall lever, orthogonal to rarity.
+
+**Measured effect of deletion, on real corpora:**
+
+| corpus | groups | candidates | landmark index | peak RSS |
+|---|---|---|---|---|
+| fs (linux/fs) | 6,484 → 6,484 (1 group absorbed into a larger family, net 0) | +3.1% | +0.6% | flat to slightly lower |
+| net (linux/drivers/net) | 28,743 → 28,747 (+4; every one of the 8 "lost" groups is a strict member-subset of a "gained" group — 100% absorption, zero true loss) | +3.4% | +0.7% | flat to slightly lower |
+
+Peak RSS does not regress — if anything it trends slightly down, because the deleted `df` `HashMap`
+had its own real cost that offset the modest growth in admitted candidates and index rows.
+
+**The architectural point.** Flood control belongs at the **candidate** level, where pairwise
+evidence exists to weigh a match — the §0.3 coverage-fraction gate already drops more candidates on
+fs than survive it, at zero measured recall cost, because it weighs a shared constellation against
+the size of the smaller unit. A rarity gate acts on **anchors**, before any pair exists to weigh:
+it destroys evidence pre-emptively rather than adjudicating it. That is why one mechanism is free
+and the other never was.
+
+Spec §5.5.4/§9 updated (PLAN.md); `docs/substantiality-metric.md` and `CALIBRATION.md` annotated
+where they described the gate as live.

@@ -252,46 +252,14 @@ pub struct RetrievalCfg {
     /// load. Matching-time only — hash-neutral, never in the extraction cache key.
     pub filters: Vec<String>,
 
-    // ── Landmark rarity / fan-out (§5.5.4) ──────────────────────────────────────
-    // These were HARD-CODED constants until the rarity-sweep WP (2026-07). They are the dominant lever on the landmark constellation index — the
-    // largest memory row in a big scan — and on landmark generation, which is 41–46% of
-    // near-phase wall. Defaults reproduce the historical hard-coded values EXACTLY, so
-    // the default path is byte-identical. Matching-time only — hash-neutral, never in
-    // the extraction cache key.
-    /// Floor of the derived rare cap: `landmark_rare_floor.max(n / landmark_rare_divisor)`,
-    /// unless `landmark_rare_cap` pins it outright. A subtree whose document frequency is
-    /// at or below the cap counts as a "rare peak" — the seed material for constellations.
-    ///
-    /// This is the **memory dial**. The derived cap is very permissive at scale (on a
-    /// 118k-unit corpus `n/20` = 6,526 — a subtree in 5% of all units still counts as
-    /// "rare"), which is what inflates the index. Tightening it shrinks the index roughly
-    /// linearly but **costs recall**: fewer landmarks ⇒ fewer candidates ⇒ missed clones.
-    /// A graceful-degradation dial, not a free win — see the sweep's recall curve.
-    pub landmark_rare_floor: u32,
-    /// Divisor in the derived rare cap. Larger ⇒ stricter rarity ⇒ smaller index.
-    /// 0 is rejected at load (it would divide by zero).
-    pub landmark_rare_divisor: u32,
-    /// Pin the rare cap to a fixed document frequency, ignoring corpus size (and hence
-    /// `landmark_rare_divisor`). `None` = derive it. A fixed cap makes index growth linear
-    /// in corpus size rather than super-linear, at a recall cost the sweep quantifies.
-    pub landmark_rare_cap: Option<u32>,
-    /// How many following rare peaks each rare peak is combinatorially paired with when
-    /// forming constellation hashes (Shazam-style fan-out). The index carries ~`fan_out`
-    /// hashes per admitted peak, so this scales index size almost linearly. 0 disables
-    /// landmark hashing (no pairs ⇒ no candidates).
+    /// How many following offset-sorted subtree peaks each peak is combinatorially
+    /// paired with when forming constellation hashes (Shazam-style fan-out). The index
+    /// carries ~`fan_out` hashes per peak, so this scales index size almost linearly.
+    /// 0 disables landmark hashing (no pairs ⇒ no candidates). The dominant lever on
+    /// the landmark constellation index — the largest memory row in a big scan — and
+    /// on landmark generation, which is 41–46% of near-phase wall. Matching-time only —
+    /// hash-neutral, never in the extraction cache key.
     pub landmark_fan_out: usize,
-    /// Build the rarity `df` map over the SAME inventory the rarity filter is applied to.
-    ///
-    /// **Default `false` preserves a known defect (E5b).** `df` is built from `bag_set`
-    /// (floor `thresholds.bag_min_subtree_tokens` = 6) but is used to filter `offsets`
-    /// (floor 3), so every 3-to-5-token subtree is ABSENT from `df` → `unwrap_or(0)` →
-    /// admitted as maximally rare however common it truly is. ~51% of admitted "rare
-    /// peaks" are never rarity-tested at all. `true` builds `df` over `offsets`, so the
-    /// gate means what its docs say.
-    ///
-    /// NOT a free bug-fix: it cuts ~11% of AU calls and ~13% of candidates but costs
-    /// ~1–2% of near groups. Left `false` pending a ruling on that trade.
-    pub landmark_df_over_offsets: bool,
 }
 
 impl Default for RetrievalCfg {
@@ -307,28 +275,8 @@ impl Default for RetrievalCfg {
                 "offset-histogram".into(),
                 "h-tree".into(),
             ],
-            // The historical hard-coded values: `rare_cap = 3.max(n / 20)`, `FAN_OUT = 3`,
-            // and `df` built over `bag_set` (the E5b defect, preserved by default).
-            landmark_rare_floor: 3,
-            landmark_rare_divisor: 20,
-            landmark_rare_cap: None,
             landmark_fan_out: 3,
-            landmark_df_over_offsets: false,
         }
-    }
-}
-
-impl RetrievalCfg {
-    /// The document-frequency ceiling for a "rare peak", for a partition of `n_units`.
-    /// `landmark_rare_cap` pins it; otherwise it is derived as
-    /// `landmark_rare_floor.max(n_units / landmark_rare_divisor)` — the historical
-    /// `3.max(n / 20)` under the default keys.
-    pub fn rare_cap(&self, n_units: usize) -> u32 {
-        if let Some(cap) = self.landmark_rare_cap {
-            return cap;
-        }
-        let divisor = self.landmark_rare_divisor.max(1);
-        self.landmark_rare_floor.max(n_units as u32 / divisor)
     }
 }
 
@@ -379,9 +327,8 @@ pub struct Thresholds {
     pub min_unit_tokens_ir: u32,
     pub min_seq_tokens: u32,
     /// Token floor for a subtree to enter `bag_set`. NOT a retrieval threshold: `bag_set`
-    /// is the default substrate for the landmark rarity `df` map, so this floor decides
-    /// which subtrees are rarity-tested at all (`retrieval.landmark_df_over_offsets`
-    /// documents the E5b defect this floor mismatch causes).
+    /// is not itself a candidate layer — it is a persisted `UnitDigest` field consumed by
+    /// the retrieval bake-off's comparison retrievers (`examples/bakeoff.rs`).
     pub bag_min_subtree_tokens: u32,
     /// **Not a retrieval threshold, and not read by the core at all.**
     ///
@@ -591,15 +538,6 @@ impl Config {
             .map_err(|e| anyhow::anyhow!("reprise.toml [report] fail_on: {e}"))?;
         crate::matchtree::validate_filters(&self.retrieval.filters)
             .map_err(|e| anyhow::anyhow!("reprise.toml [retrieval] filters: {e}"))?;
-        // A 0 divisor would divide by zero when deriving the rare cap. Reject it at load
-        // rather than silently clamping — a config that accepts a value it then ignores lies.
-        if self.retrieval.landmark_rare_divisor == 0 {
-            anyhow::bail!(
-                "reprise.toml [retrieval] landmark_rare_divisor: must be >= 1 \
-                 (it divides the unit count to derive the rare cap); \
-                 to pin the cap outright set `landmark_rare_cap` instead"
-            );
-        }
         // Enumerated string keys whose consumer silently treats an unknown value
         // as a fallthrough default. `tests.mode` is the load-bearing one: an
         // unknown value falls through lib.rs's partition catch-all and routes

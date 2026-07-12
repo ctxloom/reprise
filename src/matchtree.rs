@@ -2,9 +2,11 @@
 //! rivalry winner), offset-histogram verification, then anti-unification.
 //!
 //! Retrieval is the landmark retriever ALONE: **one candidate set, never a union.**
-//! `bag_set` is NOT a retrieval layer — it is the substrate the landmark rarity `df` map
-//! is built from (see `retrieval.landmark_df_over_offsets`) and a persisted `UnitDigest`
-//! field.
+//! `bag_set` is NOT a retrieval layer — it is a persisted `UnitDigest` field consumed
+//! by the retrieval bake-off's comparison retrievers (`examples/bakeoff.rs`), not by
+//! [`Landmark`] itself. Every offset-sorted subtree peak is admitted into the landmark
+//! constellation; there is no document-frequency gate on peaks (D51 — the historical
+//! rarity gate never bound in practice and is deleted, not tuned).
 //!
 //! Phase 3: inline-expanded variants
 //! (spec §5.4) enter retrieval alongside plain units; a verified pair
@@ -65,8 +67,7 @@ pub struct RetrievalStats {
     /// the true verify-survivor count, not the post-acceptance subset).
     pub verified_pairs: usize,
     /// Total constellation hashes across every unit — the landmark index's size, and the
-    /// largest memory row in a large scan. Directly governed by `retrieval.landmark_rare_*`
-    /// and `retrieval.landmark_fan_out`.
+    /// largest memory row in a large scan. Directly governed by `retrieval.landmark_fan_out`.
     pub landmark_index_size: usize,
 }
 
@@ -98,9 +99,9 @@ impl<'d> RepData<'d> {
         self.unit_idx
     }
     /// Floor-`bag_min_subtree_tokens` deduplicated subtree-hash set, sorted ascending.
-    /// The default substrate for the landmark rarity `df` map (see
-    /// `retrieval.landmark_df_over_offsets`), and available to any `Retriever` building
-    /// its own index. Not itself a retrieval layer.
+    /// Not consumed by [`Landmark`] (which reads `offsets` directly); available to any
+    /// `Retriever` building its own index, and to the bake-off's comparison retrievers.
+    /// Not itself a retrieval layer.
     pub fn bag_set(&self) -> &[u128] {
         &self.bag_set
     }
@@ -286,12 +287,10 @@ fn near_groups_for_lang(
     // retriever proposes the pairs.
     //
     // ONE candidate set. There is no second layer to union with: the retriever's output IS
-    // the candidate set. The failure mode a second bag-Jaccard layer would nominally guard
-    // against — a clone family so large its subtrees stop being rare, starving landmark's
-    // rarity gate — does not occur on any measured corpus.
+    // the candidate set.
     //
-    // `bag_set` is NOT a candidate layer: it is the substrate for the landmark rarity `df`
-    // map (see `Landmark::candidates`) and a persisted `UnitDigest` field.
+    // `bag_set` is NOT a candidate layer: it is a persisted `UnitDigest` field, consumed
+    // only by the retrieval bake-off's comparison retrievers, not by [`Landmark`].
     let mut candidates: BTreeSet<(usize, usize)> = BTreeSet::new();
     if cfg.retrieval.landmark_pairs {
         let retriever = select_retriever(&cfg.retrieval.retriever);
@@ -513,11 +512,20 @@ fn select_retriever(name: &str) -> Box<dyn Retriever> {
     }
 }
 
-/// The §5.5.4 rare-peak constellation retriever — the §7.4(b) rivalry winner and
-/// the default. Rare subtrees (low document frequency) are paired combinatorially
-/// with bucketed structural offsets into landmark hashes; two units are candidates
-/// when they share ≥ `shared_landmarks_min` landmarks and clear the §0.3
-/// coverage-fraction gate.
+/// The §5.5.4 constellation retriever — the §7.4(b) rivalry winner and the default.
+/// Offset-sorted subtree peaks are paired combinatorially with bucketed structural
+/// offsets into landmark hashes; two units are candidates when they share ≥
+/// `shared_landmarks_min` landmarks and clear the §0.3 coverage-fraction gate.
+///
+/// Every peak is admitted — there is no document-frequency gate here (D51). A prior
+/// rarity gate capped a peak's corpus document frequency before admission, but
+/// measurement showed it never bound in practice (it rejected 3 of 754,254 hashes on
+/// a real corpus) and could not be tuned into a useful one: making it bind removed
+/// real clone families (tight, low-divergence families of small units) at every
+/// threshold, with no precision benefit — `df` says nothing about whether the pair an
+/// anchor mints is real. Flood control belongs at the candidate level below (the
+/// coverage-fraction gate), where pairwise evidence exists to weigh a match; a rarity
+/// gate acts on anchors, before any pair can be weighed.
 pub struct Landmark;
 
 impl Retriever for Landmark {
@@ -531,60 +539,30 @@ impl Retriever for Landmark {
         cfg: &Config,
         stats: &mut RetrievalStats,
     ) -> Vec<(usize, usize)> {
-        // Landmark pairs (§5.5.4): rare subtrees (low document frequency) paired
-        // combinatorially with bucketed structural offsets. Built here from the
-        // shared substrate and owned by the retriever (not stored on RepData).
+        // Landmark pairs (§5.5.4): offset-sorted subtree peaks paired combinatorially
+        // with bucketed structural offsets. Built here from the shared substrate and
+        // owned by the retriever (not stored on RepData).
         //
-        // The rarity cap and the fan-out are CONFIG (`retrieval.landmark_*`), not constants:
-        // together they set the size of the constellation index, which is the largest memory
-        // row in a large scan and ~41–46% of near-phase wall. Defaults reproduce the former
-        // hard-coded `3.max(n/20)` / `FAN_OUT = 3` exactly.
-        let rc = &cfg.retrieval;
-        // `df` — the document-frequency map the rarity gate consults.
-        //
-        // Which inventory builds it is a REAL behavioral choice, not a detail (E5b):
-        //   - `bag_set` (default, `landmark_df_over_offsets = false`) has floor
-        //     `bag_min_subtree_tokens` (6), but the gate below filters `offsets` (floor 3).
-        //     Every 3-to-5-token subtree is therefore ABSENT from `df`, hits `unwrap_or(0)`,
-        //     and is admitted as maximally rare however common it truly is — ~51% of admitted
-        //     peaks are never rarity-tested at all. This is the historical behavior.
-        //   - `offsets` (`landmark_df_over_offsets = true`) builds `df` over the same
-        //     inventory it filters, so the gate means what §5.5.4 says it means. It cuts
-        //     ~11% of AU calls and ~13% of candidates but costs ~1–2% of near groups —
-        //     a trade, not a free fix. Default stays on the historical path pending a ruling.
-        let mut df: HashMap<u128, u32> = HashMap::new();
-        if rc.landmark_df_over_offsets {
-            for rep in reps {
-                for (h, _, _) in rep.offsets.iter() {
-                    *df.entry(*h).or_insert(0) += 1;
-                }
-            }
-        } else {
-            for rep in reps {
-                for h in rep.bag_set.iter() {
-                    *df.entry(*h).or_insert(0) += 1;
-                }
-            }
-        }
-        let rare_cap = rc.rare_cap(reps.len());
-        let fan_out = rc.landmark_fan_out;
+        // `fan_out` is CONFIG (`retrieval.landmark_fan_out`), not a constant: it sets the
+        // size of the constellation index, which is the largest memory row in a large
+        // scan and ~41–46% of near-phase wall.
+        let fan_out = cfg.retrieval.landmark_fan_out;
         let landmarks: Vec<Vec<u128>> = reps
             .par_iter()
             .map(|rep| {
-                let mut rare: Vec<(u32, u128)> = rep
+                let mut peaks: Vec<(u32, u128)> = rep
                     .offsets
                     .iter()
-                    .filter(|(h, _, _)| df.get(h).copied().unwrap_or(0) <= rare_cap)
                     .flat_map(|(h, offs, _)| offs.iter().map(move |o| (*o, *h)))
                     .collect();
-                rare.sort_unstable();
+                peaks.sort_unstable();
                 let mut lms = Vec::new();
-                for i in 0..rare.len() {
-                    for j in i + 1..(i + 1 + fan_out).min(rare.len()) {
-                        let delta = (rare[j].0 - rare[i].0) / 8;
+                for i in 0..peaks.len() {
+                    for j in i + 1..(i + 1 + fan_out).min(peaks.len()) {
+                        let delta = (peaks[j].0 - peaks[i].0) / 8;
                         let mut buf = Vec::with_capacity(36);
-                        buf.extend_from_slice(&rare[i].1.to_le_bytes());
-                        buf.extend_from_slice(&rare[j].1.to_le_bytes());
+                        buf.extend_from_slice(&peaks[i].1.to_le_bytes());
+                        buf.extend_from_slice(&peaks[j].1.to_le_bytes());
                         buf.extend_from_slice(&delta.to_le_bytes());
                         lms.push(xxhash_rust::xxh3::xxh3_128(&buf));
                     }

@@ -11,28 +11,112 @@ fn wild_root() -> PathBuf {
 }
 
 #[test]
-fn estimator_is_the_pinned_linear_model() {
+fn estimator_is_the_pinned_phase_max_model() {
     // The estimate is a pure, pinned function of (plain token sum, unit count,
-    // inline on/off): tokens × the validated per-token tree constant, times the
-    // measured variant inflation when the inliner will add variants, plus the
-    // RepData substrate term. No RSS sampling, no environment dependence.
+    // inline on/off, landmark fan-out). The peak is a MAX over two phases, not a
+    // single scalar — measured on fs/net/drivers (all three corpora, both gate
+    // regimes; see the constants' doc comments):
+    //
+    //   extraction phase: EXTRACT × tokens                     (no index yet)
+    //   near phase:       TREE × tokens + INDEX × fan_out × tokens
+    //
+    // plus the RepData substrate, times the variant inflation when inline runs.
+    // No RSS sampling, no environment dependence.
     let tokens = 10_000u64;
     let units = 40usize;
-    let base = memory::estimate_bytes(tokens, units, false);
+    let fan_out = 3usize;
+
+    let near = memory::PER_TOKEN_TREE_BYTES * tokens
+        + memory::PER_FANOUT_TOKEN_INDEX_BYTES * fan_out as u64 * tokens;
+    let extract = memory::PER_TOKEN_EXTRACT_BYTES * tokens;
+    let expected_base = near.max(extract) + units as u64 * memory::REPDATA_PER_UNIT_BYTES;
+
+    let base = memory::estimate_bytes(tokens, units, false, fan_out);
     assert_eq!(
-        base,
-        tokens * memory::PER_TOKEN_TREE_BYTES + units as u64 * memory::REPDATA_PER_UNIT_BYTES,
-        "inline-off estimate must be the bare linear model"
+        base, expected_base,
+        "inline-off estimate must be the phase-max model"
     );
-    let inflated = memory::estimate_bytes(tokens, units, true);
+
+    let inflated = memory::estimate_bytes(tokens, units, true, fan_out);
+    assert_eq!(
+        inflated,
+        (expected_base as f64 * memory::VARIANT_INFLATION).round() as u64,
+        "inflation factor drifted"
+    );
+
+    // THE POINT OF THE MODEL: the landmark index is the largest memory row in a
+    // large scan, and it scales with fan_out. The estimate MUST move when the dial
+    // moves — the old single-scalar model was blind to it (a fan_out=3 constant
+    // that never budged), which is exactly the defect this replaces.
+    let f4 = memory::estimate_bytes(tokens, units, false, 4);
     assert!(
-        inflated > base,
-        "inline-on must inflate the estimate (variants add ~49-55% tree mass)"
+        f4 > base,
+        "raising fan_out must raise the estimate — the index term is what makes \
+         the gate able to see the index at all"
     );
-    let expected = (base as f64 * memory::VARIANT_INFLATION).round() as u64;
-    assert_eq!(inflated, expected, "inflation factor drifted");
+    let f2 = memory::estimate_bytes(tokens, units, false, 2);
+    assert!(f2 < base, "lowering fan_out must lower the estimate");
+    // Linear in fan_out inside the near-bound regime: equal steps, equal deltas.
+    assert_eq!(
+        f4 - base,
+        base - f2,
+        "the index term must be linear in fan_out"
+    );
+    assert_eq!(
+        f4 - base,
+        memory::PER_FANOUT_TOKEN_INDEX_BYTES * tokens,
+        "per-fan_out step must be exactly the measured index coefficient"
+    );
+
+    // fan_out = 0 disables landmark hashing entirely (no pairs, no index): the
+    // estimate must fall back to the index-free extraction peak, NOT to a tree
+    // term that silently omits a phase.
+    assert_eq!(
+        memory::estimate_bytes(tokens, units, false, 0),
+        extract + units as u64 * memory::REPDATA_PER_UNIT_BYTES,
+        "fan_out=0 must be extraction-bound"
+    );
+
     // Degenerate corpus: zero estimate, never a panic.
-    assert_eq!(memory::estimate_bytes(0, 0, true), 0);
+    assert_eq!(memory::estimate_bytes(0, 0, true, 3), 0);
+}
+
+#[test]
+fn estimator_tracks_measured_peaks_on_the_calibration_corpora() {
+    // The constants are not taste — they are fits to measured VmHWM on fs, net and
+    // drivers (linux 7.1), captured with a fan_out sweep so the index term is
+    // separated from the tree term rather than fused into it. This test pins the
+    // model against those measurements: the estimate must be CONSERVATIVE (never
+    // under-predict a resident peak — under-prediction is an OOM, over-prediction is
+    // merely an unnecessary spill) and must stay within a sane band (a model that
+    // over-predicts by 2x would spill everything and is no better than the fused
+    // constant it replaced).
+    //
+    // Measured under JEMALLOC, the shipped global allocator (src/main.rs). Measuring
+    // from a harness that does not declare `#[global_allocator]` silently gets glibc
+    // malloc instead, which reads ~4% low here — enough to make the model appear
+    // conservative when it is in fact under-predicting. Re-measure with the real
+    // binary, never an ad-hoc example.
+    //
+    // Measured resident VmHWM at the default fan_out = 3 (bytes):
+    let cases = [
+        // (corpus, plain_tokens, plain_units, measured_resident_vmhwm)
+        ("fs", 4_268_773u64, 39_367usize, 2_273_840u64 * 1024),
+        ("net", 3_780_068, 38_324, 1_829_892 * 1024),
+    ];
+    for (name, tokens, units, measured) in cases {
+        let est = memory::estimate_bytes(tokens, units, true, 3);
+        assert!(
+            est >= measured,
+            "{name}: estimate {est} UNDER-predicts measured resident peak {measured} — \
+             the gate would stay resident and OOM"
+        );
+        let ratio = est as f64 / measured as f64;
+        assert!(
+            ratio < 1.25,
+            "{name}: estimate is {ratio:.2}x measured — too loose to be useful"
+        );
+    }
 }
 
 #[test]

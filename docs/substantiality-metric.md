@@ -4,6 +4,11 @@ status: substantiality-via-landmark-peaks = **NO-GO ×2** (§0 density, §0.2 an
   is semantic, token floors stay). BUT the investigation surfaced a real **pair-level** signal —
   **coverage-fraction (AUC 0.955)** as a match-shape filter, and confirmed the landmark layer is the near-tier
   recall engine (T1). Under pipeline validation (§0.2, A→B). Retained as the full landmark-investigation record.
+  **⚠ Stale mechanism reference (2026-07-12):** §2 and §0.3 describe peak selection as gated on
+  `df ≤ rare_cap` — that gate is deleted (DECISIONS.md D51: measured inert, and unable to remove junk
+  groups even fixed to bind). Every offset-sorted peak is now admitted; `rare_cap`/`df` no longer exist
+  in `src/matchtree.rs`. The coverage-fraction finding (§0.3) is unaffected — coverage is a pair-level
+  candidate filter, orthogonal to peak admission.
 sessions:
   - pulpy-wooly-list
 related:
@@ -521,7 +526,12 @@ Two structural faults:
    floor must admit *both* or *neither* — it forces a recall/precision either-or that has no good answer
    in the size domain.
 
-## 2. The foundation — reprise already selects rarity peaks (how the Shazam layer works)
+## 2. The foundation — reprise already selects rarity peaks (how the Shazam layer worked)
+
+**⚠ Historical.** This section describes the rarity-gated peak selection as it stood when this
+investigation ran. The gate (`df ≤ rare_cap`) is since deleted (DECISIONS.md D51) — every
+offset-sorted peak is now admitted, unconditionally. Read the rest of this section as the record of
+what was measured, not as current source.
 
 The novel gate is cheap because the signal already exists. In audio Shazam a *peak* is a local energy
 maximum in the spectrogram; reprise's analog (`src/matchtree.rs:143-176`):
