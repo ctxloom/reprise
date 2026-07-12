@@ -52,10 +52,16 @@ From source (Rust 2024 edition toolchain required):
 
 ```sh
 git clone https://github.com/ctxloom/reprise && cd reprise
-cargo build --release        # binary at target/release/reprise
-just install                 # install onto your PATH (cargo install --path .)
-just install-static          # fully static Linux binary (crt-static), then install
+cargo build --release        # all three binaries, under target/release/
+just install                 # the reprise CLI onto your PATH (cargo install --path .)
+just install-servers         # the MCP and LSP servers onto your PATH (optional)
+just install-static          # musl-static Linux CLI via cargo-zigbuild, then install
 ```
+
+The workspace builds three binaries. `reprise` is the CLI, and it is the whole
+tool — everything below works with nothing else installed. `reprise-mcp` and
+`reprise-lsp` are optional server front-ends that hand the same findings to a
+coding agent or an editor; see [The servers](#the-servers-mcp-and-lsp).
 
 crates.io publish is **coming soon** — the crate name was verified free as of
 2026-07-02 but nothing is published yet. Licensed under **BSD-3-Clause**.
@@ -276,6 +282,93 @@ its members drift through renames and whitespace edits, instead of churning
 closed-and-reopened on every cosmetic change. Set `[report] sarif_fingerprint =
 "line"` to fall back to GitHub's line-hash default.
 
+## The servers: MCP and LSP
+
+The CLI is one front-end over the reprise library. Two more ship in the same
+workspace: `reprise-mcp` puts reprise in front of a coding agent, and
+`reprise-lsp` puts it in front of a person in an editor. Both are thin
+projections over the library the CLI calls, both speak their protocol over
+stdio, and both are report-only. Neither reads a config of its own: they load
+`reprise.toml` from the scan root exactly as `reprise scan` does.
+
+Install with `just install-servers`, or one at a time:
+
+```sh
+cargo install --path crates/reprise-mcp --locked
+cargo install --path crates/reprise-lsp --locked
+```
+
+### `reprise-mcp` — the agent surface
+
+An MCP server on stdio, no arguments. Register it with any MCP client that can
+launch a local command:
+
+```json
+{
+  "mcpServers": {
+    "reprise": { "command": "reprise-mcp" }
+  }
+}
+```
+
+It exposes three tools. Each returns its result as JSON text. A failure inside a
+tool — a path that doesn't exist, a broken `reprise.toml`, a language reprise
+doesn't parse — comes back as a tool error carrying reprise's own message, not a
+protocol fault, so the model reads what went wrong and can fix its call.
+
+| Tool | Arguments | Returns |
+|---|---|---|
+| `reprise_scan` | `path` | The full `ScanReport` as JSON — the same model as `reprise scan --format json`: clone groups with per-member `file:line`, tier, similarity, and the anti-unification template. |
+| `reprise_check` | `path`, `base` (optional) | The `CheckReport` as JSON: the `inconsistent-update` findings, the untouched members by name, and each group's divergence trend. |
+| `reprise_find_similar` | `path`, `snippet`, `lang` | Ranked existing units that the snippet duplicates. |
+
+`reprise_check` resolves its base ref when `base` is omitted, in this order: the
+pinned `[baseline] ref` from `reprise.toml`, then the merge-base of `HEAD` with
+the repo's default branch, then `HEAD`. It always resolves to something, so an
+agent's call never fails on baseline resolution alone. The CLI is stricter — bare
+`reprise check .` with no `--base` and no pinned ref is an error rather than a
+guess.
+
+`reprise_find_similar` is the one to reach for while writing code, and it answers
+the question the whole tool exists for: does this helper already exist? Pass a
+complete function or method as `snippet` (if it contains several, the largest is
+the candidate) and its language as `lang`, which takes a name or a file extension
+— `rust`/`rs`, `python`/`py`, `typescript`/`ts`, `tsx`, `go`, `kotlin`/`kt`/`kts`,
+`c`/`h`. The snippet is normalized like any other unit and matched against every
+same-language unit in the repo. Each match reports the existing unit's `file`,
+`name`, and `line_span`; a `kind` of `exact` (identical once renames, literals,
+and loop form are normalized away) or `near` (anti-unified within reprise's clone
+thresholds); the `similarity` and `divergence`; the hole count; and, for near
+matches, the shared template. Exact matches sort first, then ascending
+divergence, capped at 20. Nothing is written: the agent decides whether to call
+the unit it just found.
+
+### `reprise-lsp` — the editor surface
+
+A language server on stdio, no arguments. Point your editor's LSP client at the
+`reprise-lsp` binary with the repository as the workspace root.
+
+It scans the workspace once the client finishes initializing, and rescans on
+save. Every member of every clone group becomes one diagnostic at its own
+location, at **Information** severity — this is advice about a design smell, and
+it is not an error. The tier (`near-normalized`, `exact-normalized`, …) is the
+diagnostic's `code`, `reprise` is its `source`, and the message names how many
+members the group has and how similar they are.
+
+The part worth having an editor for is `relatedInformation`. Each diagnostic
+carries the group's *other* members as related locations, so the editor's
+jump-to-related command walks you from the copy under your cursor to the copies
+elsewhere in the repo, across files. A clone group is one finding at N locations,
+and the diagnostic keeps that shape. The `data` field carries the group id and
+the structural fingerprint, which survives renames and whitespace edits, so an
+alert stays the same alert as its members drift.
+
+Diagnostics are cleared for a file once a rescan no longer finds anything in it.
+The server advertises text-document sync and nothing else: no hover, no
+completion, no code actions yet.
+
+Design and rationale for both: [`docs/SERVERS.md`](docs/SERVERS.md).
+
 ## Headline calibration numbers
 
 Full measured evidence, per phase, is in [`CALIBRATION.md`](CALIBRATION.md).
@@ -427,7 +520,8 @@ the cover-song lesson. After normalization, align with tolerance.
 Everything runs through [`just`](https://github.com/casey/just):
 
 ```sh
-just test             # cargo test --all-targets (127 tests)
+just build            # the whole workspace: CLI + both servers
+just test             # cargo test --workspace --all-targets
 just lint             # clippy -D warnings + cargo fmt --check
 just bench-mutations  # the mutation-recall gate (spec §7.1)
 just scan-self        # dogfood: scan reprise's own repo
@@ -448,7 +542,12 @@ commits has no `HEAD` — commit first, then `check` works.
 
 ## Repository map
 
+- `src/` — the `reprise` library and CLI.
+- `crates/reprise-mcp/` — the MCP server (the agent surface).
+- `crates/reprise-lsp/` — the LSP server (the editor surface).
+- `crates/reprise-server-core/` — the protocol-neutral projection both servers share.
 - [`docs/PLAN.md`](docs/PLAN.md) — the authoritative design spec (Rev 9).
+- [`docs/SERVERS.md`](docs/SERVERS.md) — the design behind the two server surfaces.
 - [`docs/CONFIG.md`](docs/CONFIG.md) — every `reprise.toml` key, defaults, and drift from the spec.
 - [`DECISIONS.md`](DECISIONS.md) — every deviation from the spec, with rationale.
 - [`CALIBRATION.md`](CALIBRATION.md) — measured recall/precision/performance, per phase.

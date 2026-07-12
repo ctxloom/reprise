@@ -1,10 +1,11 @@
-//! Base-state snapshots (D40: the persistent baseline is a git REF, never a
-//! tracked file — this module is the internal serialization for check's
-//! transient base-state cache). All current
-//! findings, keyed by their stable structural/template fingerprints (§6.1),
-//! written to a checked-in `reprise-baseline.json`. Subsequent `check` runs
-//! fail only on findings not in the baseline or worsened since it — but
-//! baselined groups are STILL tracked for inconsistent updates (§6).
+//! Base-state snapshots: the internal serialization of `check`'s transient
+//! base-state cache. The persistent baseline is a git REF, never a tracked file
+//! (D40) — no `reprise-baseline.json`, no baseline artifact in VCS. `check`
+//! scans the base ref itself, records every finding keyed by its stable
+//! structural/template fingerprint (§6.1), and caches that snapshot under
+//! `.reprise/base-state/`, keyed by commit. A current finding fails only when it
+//! is absent from the base state or worsened since it; groups present in the
+//! base state are STILL tracked for inconsistent updates (§6).
 
 use crate::report::{Group, ScanReport};
 use anyhow::Context;
@@ -33,7 +34,8 @@ pub struct BaselineEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BaselineMember {
-    /// Root-relative path with `/` separators (the file is checked in).
+    /// Root-relative path with `/` separators — stable across checkouts, so a
+    /// snapshot stays comparable wherever the base ref is scanned.
     pub file: String,
     pub name: String,
     pub line_span: (u32, u32),

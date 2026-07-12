@@ -2,15 +2,15 @@
 
 reprise runs with **zero configuration** — every key below has a default and the
 tool works with no `reprise.toml` present. A `reprise.toml` at the scan root
-(the `<path>` you pass to `scan`/`check`/`baseline`) overrides individual keys;
-unknown keys are ignored, missing keys fall back to the default.
+(the `<path>` you pass to `scan`/`check`) overrides individual keys; unknown keys
+are ignored, missing keys fall back to the default.
 
 This document walks the **actual implemented config surface** (`src/config.rs`),
 which has drifted from the spec's `docs/PLAN.md` §9 in the ways called out below.
 Where a default differs from the spec, the governing `DECISIONS.md` entry is
 cited. The load path validates `[report] fail_on` at load time (a typo fails
-`scan`/`check`/`baseline` immediately with the valid-tier list, rather than only
-surfacing in CI — D31).
+`scan`/`check` immediately with the valid-tier list, rather than only surfacing
+in CI — D31).
 
 ## What drifted from spec §9
 
@@ -20,8 +20,10 @@ surfacing in CI — D31).
 | `[api_profile] api_profile_sim` 0.8 → **0.5** | §7.4(d) sweep: the rare-callee floor (not sim) carries precision at function granularity | D29 |
 | `[thresholds] hole_hash_min_cover` | **dead-but-accepted** — hole-context hashes were deleted (lost the retrieval rivalry); key retained for config compatibility, reading it changes nothing | D16 |
 | new `[retrieval]` section | `landmark_pairs`, `shared_landmarks_min`, `owner_pair_window` — tuning constants promoted to config so they can't hide behind rebuilds | D27 |
-| new `[normalize]` section | `literal_keep` — spec §5.2.5 keep-list, not tabulated in §9 | — |
+| new `[normalize]` section | `literal_keep` — spec §5.2.5 keep-list, not tabulated in §9 — plus `normalizer`, the IR/historical selector (`"ir"` is the default since the §8 switchover) | — |
+| new `_ir` threshold twins | `min_unit_tokens_ir`, `histogram_min_votes_ir` — the IR trees are ~18% more compact, so the size and vote floors are per-normalizer | — |
 | new `[cache]` section | `enabled` — on-disk index toggle | D19 |
+| new `[memory]` section | `budget_fraction`, `budget_bytes`, `force_gate`, `pack_dir` — the post-extraction spill gate; performance-only, never changes output | — |
 | `[scan] generated_paths` | spec §5.1 names these globs; §9's table only listed `generated_markers` | — |
 
 ---
@@ -57,24 +59,28 @@ tree (D1).
 | `bag_min_subtree_tokens` | int | `6` | Subtree-hash-bag floor: subtrees smaller than this don't enter the retrieval bag. |
 | `candidate_sim` | float | `0.70` | Bag-Jaccard retrieval threshold (estimated) for near-miss candidate pairs. |
 | `hole_hash_min_cover` | float | `0.5` | **Dead-but-accepted** (D16). Was the template/pair fingerprint retrieval threshold for hole-context hashes; that layer lost the retrieval rivalry and was deleted. The key is still parsed for config compatibility but has no effect. |
-| `histogram_min_votes` | int | `5` | Offset-histogram diagonal acceptance: minimum aligned-fingerprint votes for a candidate to reach anti-unification. The effective threshold scales up with unit size — `max(histogram_min_votes, min_inventory/8)` (D22). |
+| `histogram_min_votes` | int | `5` | Offset-histogram diagonal acceptance: minimum aligned-fingerprint votes for a candidate to reach anti-unification. The effective threshold scales up with unit size — `max(histogram_min_votes, min_inventory/8)` (D22). Applies to the historical normalizer. |
+| `histogram_min_votes_ir` | int | `4` | Same vote floor for `[normalize] normalizer = "ir"`, and the same compaction story as `min_unit_tokens_ir`: the more compact IR trees offer proportionally fewer shared subtrees to vote a diagonal, so the historical 5-vote bar rejects real IR-path pairs before anti-unification. `5 × 0.815 ≈ 4`. `Config::histogram_min_votes()` selects between the two by the active normalizer. |
 | `max_divergence` | float | `0.18` | Anti-unification acceptance: `(|σ1|+|σ2|)/(2·|T|)` must be ≤ this. Reported similarity = `1 − divergence`. **Raised from the spec's 0.15** (D13). |
 | `max_holes` | int | `5` | AU acceptance: max factorable holes before a pair is demoted to `weak-similarity`. Consistent local↔local renames and synthetic lowering machinery are zero-cost and don't count against this budget (D14). |
 | `fold_min_repeats` | int | `3` | Minimum consecutive matching sibling subtrees to fold into a `REPEAT` node (sibling-run folding, spec §5.3). |
 
 ## `[normalize]`
 
-Not tabulated in spec §9; implements the §5.2.5 literal keep-list.
+Not tabulated in spec §9; implements the §5.2.5 literal keep-list and selects the
+normalizer.
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `literal_keep` | list of strings | `["0", "1", "-1", ""]` | Literals whose identity is structural and are **not** abstracted to typed buckets. String literals compare by inner content, numeric literals by text. |
+| `normalizer` | string | `"ir"` | Which normalizer produces the canonical tree fed to matching. `"ir"` is the `src/frontend` + `src/ir` canonical IR — **the default** since the §8 switchover. `"historical"` is the per-language `src/lang` profile path, still supported and selectable. A **bounded** selector, unlike `[retrieval] retriever`: an unknown value (a typo like `"irr"`) fails at config load, so it can never silently fall through to the historical path. Languages without an IR frontend (TypeScript, Kotlin) fall back to the historical path even under `"ir"`. The IR trees are ~18% more compact, which is why the size and vote floors have per-normalizer `_ir` twins. This value enters the extraction cache key. |
 
 ## `[report]`
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `top` | int | `20` | Number of groups shown in terminal output. `0` shows all. The `--top` CLI flag overrides this. |
+| `micro_region_tokens` | int | `60` | Substantiality line for `exact-region` findings. Regions below it are "micro": still reported and still ranked — this filters nothing — but the summary counts substantial regions separately (`exact-region: N substantial of M`), so the headline number reflects what the ranking values. |
 | `fail_on` | string | `"exact-normalized"` | Minimum tier that fails `check` (CI gate). Valid: `inconsistent-update`, `exact-normalized`, `internal-repeat`, `exact-region`, `near-normalized`, `inline-assisted`, or `none` (disables the gate). `api-profile` and `weak-similarity` **never** fail CI regardless. The `--fail-on` CLI flag overrides this. Validated at config load (D31). |
 | `sarif_fingerprint` | string | `"structural"` | Source of SARIF `partialFingerprints` (D28). `"structural"` sets a stable structural/template-hash key so a code-scanning alert survives cosmetic drift (recommended). `"line"` omits our key so GitHub falls back to `primaryLocationLineHash` (churns on every edit). |
 
@@ -139,6 +145,27 @@ New section (D19) — the version-keyed on-disk index under `.reprise/cache/`.
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `enabled` | bool | `true` | Enable the per-file cache (spec §4). The cache key includes the fingerprint-scheme version, crate version, grammar versions, and extraction-relevant config, so a tool/grammar upgrade invalidates it automatically. Set `false` to force cold scans (perf comparison). The cache directory writes its own `.gitignore` (`*`), so scanned repos need no `.gitignore` edit. |
+
+## `[memory]`
+
+The post-extraction memory gate (`src/memory.rs`). Right after extraction reprise
+estimates the scan's resident bytes from exact unit/token counts, once, and
+decides: under budget, normalized trees stay in memory and the scan pays nothing
+extra; over budget, trees and sequence streams spill to a scan-scoped pack and
+near-tier verification materializes pairs through an LRU. **The gate changes
+performance, never output** — the same corpus reports the same findings on either
+side of it. It trips at 70% of the budget, so the headroom absorbs the
+estimator's known undercounts.
+
+Most scans never need this section. Reach for it on very large corpora, or when a
+scan must behave identically across machines.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `budget_fraction` | float | `0.5` | Fraction of detected system RAM to budget for the scan. Used whenever `budget_bytes` is unset. |
+| `budget_bytes` | int (optional) | *(none)* | Explicit budget in bytes. Outranks `budget_fraction`. Pin it when the gate decision must be reproducible across machines — a fraction of RAM is a different number on every host. |
+| `force_gate` | string | `"auto"` | `auto` gates on the estimate; `always` forces the spill path; `never` forces the resident path. The `REPRISE_MEMORY_FORCE_GATE` env var outranks this key. |
+| `pack_dir` | string (optional) | *(none)* | Directory for the spill pack's backing files, overriding the default `<scan root>/.reprise/tmp/`. Point it at real disk when the scan root sits on a small or RAM-backed volume: spilling onto tmpfs still occupies RAM, which defeats the spill, and can exhaust a small tmpfs outright on a large scan. |
 
 ---
 

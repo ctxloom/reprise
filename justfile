@@ -77,9 +77,16 @@ corpus-fetch:
 scan-self:
     cargo run --release -- scan .
 
-# Install onto PATH from this checkout.
+# Install the reprise CLI onto PATH from this checkout.
 install:
     cargo install --path . --locked
+
+# Install the two optional servers onto PATH: reprise-mcp (agent surface) and
+# reprise-lsp (editor surface). The CLI needs neither; both are thin projections
+# over the same library it calls.
+install-servers:
+    cargo install --path crates/reprise-mcp --locked
+    cargo install --path crates/reprise-lsp --locked
 
 # Portable Linux binary: musl-static via cargo-zigbuild. This is the SHIPPABLE
 # build. zig supplies the musl C toolchain the tree-sitter grammars need, so the
