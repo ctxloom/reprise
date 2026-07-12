@@ -577,13 +577,16 @@ impl Retriever for Landmark {
                     }
                 }
                 // shared_count_pairs expects sorted, deduplicated hash lists.
+                // The dedup is load-bearing, not hygiene: it is what makes
+                // `(hash, owner)` globally unique, which is what lets the join
+                // stream a range-partitioned group-by instead of materializing and
+                // re-sorting every occurrence. Do not remove.
                 lms.sort_unstable();
                 lms.dedup();
                 lms
             })
             .collect();
 
-        let df_cap = 50usize;
         let window = cfg.retrieval.owner_pair_window;
         // ≥4 shared pair hashes (was 2): the Phase-2 watch item fired at
         // 500k LOC — shared-2 admitted ~30x more candidates than survive
@@ -601,9 +604,7 @@ impl Retriever for Landmark {
         stats.landmark_index_size += landmarks.iter().map(Vec::len).sum::<usize>();
         stats.landmark_admitted_peaks += admitted_peaks.load(std::sync::atomic::Ordering::Relaxed);
         let mut out = Vec::new();
-        for ((i, j), shared) in
-            shared_count_pairs(landmarks.len(), |k| landmarks[k].as_slice(), df_cap, window)
-        {
+        for ((i, j), shared) in shared_count_pairs(&landmarks, window) {
             if shared < shared_landmarks_min {
                 continue;
             }
@@ -671,67 +672,146 @@ fn intersect_count(a: &[u128], b: &[u128]) -> usize {
     n
 }
 
-/// Shared-hash counts for all pairs (skip hashes with df > cap). Fully
-/// sort-based (M3b/D22): at 500k-LOC scale the landmark index holds ~10⁷
-/// hashes, and both a HashMap-of-owner-lists index and a map per pair event
-/// dominated the scan. `hashes(i)` returns unit `i`'s already-sorted,
-/// deduplicated hash list — indexed rather than keyed on `RepData` so any layer
-/// (bag substrate, retriever-owned landmark index, …) can drive the same join.
-fn shared_count_pairs<'a, F>(
-    n: usize,
-    hashes: F,
-    df_cap: usize,
+/// A hash owned by more than this many units is boilerplate, not signal: it is
+/// skipped rather than exploded into a clique. Was a parameter; the bag layer that
+/// passed the other value is deleted, so it is a constant.
+const DF_CAP: usize = 50;
+
+/// Shared-hash counts for all pairs (skipping hashes owned by more than `DF_CAP`
+/// units). Sort-based (M3b/D22): at 500k-LOC scale the landmark index holds ~10⁸
+/// hash occurrences, and both a HashMap-of-owner-lists index and a map per pair
+/// event dominated the scan.
+///
+/// The join never materializes those occurrences. The obvious shape — push every
+/// `(hash, owner)` into one `Vec<(u128, u32)>`, sort it, walk the runs — cost 3.375
+/// GB at `drivers` (105.5M × 32 B; note `(u128, u32)` is **32 B**, not 20 —
+/// `u128`'s 16-byte alignment makes 12 B of every entry pure padding), and it was
+/// **a re-sort of data that is already sorted**: each `landmarks[i]` arrives sorted
+/// and deduplicated. So we range-partition instead, and the big array never exists.
+///
+/// Why this is bit-identical to the sort-everything version, not merely close:
+///
+/// 1. Each unit's list is **deduplicated**, so an owner occurs at most once per
+///    hash ⇒ every `(hash, owner)` key is **globally unique** ⇒ the ordering is a
+///    strict total order, and the sort's output is uniquely determined (stability
+///    cannot matter — there are no ties to break).
+/// 2. `counts` is `sort(events)` followed by an adjacent-coalesce, so it is a
+///    function of the **multiset** of events alone — the order in which hashes are
+///    visited is not observable in the result.
+/// 3. That multiset is fixed by each hash's ascending owner list, and the partition
+///    key is a pure function of the hash, so **every occurrence of a hash lands in
+///    exactly one partition**: no owner list is ever split, and each is assembled
+///    complete.
+///
+/// Hence any partitioning of the hash space yields the identical event multiset and
+/// therefore the identical `counts`. Verified byte-identical (SARIF `cmp` +
+/// stats-stripped JSON) on `self`, `fs`, and `linux/drivers/net`, and pinned by
+/// `partitioned_join_matches_monolithic_sort`.
+fn shared_count_pairs(
+    landmarks: &[Vec<u128>],
     owner_pair_window: usize,
-) -> Vec<((usize, usize), usize)>
-where
-    F: Fn(usize) -> &'a [u128],
-{
-    let total: usize = (0..n).map(|i| hashes(i).len()).sum();
-    let mut entries: Vec<(u128, u32)> = Vec::with_capacity(total);
-    for i in 0..n {
-        debug_assert!(hashes(i).is_sorted());
-        for &h in hashes(i) {
-            entries.push((h, i as u32));
-        }
-    }
-    entries.par_sort_unstable();
+) -> Vec<((usize, usize), usize)> {
+    // Partition the hash space by high bits. Landmarks are xxh3_128 digests, so they
+    // are uniform and a top-bits split is even; `TARGET` then bounds the working
+    // buffer regardless of corpus size (drivers: 105.5M occurrences → 32 partitions
+    // → ~3.3M entries ≈ 106 MB resident, against 3.375 GB before).
+    const TARGET: usize = 4 << 20;
+    let total: usize = landmarks.iter().map(Vec::len).sum();
+    let parts = (total / TARGET).max(1).next_power_of_two();
+    shared_count_pairs_partitioned(landmarks, owner_pair_window, parts)
+}
+
+/// `shared_count_pairs` with the partition count pinned. `parts` is a pure
+/// space/time knob and **must not be observable in the result** — that is the whole
+/// claim, and `partitioned_join_matches_monolithic_sort` holds it down by sweeping
+/// `parts` against a reference monolithic sort.
+fn shared_count_pairs_partitioned(
+    landmarks: &[Vec<u128>],
+    owner_pair_window: usize,
+    parts: usize,
+) -> Vec<((usize, usize), usize)> {
+    debug_assert!(parts.is_power_of_two());
+    let n = landmarks.len();
+    // Because the key is monotone in the hash and each list is sorted, a unit's
+    // contribution to a partition is a **contiguous slice** of its list — found by
+    // binary search, so partitions are both memory-bounded and independently walkable.
+    let shift = 128 - parts.trailing_zeros();
+    // `parts == 1` ⇒ `shift == 128`, which would overflow the shift; `checked_shr`
+    // folds that case to the single partition 0.
+    let key = |h: u128| -> usize { h.checked_shr(shift).unwrap_or(0) as usize };
 
     let mut events: Vec<(u32, u32)> = Vec::new();
-    let mut run_start = 0usize;
-    for k in 0..=entries.len() {
-        if k < entries.len() && entries[k].0 == entries[run_start].0 {
-            continue;
-        }
-        // Owners of one hash, ascending (entries sort by (hash, owner)).
-        let owners: Vec<u32> = entries[run_start..k].iter().map(|e| e.1).collect();
-        run_start = k;
-        if owners.len() < 2 || owners.len() > df_cap {
-            continue;
-        }
-        // Full clique for small owner sets; a sliding window for common
-        // hashes: grouping is transitive via union-find, so adjacent-owner
-        // chains connect a large clone family without paying O(owners²)
-        // events per hash. Owner order is unit order (file-sorted), so
-        // windows are deterministic.
-        let window = if owner_pair_window == 0 {
-            usize::MAX
-        } else {
-            owner_pair_window
-        };
-        if owner_pair_window == 0 || owners.len() <= 8 {
-            for x in 0..owners.len() {
-                for y in x + 1..owners.len() {
-                    events.push((owners[x], owners[y]));
-                }
+    let mut cursors: Vec<usize> = vec![0; n];
+    let mut buf: Vec<(u128, u32)> = Vec::new();
+
+    for p in 0..parts {
+        // End of each unit's slice for this partition. The list is sorted and the key
+        // is monotone in the hash, so everything below the cursor is already consumed.
+        let ends: Vec<usize> = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let s = &landmarks[i];
+                debug_assert!(s.is_sorted());
+                let c = cursors[i];
+                c + s[c..].partition_point(|&h| key(h) <= p)
+            })
+            .collect();
+
+        let want: usize = (0..n).map(|i| ends[i] - cursors[i]).sum();
+        buf.clear();
+        // `reserve_exact`, not `reserve`: plain `reserve` grows amortized (doubling),
+        // which measured a 6.53M-entry capacity against a 3.32M-entry high-water at
+        // drivers — 0.10 GiB of slack for nothing. `buf` is empty here, so this asks
+        // for exactly `want` and is a no-op once the buffer has seen a partition that
+        // big. Reallocation is bounded by `parts`, not by occurrences.
+        buf.reserve_exact(want);
+        for i in 0..n {
+            for &h in &landmarks[i][cursors[i]..ends[i]] {
+                buf.push((h, i as u32));
             }
-        } else {
-            for x in 0..owners.len() {
-                for y in x + 1..(x + 1).saturating_add(window).min(owners.len()) {
-                    events.push((owners[x], owners[y]));
+        }
+        cursors = ends;
+        buf.par_sort_unstable();
+
+        let mut run_start = 0usize;
+        for k in 0..=buf.len() {
+            if k < buf.len() && buf[k].0 == buf[run_start].0 {
+                continue;
+            }
+            // Owners of one hash, ascending (buf sorts by (hash, owner)).
+            let owners: Vec<u32> = buf[run_start..k].iter().map(|e| e.1).collect();
+            run_start = k;
+            if owners.len() < 2 || owners.len() > DF_CAP {
+                continue;
+            }
+            // Full clique for small owner sets; a sliding window for common
+            // hashes: grouping is transitive via union-find, so adjacent-owner
+            // chains connect a large clone family without paying O(owners²)
+            // events per hash. Owner order is unit order (file-sorted), so
+            // windows are deterministic.
+            let window = if owner_pair_window == 0 {
+                usize::MAX
+            } else {
+                owner_pair_window
+            };
+            if owner_pair_window == 0 || owners.len() <= 8 {
+                for x in 0..owners.len() {
+                    for y in x + 1..owners.len() {
+                        events.push((owners[x], owners[y]));
+                    }
+                }
+            } else {
+                for x in 0..owners.len() {
+                    for y in x + 1..(x + 1).saturating_add(window).min(owners.len()) {
+                        events.push((owners[x], owners[y]));
+                    }
                 }
             }
         }
     }
+    drop(buf);
+    drop(cursors);
+
     events.par_sort_unstable();
     let mut counts: Vec<((usize, usize), usize)> = Vec::new();
     for pair in events {
@@ -1107,5 +1187,155 @@ mod tests {
         let names: Vec<&str> = active_filters(&cfg).iter().map(|(n, _)| *n).collect();
         // `coverage` is dispatched to the retriever phase, not the verify cascade.
         assert_eq!(names, vec!["offset-histogram", "h-tree"]);
+    }
+
+    /// The join `shared_count_pairs` replaced: materialize every `(hash, owner)`
+    /// occurrence into one array, sort it, walk the runs. This is the 3.375 GB
+    /// row at `drivers` — kept here, and ONLY here, as the reference oracle that
+    /// pins the streaming version's output.
+    fn monolithic_reference(
+        landmarks: &[Vec<u128>],
+        owner_pair_window: usize,
+    ) -> Vec<((usize, usize), usize)> {
+        let n = landmarks.len();
+        let total: usize = landmarks.iter().map(Vec::len).sum();
+        let mut entries: Vec<(u128, u32)> = Vec::with_capacity(total);
+        for (i, lm) in landmarks.iter().enumerate() {
+            for &h in lm {
+                entries.push((h, i as u32));
+            }
+        }
+        entries.sort_unstable();
+
+        let mut events: Vec<(u32, u32)> = Vec::new();
+        let mut run_start = 0usize;
+        for k in 0..=entries.len() {
+            if k < entries.len() && entries[k].0 == entries[run_start].0 {
+                continue;
+            }
+            let owners: Vec<u32> = entries[run_start..k].iter().map(|e| e.1).collect();
+            run_start = k;
+            if owners.len() < 2 || owners.len() > DF_CAP {
+                continue;
+            }
+            let window = if owner_pair_window == 0 {
+                usize::MAX
+            } else {
+                owner_pair_window
+            };
+            if owner_pair_window == 0 || owners.len() <= 8 {
+                for x in 0..owners.len() {
+                    for y in x + 1..owners.len() {
+                        events.push((owners[x], owners[y]));
+                    }
+                }
+            } else {
+                for x in 0..owners.len() {
+                    for y in x + 1..(x + 1).saturating_add(window).min(owners.len()) {
+                        events.push((owners[x], owners[y]));
+                    }
+                }
+            }
+        }
+        events.sort_unstable();
+        let mut counts: Vec<((usize, usize), usize)> = Vec::new();
+        for pair in events {
+            match counts.last_mut() {
+                Some((last, c)) if *last == (pair.0 as usize, pair.1 as usize) => *c += 1,
+                _ => counts.push(((pair.0 as usize, pair.1 as usize), 1)),
+            }
+        }
+        let _ = n;
+        counts
+    }
+
+    /// A landmark index shaped like a real one (`fs`: ~226 hashes/unit, a long tail
+    /// of unique hashes over a core of shared ones), scaled down for test runtime.
+    /// Deliberately exercises every owner-count class the join branches on:
+    /// singleton (skipped), 2–8 owners (full clique), >8 (sliding window), and
+    /// >`DF_CAP` (skipped as boilerplate).
+    fn fixture() -> Vec<Vec<u128>> {
+        // SplitMix64 — deterministic, no dev-dependency.
+        let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut rng = move || {
+            s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = s;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        const UNITS: usize = 300;
+        const HASHES: usize = 9_000;
+        let mut lms: Vec<Vec<u128>> = vec![Vec::new(); UNITS];
+        for h in 0..HASHES {
+            // A real hash: full 128 bits, so the top-bits partition key is uniform.
+            let hash = (u128::from(rng()) << 64) | u128::from(rng());
+            let owners = match h % 17 {
+                0 => 60,                   // > DF_CAP  → skipped
+                3 | 10 => 12,              // > 8       → window path
+                5 | 8 | 13 => 2 + (h % 7), // 2..=8     → full clique
+                _ => 1,                    // singleton → skipped
+            };
+            for _ in 0..owners {
+                lms[(rng() as usize) % UNITS].push(hash);
+            }
+        }
+        // The production precondition: each list sorted and deduplicated.
+        for lm in &mut lms {
+            lm.sort_unstable();
+            lm.dedup();
+        }
+        lms
+    }
+
+    #[test]
+    fn partitioned_join_matches_monolithic_sort() {
+        // THE claim behind deleting the 3.375 GB `entries` array: the partition count
+        // is a pure space/time knob, invisible in the output. It holds because each
+        // per-unit list is deduplicated (so `(hash, owner)` is globally unique — a
+        // strict total order, no ties for an unstable sort to reorder) and because
+        // `counts` is an adjacent-coalesce over globally sorted events (so it depends
+        // on the event MULTISET alone, not on visit order). If either premise ever
+        // breaks, this test fails before a scan silently changes its findings.
+        let lms = fixture();
+        let occurrences: usize = lms.iter().map(Vec::len).sum();
+        assert!(occurrences > 20_000, "fixture too thin: {occurrences}");
+
+        for &window in &[0usize, 4, 8] {
+            let want = monolithic_reference(&lms, window);
+            assert!(
+                !want.is_empty(),
+                "fixture produced no pairs at window={window}"
+            );
+            // parts=1 is the monolithic shape; 64 splits the fixture ~140 ways per
+            // partition. Every one must agree, byte for byte.
+            for &parts in &[1usize, 2, 4, 8, 16, 64] {
+                let got = shared_count_pairs_partitioned(&lms, window, parts);
+                assert_eq!(
+                    got, want,
+                    "partition count is observable in the output \
+                     (window={window}, parts={parts}) — the total-order argument is broken"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn partitioning_splits_the_hash_space_it_is_given() {
+        // Guards the test above from going vacuous: if every hash landed in partition
+        // 0, the sweep would prove nothing. Assert the fixture genuinely spans them.
+        let lms = fixture();
+        let parts = 64usize;
+        let shift = 128 - parts.trailing_zeros();
+        let mut seen = vec![false; parts];
+        for lm in &lms {
+            for &h in lm {
+                seen[(h >> shift) as usize] = true;
+            }
+        }
+        assert!(
+            seen.iter().all(|&b| b),
+            "fixture does not reach every partition — the sweep would be vacuous"
+        );
     }
 }
