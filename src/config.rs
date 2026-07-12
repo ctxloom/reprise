@@ -191,7 +191,9 @@ impl Default for TestsCfg {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct RetrievalCfg {
-    /// Which candidate-generation retriever runs alongside the shared bag layer.
+    /// Which candidate-generation retriever runs. It is now the SOLE source of near-tier
+    /// candidates: the bag-Jaccard layer it once ran alongside was measured to add zero
+    /// unique candidates on every corpus and was deleted (see `matchtree`).
     /// A **string-keyed, plugin-extensible** selector (mirrors `normalize.normalizer`),
     /// NOT a two-way flag: further retrievers may register later. The default `"landmark"`
     /// is the §5.5.4 rare-peak constellation retriever (the §7.4b rivalry winner). The
@@ -200,8 +202,12 @@ pub struct RetrievalCfg {
     /// post-fingerprint, so this NEVER enters the extraction cache key (hash-neutral).
     pub retriever: String,
     /// §5.5.4 landmark pairs — rivalry winner (§7.4b, see CALIBRATION.md;
-    /// hole-context hashes were dropped per the §5.5 rivalry clause). Master on/off for
-    /// the landmark layer; when off, the shared bag layer runs alone.
+    /// hole-context hashes were dropped per the §5.5 rivalry clause).
+    ///
+    /// Master on/off for the landmark layer. **Semantics changed when the bag layer was
+    /// deleted:** `false` used to leave the bag layer running alone; now it leaves the near
+    /// tier with NO retriever at all, so it proposes zero candidates and finds nothing.
+    /// It is effectively a kill-switch for near-tier retrieval. Default `true`.
     pub landmark_pairs: bool,
     /// Minimum shared landmark-pair hashes for a candidate. The M3b value of 4
     /// cost real recall (D27 A/B: serde lost 15/43 pairs); 2 is recall-neutral.
@@ -225,9 +231,11 @@ pub struct RetrievalCfg {
     /// order is result-invariant — it sets only short-circuit cost, never recall. Known
     /// filters:
     ///   - `coverage` — the §0.3 coverage-fraction filter, scoped to LANDMARK candidacy
-    ///     (a pair also proposed by the bag layer is out of scope and always survives —
-    ///     recall-safe by scope; threshold = `landmark_coverage_min`). It runs in the
-    ///     landmark retriever's phase, not as a per-pair `&Ctx` predicate.
+    ///     (threshold = `landmark_coverage_min`). It runs in the landmark retriever's
+    ///     phase, not as a per-pair `&Ctx` predicate. It used to be softened by the bag
+    ///     layer (a pair the bag also proposed entered the union anyway and survived a
+    ///     coverage drop); with the bag layer deleted it applies unconditionally — measured
+    ///     to change no output.
     ///   - `offset-histogram` — the Shazam Δoffset diagonal (spec §5.6), a consistency
     ///     predicate over the shared floor-3 subtree evidence.
     ///   - `h-tree` — H-tree-verify, the Δdepth diagonal (docs/substantiality-metric.md
@@ -245,6 +253,47 @@ pub struct RetrievalCfg {
     /// to `htree_rejected`). Unknown names error at
     /// load. Matching-time only — hash-neutral, never in the extraction cache key.
     pub filters: Vec<String>,
+
+    // ── Landmark rarity / fan-out (§5.5.4) ──────────────────────────────────────
+    // These were HARD-CODED constants until the rarity-sweep WP (2026-07). They are the dominant lever on the landmark constellation index — the
+    // largest memory row in a big scan — and on landmark generation, which is 41–46% of
+    // near-phase wall. Defaults reproduce the historical hard-coded values EXACTLY, so
+    // the default path is byte-identical. Matching-time only — hash-neutral, never in
+    // the extraction cache key.
+    /// Floor of the derived rare cap: `landmark_rare_floor.max(n / landmark_rare_divisor)`,
+    /// unless `landmark_rare_cap` pins it outright. A subtree whose document frequency is
+    /// at or below the cap counts as a "rare peak" — the seed material for constellations.
+    ///
+    /// This is the **memory dial**. The derived cap is very permissive at scale (on a
+    /// 118k-unit corpus `n/20` = 6,526 — a subtree in 5% of all units still counts as
+    /// "rare"), which is what inflates the index. Tightening it shrinks the index roughly
+    /// linearly but **costs recall**: fewer landmarks ⇒ fewer candidates ⇒ missed clones.
+    /// A graceful-degradation dial, not a free win — see the sweep's recall curve.
+    pub landmark_rare_floor: u32,
+    /// Divisor in the derived rare cap. Larger ⇒ stricter rarity ⇒ smaller index.
+    /// 0 is rejected at load (it would divide by zero).
+    pub landmark_rare_divisor: u32,
+    /// Pin the rare cap to a fixed document frequency, ignoring corpus size (and hence
+    /// `landmark_rare_divisor`). `None` = derive it. A fixed cap makes index growth linear
+    /// in corpus size rather than super-linear, at a recall cost the sweep quantifies.
+    pub landmark_rare_cap: Option<u32>,
+    /// How many following rare peaks each rare peak is combinatorially paired with when
+    /// forming constellation hashes (Shazam-style fan-out). The index carries ~`fan_out`
+    /// hashes per admitted peak, so this scales index size almost linearly. 0 disables
+    /// landmark hashing (no pairs ⇒ no candidates).
+    pub landmark_fan_out: usize,
+    /// Build the rarity `df` map over the SAME inventory the rarity filter is applied to.
+    ///
+    /// **Default `false` preserves a known defect (E5b).** `df` is built from `bag_set`
+    /// (floor `thresholds.bag_min_subtree_tokens` = 6) but is used to filter `offsets`
+    /// (floor 3), so every 3-to-5-token subtree is ABSENT from `df` → `unwrap_or(0)` →
+    /// admitted as maximally rare however common it truly is. ~51% of admitted "rare
+    /// peaks" are never rarity-tested at all. `true` builds `df` over `offsets`, so the
+    /// gate means what its docs say.
+    ///
+    /// NOT a free bug-fix: it cuts ~11% of AU calls and ~13% of candidates but costs
+    /// ~1–2% of near groups. Left `false` pending a ruling on that trade.
+    pub landmark_df_over_offsets: bool,
 }
 
 impl Default for RetrievalCfg {
@@ -260,7 +309,28 @@ impl Default for RetrievalCfg {
                 "offset-histogram".into(),
                 "h-tree".into(),
             ],
+            // The historical hard-coded values: `rare_cap = 3.max(n / 20)`, `FAN_OUT = 3`,
+            // and `df` built over `bag_set` (the E5b defect, preserved by default).
+            landmark_rare_floor: 3,
+            landmark_rare_divisor: 20,
+            landmark_rare_cap: None,
+            landmark_fan_out: 3,
+            landmark_df_over_offsets: false,
         }
+    }
+}
+
+impl RetrievalCfg {
+    /// The document-frequency ceiling for a "rare peak", for a partition of `n_units`.
+    /// `landmark_rare_cap` pins it; otherwise it is derived as
+    /// `landmark_rare_floor.max(n_units / landmark_rare_divisor)` — the historical
+    /// `3.max(n / 20)` under the default keys.
+    pub fn rare_cap(&self, n_units: usize) -> u32 {
+        if let Some(cap) = self.landmark_rare_cap {
+            return cap;
+        }
+        let divisor = self.landmark_rare_divisor.max(1);
+        self.landmark_rare_floor.max(n_units as u32 / divisor)
     }
 }
 
@@ -310,7 +380,21 @@ pub struct Thresholds {
     /// parity at zero measured precision cost. See `Config::min_unit_floor`.
     pub min_unit_tokens_ir: u32,
     pub min_seq_tokens: u32,
+    /// Token floor for a subtree to enter `bag_set`. The bag-Jaccard RETRIEVAL layer this
+    /// once fed is gone (zero unique yield — see `matchtree`), but the key is still live:
+    /// `bag_set` is the default substrate for the landmark rarity `df` map, so this floor
+    /// still decides which subtrees are rarity-tested at all (`retrieval.
+    /// landmark_df_over_offsets` = the E5b defect this floor mismatch causes).
     pub bag_min_subtree_tokens: u32,
+    /// **No longer a retrieval threshold.** This was the bag-Jaccard candidate threshold
+    /// (spec §9 / PLAN.md §201); that layer was deleted for zero unique yield, so nothing
+    /// in the core reads it any more.
+    ///
+    /// It survives only because `reprise-mcp` reuses the value as a **size-compatibility
+    /// ratio** in its own pre-AU prefilter (`size_compatible(a_tokens, b_tokens, ratio)`) —
+    /// a semantically unrelated use that happens to want a number near 0.70. That coupling
+    /// is accidental and should get its own key; left alone here to avoid changing MCP
+    /// behavior as a side effect of deleting the bag layer.
     pub candidate_sim: f64,
     pub hole_hash_min_cover: f64,
     pub histogram_min_votes: u32,
@@ -513,6 +597,15 @@ impl Config {
             .map_err(|e| anyhow::anyhow!("reprise.toml [report] fail_on: {e}"))?;
         crate::matchtree::validate_filters(&self.retrieval.filters)
             .map_err(|e| anyhow::anyhow!("reprise.toml [retrieval] filters: {e}"))?;
+        // A 0 divisor would divide by zero when deriving the rare cap. Reject it at load
+        // rather than silently clamping — a config that accepts a value it then ignores lies.
+        if self.retrieval.landmark_rare_divisor == 0 {
+            anyhow::bail!(
+                "reprise.toml [retrieval] landmark_rare_divisor: must be >= 1 \
+                 (it divides the unit count to derive the rare cap); \
+                 to pin the cap outright set `landmark_rare_cap` instead"
+            );
+        }
         // Enumerated string keys whose consumer silently treats an unknown value
         // as a fallthrough default. `tests.mode` is the load-bearing one: an
         // unknown value falls through lib.rs's partition catch-all and routes

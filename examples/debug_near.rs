@@ -59,13 +59,15 @@ fn main() {
     sb.dedup();
     let shared = sa.iter().filter(|h| sb.binary_search(h).is_ok()).count();
     let union = sa.len() + sb.len() - shared;
+    // Diagnostic only: the bag-Jaccard RETRIEVAL layer was deleted (zero unique yield),
+    // so this number no longer gates anything — it is printed purely as a similarity
+    // read-out when eyeballing why two units did or did not pair.
     println!(
-        "bag: |A|={} |B|={} shared={} jaccard={:.3} (threshold {})",
+        "bag-jaccard (diagnostic, no longer a gate): |A|={} |B|={} shared={} jaccard={:.3}",
         sa.len(),
         sb.len(),
         shared,
         shared as f64 / union as f64,
-        cfg.thresholds.candidate_sim
     );
     let ir = cfg.normalize.normalizer == Normalizer::Ir && reprise::frontend::has_ir_frontend(lang);
     let profile = (!ir).then(|| lang.profile());

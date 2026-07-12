@@ -1,6 +1,13 @@
-//! P7 tree tier (spec §5.6): candidate retrieval (subtree-hash bags + §5.5.4
-//! landmark pairs — the §7.4(b) rivalry winner), offset-histogram
-//! verification, then anti-unification. Phase 3: inline-expanded variants
+//! P7 tree tier (spec §5.6): candidate retrieval (§5.5.4 landmark pairs — the §7.4(b)
+//! rivalry winner), offset-histogram verification, then anti-unification.
+//!
+//! NOTE vs spec §5.5.2 / PLAN.md §201: retrieval is no longer a *union* of a bag-Jaccard
+//! layer and the landmark layer. The bag layer was measured to have zero unique yield —
+//! its candidate set was a strict subset of landmark's on every corpus — and was deleted.
+//! Retrieval is the landmark retriever alone. `bag_set` survives as the substrate for
+//! landmark's rarity `df` map. Measured in the rarity-sweep WP (2026-07); see CALIBRATION.md / DECISIONS.md when landed.
+//!
+//! Phase 3: inline-expanded variants
 //! (spec §5.4) enter retrieval alongside plain units; a verified pair
 //! involving a variant becomes tier `inline-assisted`, reported against the
 //! variants' base units, with the D3 tautology filter applied.
@@ -12,7 +19,7 @@ use crate::lang::Lang;
 use crate::report::Tier;
 use crate::unit::{Unit, base_of};
 use rayon::prelude::*;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 pub struct NearGroup {
     /// Base-resolved member unit indices (a variant reports as its base).
@@ -33,7 +40,13 @@ pub struct NearGroup {
 
 #[derive(Default, Debug, Clone, serde::Serialize)]
 pub struct RetrievalStats {
-    pub candidates_bag: usize,
+    // `candidates_bag` and `verified_only_landmark` are GONE with the bag layer (see
+    // `near_groups_for_lang`). They existed to arbitrate a two-layer union that no longer
+    // exists: with a single retriever, `candidates_total == candidates_landmark` and
+    // "verified only by landmark" == `verified_pairs`, both by construction. The measurement
+    // that retired the bag layer — its unique verified yield was 0 on every corpus — is
+    // recorded in the rarity-sweep WP (2026-07). If a second candidate layer is ever
+    // added back, it MUST ship with a unique-yield counter; that was the lesson.
     pub candidates_landmark: usize,
     /// Landmark candidates dropped by the coverage-fraction gate (§0.3): the
     /// recall-neutral pre-AU flood cut. Reported so the gate's marginal effect is
@@ -50,8 +63,9 @@ pub struct RetrievalStats {
     /// one point — pre-acceptance — for both the plain and the inline path, so it is
     /// the true verify-survivor count, not the post-acceptance subset).
     pub verified_pairs: usize,
-    /// Verified pairs proposed only by landmark pairs (§7.4b record).
-    pub verified_only_landmark: usize,
+    /// Total constellation hashes across every unit — the landmark index's size, and the
+    /// largest memory row in a large scan. Directly governed by `retrieval.landmark_rare_*`
+    /// and `retrieval.landmark_fan_out`.
     pub landmark_index_size: usize,
 }
 
@@ -82,8 +96,10 @@ impl<'d> RepData<'d> {
     pub fn unit_idx(&self) -> usize {
         self.unit_idx
     }
-    /// Floor-`bag_min_subtree_tokens` deduplicated subtree-hash set (the bag layer's
-    /// features), sorted ascending. A `Retriever` reads this to build its own index.
+    /// Floor-`bag_min_subtree_tokens` deduplicated subtree-hash set, sorted ascending.
+    /// Once the retired bag layer's Jaccard features; now the default substrate for the
+    /// landmark rarity `df` map (see `retrieval.landmark_df_over_offsets`), and available
+    /// to any `Retriever` building its own index.
     pub fn bag_set(&self) -> &[u128] {
         &self.bag_set
     }
@@ -264,26 +280,25 @@ fn near_groups_for_lang(
     }
 
     mark("reps");
-    // ---- candidate retrieval (union of two layers; membership tracked for §7.4b) ----
-    // Layer 1 (shared, always on): the bag-Jaccard layer.
-    // Layer 2 (swappable `Retriever`, default `Landmark`): candidate generation only —
-    // the verify chain below is identical for whichever retriever proposes the pairs.
-    let df_cap = 50usize;
-    let window = cfg.retrieval.owner_pair_window;
-    let bag_pairs = shared_count_pairs(reps.len(), |i| &reps[i].bag_set, df_cap, window);
-    let mut candidates: BTreeMap<(usize, usize), (bool, bool)> = BTreeMap::new();
-    for ((i, j), shared) in bag_pairs {
-        let union = reps[i].bag_set.len() + reps[j].bag_set.len() - shared;
-        if union > 0 && shared as f64 / union as f64 >= cfg.thresholds.candidate_sim {
-            candidates.entry((i, j)).or_default().0 = true;
-        }
-    }
-    stats.candidates_bag += candidates.len();
+    // ---- candidate retrieval (the swappable `Retriever`, default `Landmark`) ----
+    // Candidate generation only — the verify chain below is identical for whichever
+    // retriever proposes the pairs.
+    //
+    // There used to be a second, always-on "bag-Jaccard" layer here, unioned with the
+    // retriever's output. It was DELETED after being measured: its candidate set was a
+    // strict SUBSET of landmark's on every corpus (`candidates_total == candidates_landmark`
+    // exactly, on self/fs/net), it verified ZERO pairs landmark did not also propose
+    // (`verified_only_bag = 0`), and disabling it left every tier's group set byte-identical.
+    // The failure mode it existed for — a clone family so large its subtrees stop being rare,
+    // starving landmark — does not occur. It was an unswitchable corpus-wide par-sort join
+    // over `bag_set` contributing nothing. Measured in the rarity-sweep WP (2026-07); see CALIBRATION.md / DECISIONS.md when landed.
+    //
+    // `bag_set` itself SURVIVES: it is still the substrate for the landmark rarity `df` map
+    // (see `Landmark::candidates`) and a persisted `UnitDigest` field. Only the JOIN is gone.
+    let mut candidates: BTreeSet<(usize, usize)> = BTreeSet::new();
     if cfg.retrieval.landmark_pairs {
         let retriever = select_retriever(&cfg.retrieval.retriever);
-        for (i, j) in retriever.candidates(&reps, cfg, stats) {
-            candidates.entry((i, j)).or_default().1 = true;
-        }
+        candidates.extend(retriever.candidates(&reps, cfg, stats));
     }
     stats.candidates_total += candidates.len();
     mark("pair-counting");
@@ -343,27 +358,24 @@ fn near_groups_for_lang(
         Verify::Verified(outcome)
     };
 
-    let mut plain_cands: Vec<(usize, usize, bool, bool)> = Vec::new();
-    let mut inline_cands: Vec<(usize, usize, bool, bool)> = Vec::new();
-    for (&(i, j), &(by_bag, by_lm)) in &candidates {
+    let mut plain_cands: Vec<(usize, usize)> = Vec::new();
+    let mut inline_cands: Vec<(usize, usize)> = Vec::new();
+    for &(i, j) in &candidates {
         let (ua, ub) = (reps[i].unit_idx, reps[j].unit_idx);
         if !size_gate_passes(units[ua].token_count, units[ub].token_count, cfg) {
             continue;
         }
         if units[ua].variant.is_some() || units[ub].variant.is_some() {
-            inline_cands.push((i, j, by_bag, by_lm));
+            inline_cands.push((i, j));
         } else {
-            plain_cands.push((i, j, by_bag, by_lm));
+            plain_cands.push((i, j));
         }
     }
 
     let mut accepted: Vec<VerifiedPair> = Vec::new();
     let mut weak: Vec<VerifiedPair> = Vec::new();
-    let plain_verified: Vec<Verify> = plain_cands
-        .par_iter()
-        .map(|&(i, j, _, _)| verify(i, j))
-        .collect();
-    for (&(i, j, by_bag, by_lm), v) in plain_cands.iter().zip(plain_verified) {
+    let plain_verified: Vec<Verify> = plain_cands.par_iter().map(|&(i, j)| verify(i, j)).collect();
+    for (&(i, j), v) in plain_cands.iter().zip(plain_verified) {
         let outcome = match v {
             Verify::FilterRejected(name) => {
                 record_filter_reject(stats, name);
@@ -376,9 +388,6 @@ fn near_groups_for_lang(
             Verify::Verified(outcome) => outcome,
         };
         stats.verified_pairs += 1;
-        if by_lm && !by_bag {
-            stats.verified_only_landmark += 1;
-        }
         let pair = VerifiedPair {
             a: reps[i].unit_idx,
             b: reps[j].unit_idx,
@@ -399,7 +408,7 @@ fn near_groups_for_lang(
         .collect();
     // Cheap exclusions first, then parallel histogram+AU, then the best
     // outcome per base pair (several variant pairings can map to one).
-    inline_cands.retain(|&(i, j, _, _)| {
+    inline_cands.retain(|&(i, j)| {
         let (ua, ub) = (reps[i].unit_idx, reps[j].unit_idx);
         let (ba, bb) = (base_of(units, ua), base_of(units, ub));
         if ba == bb {
@@ -411,10 +420,10 @@ fn near_groups_for_lang(
     });
     let inline_verified: Vec<Verify> = inline_cands
         .par_iter()
-        .map(|&(i, j, _, _)| verify(i, j))
+        .map(|&(i, j)| verify(i, j))
         .collect();
     let mut inline_best: BTreeMap<(usize, usize), VerifiedPair> = BTreeMap::new();
-    for (&(i, j, by_bag, by_lm), v) in inline_cands.iter().zip(inline_verified) {
+    for (&(i, j), v) in inline_cands.iter().zip(inline_verified) {
         let outcome = match v {
             Verify::FilterRejected(name) => {
                 record_filter_reject(stats, name);
@@ -429,9 +438,6 @@ fn near_groups_for_lang(
         // Count the verify-survivor here — pre-acceptance, the SAME point as the
         // plain path — so `verified_pairs` means the same thing on both paths.
         stats.verified_pairs += 1;
-        if by_lm && !by_bag {
-            stats.verified_only_landmark += 1;
-        }
         // Near-normalized acceptance criteria; no weak demotion — a weak
         // inline match is noise, not a verbose-only finding.
         if outcome.holes.len() > cfg.thresholds.max_holes as usize || !outcome.factorable {
@@ -527,13 +533,40 @@ impl Retriever for Landmark {
         // Landmark pairs (§5.5.4): rare subtrees (low document frequency) paired
         // combinatorially with bucketed structural offsets. Built here from the
         // shared substrate and owned by the retriever (not stored on RepData).
+        //
+        // The rarity cap and the fan-out are CONFIG (`retrieval.landmark_*`), not constants:
+        // together they set the size of the constellation index, which is the largest memory
+        // row in a large scan and ~41–46% of near-phase wall. Defaults reproduce the former
+        // hard-coded `3.max(n/20)` / `FAN_OUT = 3` exactly.
+        let rc = &cfg.retrieval;
+        // `df` — the document-frequency map the rarity gate consults.
+        //
+        // Which inventory builds it is a REAL behavioral choice, not a detail (E5b):
+        //   - `bag_set` (default, `landmark_df_over_offsets = false`) has floor
+        //     `bag_min_subtree_tokens` (6), but the gate below filters `offsets` (floor 3).
+        //     Every 3-to-5-token subtree is therefore ABSENT from `df`, hits `unwrap_or(0)`,
+        //     and is admitted as maximally rare however common it truly is — ~51% of admitted
+        //     peaks are never rarity-tested at all. This is the historical behavior.
+        //   - `offsets` (`landmark_df_over_offsets = true`) builds `df` over the same
+        //     inventory it filters, so the gate means what §5.5.4 says it means. It cuts
+        //     ~11% of AU calls and ~13% of candidates but costs ~1–2% of near groups —
+        //     a trade, not a free fix. Default stays on the historical path pending a ruling.
         let mut df: HashMap<u128, u32> = HashMap::new();
-        for rep in reps {
-            for h in rep.bag_set.iter() {
-                *df.entry(*h).or_insert(0) += 1;
+        if rc.landmark_df_over_offsets {
+            for rep in reps {
+                for (h, _, _) in rep.offsets.iter() {
+                    *df.entry(*h).or_insert(0) += 1;
+                }
+            }
+        } else {
+            for rep in reps {
+                for h in rep.bag_set.iter() {
+                    *df.entry(*h).or_insert(0) += 1;
+                }
             }
         }
-        let rare_cap = 3.max(reps.len() as u32 / 20);
+        let rare_cap = rc.rare_cap(reps.len());
+        let fan_out = rc.landmark_fan_out;
         let landmarks: Vec<Vec<u128>> = reps
             .par_iter()
             .map(|rep| {
@@ -544,10 +577,9 @@ impl Retriever for Landmark {
                     .flat_map(|(h, offs, _)| offs.iter().map(move |o| (*o, *h)))
                     .collect();
                 rare.sort_unstable();
-                const FAN_OUT: usize = 3;
                 let mut lms = Vec::new();
                 for i in 0..rare.len() {
-                    for j in i + 1..(i + 1 + FAN_OUT).min(rare.len()) {
+                    for j in i + 1..(i + 1 + fan_out).min(rare.len()) {
                         let delta = (rare[j].0 - rare[i].0) / 8;
                         let mut buf = Vec::with_capacity(36);
                         buf.extend_from_slice(&rare[i].1.to_le_bytes());
@@ -591,10 +623,14 @@ impl Retriever for Landmark {
             // landmark set. A whole-unit clone covers most of each unit; a
             // coincidental boilerplate region covers little — exactly the flood
             // mechanism. Uses the FULL (df-uncapped) landmark intersection so the
-            // gate is never MORE aggressive than the validated definition, and is
-            // strictly recall-safe: a pair also proposed by the bag layer keeps its
-            // `.0` flag and is still verified. Pre-AU, so it saves the O(n·m)
-            // anti-unification on the coincidences it drops.
+            // gate is never MORE aggressive than the validated definition. Pre-AU, so it
+            // saves the O(n·m) anti-unification on the coincidences it drops.
+            //
+            // This gate used to be softened by the bag layer: a pair the bag also proposed
+            // entered the candidate union independently and so survived a coverage drop.
+            // With the bag layer deleted the gate is now unconditional — which was measured
+            // to change NOTHING (the `candidate_sim = 1.01` arm, which likewise left every
+            // pair coverage-exposed, produced byte-identical group sets on self/fs/net).
             if coverage_min > 0.0 {
                 let denom = landmarks[i].len().min(landmarks[j].len()).max(1) as f64;
                 let full_shared = intersect_count(&landmarks[i], &landmarks[j]);

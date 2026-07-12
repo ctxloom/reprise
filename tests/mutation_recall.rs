@@ -197,6 +197,33 @@ fn bench_config() -> Config {
             .parse::<Normalizer>()
             .expect("REPRISE_NORMALIZER must be one of: ir, historical");
     }
+    // Landmark rarity / fan-out overrides, so the oracle can gate a `retrieval.landmark_*`
+    // sweep (the bench builds its Config in-process and never reads a `reprise.toml`).
+    //
+    // ⚠ READ THIS BEFORE USING THE ORACLE AS A RARITY GATE. `converges()` scans a temp dir
+    // holding exactly TWO files, so a bench corpus has a handful of units: `rare_cap` pins to
+    // its FLOOR (`3.max(n/20)` = 3) and the largest document frequency any subtree can reach
+    // is 2. Every subtree is therefore "rare" no matter what, and the rarity gate CANNOT BIND.
+    // `landmark_rare_divisor` and `landmark_df_over_offsets` are consequently INERT here — the
+    // oracle is structurally incapable of pricing them, and a green run says nothing about
+    // their corpus-scale recall cost. Rarity only bites at scale; measure it on fs/net against
+    // the verify-on-union ACCEPT set. (`landmark_fan_out` and a fixed `landmark_rare_cap` <= 2
+    // DO bind here.) Measured in the rarity-sweep WP (2026-07); see CALIBRATION.md / DECISIONS.md when landed.
+    if let Ok(v) = std::env::var("REPRISE_LM_RARE_DIVISOR") {
+        cfg.retrieval.landmark_rare_divisor = v.parse().expect("REPRISE_LM_RARE_DIVISOR: u32");
+    }
+    if let Ok(v) = std::env::var("REPRISE_LM_RARE_FLOOR") {
+        cfg.retrieval.landmark_rare_floor = v.parse().expect("REPRISE_LM_RARE_FLOOR: u32");
+    }
+    if let Ok(v) = std::env::var("REPRISE_LM_RARE_CAP") {
+        cfg.retrieval.landmark_rare_cap = Some(v.parse().expect("REPRISE_LM_RARE_CAP: u32"));
+    }
+    if let Ok(v) = std::env::var("REPRISE_LM_FAN_OUT") {
+        cfg.retrieval.landmark_fan_out = v.parse().expect("REPRISE_LM_FAN_OUT: usize");
+    }
+    if std::env::var_os("REPRISE_LM_DF_FIX").is_some() {
+        cfg.retrieval.landmark_df_over_offsets = true;
+    }
     cfg
 }
 
