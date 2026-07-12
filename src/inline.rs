@@ -506,6 +506,12 @@ pub struct Expansion {
     pub scc: bool,
     pub calls_inlined: u32,
     pub ambiguity_skips: u32,
+    /// This unit got no variant because its expansion exceeded
+    /// `inline.max_expansion_nodes` — NOT because it had nothing to inline. The two
+    /// are otherwise identical (`tree: None`, `calls_inlined: 0`), and conflating
+    /// them would make the backstop a silent recall loss; `scan()` surfaces this as
+    /// `Stats::inline_budget_skipped_units`.
+    pub budget_skipped: bool,
 }
 
 impl Expansion {
@@ -518,6 +524,16 @@ impl Expansion {
             scc: false,
             calls_inlined: 0,
             ambiguity_skips,
+            budget_skipped: false,
+        }
+    }
+
+    /// The unit's expansion blew the aggregate node budget: no variant (policy
+    /// `skip` — never a truncated tree), and it says so.
+    fn budget_skipped(ambiguity_skips: u32) -> Expansion {
+        Expansion {
+            budget_skipped: true,
+            ..Expansion::skipped(ambiguity_skips)
         }
     }
 }
@@ -530,9 +546,10 @@ struct Ctx<'a> {
     file: &'a Path,
     unit_idx: usize,
     root_name: Box<str>,
-    /// Def indices in the root unit's SCC (empty unless SCC size ≥2). These
-    /// bypass the size cap: the SCC round must complete to reach
-    /// self-recursion (spec §5.4).
+    /// Def indices in the root unit's SCC (empty unless SCC size ≥2). A partner may
+    /// relax the depth/size caps to let the SCC round reach self-recursion (spec §5.4),
+    /// but only within `max_scc_depth` — see `resolve_policy`'s bypass site for why the
+    /// relaxation must stay rationed.
     scc_partners: HashSet<usize>,
     has_expr_block: bool,
     /// Defs currently being expanded — the cycle stop ("stop when a cycle
@@ -545,6 +562,12 @@ struct Ctx<'a> {
     /// Distinct ambiguous call sites (by span): a site rejected at the
     /// statement level is revisited at expression level and must count once.
     ambiguous_sites: HashSet<(u32, u32)>,
+    /// SCC-partner splices currently on the stack (the `max_scc_depth` basis).
+    scc_splices: u32,
+    /// Spliced nodes charged against `max_expansion_nodes` so far.
+    spliced_nodes: u64,
+    /// Set when a splice was refused for budget; the unit gets no variant.
+    over_budget: bool,
     /// The scan's interned id for the synthetic `keyword_argument` tag
     /// (interning-id-conversion WP) — computed ONCE at `Ctx` construction via the
     /// per-scan `LabelInterner` (rule 5), so the IR path's `keyword_argument`
@@ -594,6 +617,9 @@ pub fn expand_unit(
         scc_hit: false,
         calls_inlined: 0,
         ambiguous_sites: HashSet::new(),
+        scc_splices: 0,
+        spliced_nodes: 0,
+        over_budget: false,
         kw_arg_sym: li.intern("keyword_argument"),
     };
     // M3c: `raw.clone()` used to run unconditionally here, even though ~55% of
@@ -604,9 +630,25 @@ pub fn expand_unit(
     // call in the tree resolves, the real `walk` below is guaranteed to splice
     // nothing, so the clone is skipped outright.
     if !any_resolvable_call(raw, &mut ctx) {
+        // `any_resolvable_call` runs the same `resolve_policy`, so a budget of 0
+        // refuses every call here and no call ever "resolves" — the unit would exit
+        // through this cheap path. That is still a BUDGET skip, not a benign one, and
+        // must report itself as such. (For any budget ≥ 1 this cannot trigger: no
+        // splice has happened yet during the read-only descent, so `spliced_nodes` is
+        // still 0 and the check `B <= 0` is false.)
+        if ctx.over_budget {
+            return Expansion::budget_skipped(ctx.ambiguous_sites.len() as u32);
+        }
         return Expansion::skipped(ctx.ambiguous_sites.len() as u32);
     }
     let tree = walk(raw.clone(), &mut ctx);
+    // Policy `skip` (design doc §4): over the aggregate expansion-node budget, the
+    // unit gets NO variant at all — never a truncated one. This is what keeps
+    // `max_expansion_nodes` out of the byte-identity surface: it only ever selects
+    // a variant's presence/absence, never alters the content of one that IS emitted.
+    if ctx.over_budget {
+        return Expansion::budget_skipped(ctx.ambiguous_sites.len() as u32);
+    }
     Expansion {
         tree: Some(tree),
         chain: ctx.chain,
@@ -614,6 +656,7 @@ pub fn expand_unit(
         scc: ctx.scc_hit,
         calls_inlined: ctx.calls_inlined,
         ambiguity_skips: ctx.ambiguous_sites.len() as u32,
+        budget_skipped: false,
     }
 }
 
@@ -816,8 +859,9 @@ fn de_return_node(node: &mut NormNode) {
 }
 
 /// Resolve a call node against the table and the §5.4 policy knobs. Counts
-/// ambiguity skips; enforces the self-recursion and cycle guards, depth, and
-/// the callee size cap (bypassed for SCC partners — the SCC round).
+/// ambiguity skips; enforces the self-recursion and cycle guards, the aggregate
+/// expansion budget, depth, and the callee size cap — the last two relaxed for an
+/// SCC partner only within `max_scc_depth` (see the bypass site below).
 fn resolve_policy(node: &NormNode, ctx: &mut Ctx) -> Option<(usize, Vec<NormNode>)> {
     let (name, args) = ctx.shapes.call_parts(node, ctx.kw_arg_sym)?;
     if name == ctx.root_name {
@@ -838,7 +882,35 @@ fn resolve_policy(node: &NormNode, ctx: &mut Ctx) -> Option<(usize, Vec<NormNode
     if def.unit_idx == ctx.unit_idx || ctx.stack.contains(&def_idx) {
         return None;
     }
-    if !ctx.scc_partners.contains(&def_idx) {
+    // Aggregate per-unit expansion budget (backstop, checked BEFORE the SCC bypass —
+    // the SCC round does not get to bypass it): over budget, the unit gets no variant
+    // at all (policy skip, never a truncated one — `expand_unit` reads `over_budget`
+    // after the walk and discards everything).
+    if u64::from(ctx.cfg.inline.max_expansion_nodes) <= ctx.spliced_nodes {
+        ctx.over_budget = true;
+        return None;
+    }
+    // The SCC round is BOUNDED by the caps, never exempt from them.
+    //
+    // `max_callee_tokens` is a PRECISION guard, not merely a size/perf knob: splice a large
+    // shared helper into two thin sibling wrappers and their bodies become mostly the HELPER's
+    // mass, so they "match" each other on code that exists exactly once — a clone report
+    // pointing at nothing duplicated. The size cap is what keeps such a helper out.
+    //
+    // And an SCC partner exempted from `max_depth` nests without bound: the cycle stop only
+    // forbids REPEATING a member, so a chain of distinct partners descends as deep as the SCC
+    // is large, at any body size.
+    //
+    // Hence the bypass is rationed by `max_scc_depth` — enough to turn mutual recursion into
+    // direct self-recursion (the round's whole purpose) and no further. Never widen this to an
+    // unconditional exemption.
+    //
+    // SCC partners bypass `max_depth`/`max_callee_tokens` ONLY while strictly fewer
+    // than `max_scc_depth` partner splices are already on the stack — "inline SCC
+    // partner once" (module doc), not as deep as the SCC has distinct members.
+    let scc_bypass =
+        ctx.scc_partners.contains(&def_idx) && ctx.scc_splices < ctx.cfg.inline.max_scc_depth;
+    if !scc_bypass {
         if ctx.stack.len() >= ctx.cfg.inline.max_depth as usize {
             return None;
         }
@@ -861,11 +933,24 @@ fn splice_body(def_idx: usize, args: Vec<NormNode>, ctx: &mut Ctx) -> Vec<NormNo
         .zip(args.iter())
         .collect();
     let body = substitute(def.body.clone(), &map, ctx.shapes, *EMPTY_KIND);
+    // Charge the budget after substitution (so duplicated argument subtrees are
+    // counted) but before recursing, so a nested splice's own budget check sees
+    // this splice's cost. Overshoot note: the check in `resolve_policy` runs
+    // BEFORE a splice, so the final admitted splice may push the total past the
+    // budget by its own size — bounded, measured at 0.07% on a 500k-node probe;
+    // not worth a param-use-table prediction to close (see design doc §6.2).
+    ctx.spliced_nodes += u64::from(body.token_count());
     let name = def.name.to_string();
     let unit_idx = def.unit_idx;
     let is_partner = ctx.scc_partners.contains(&def_idx);
     ctx.stack.push(def_idx);
+    if is_partner {
+        ctx.scc_splices += 1;
+    }
     let body = walk(body, ctx);
+    if is_partner {
+        ctx.scc_splices -= 1;
+    }
     ctx.stack.pop();
     if !ctx.chain.contains(&name) {
         ctx.chain.push(name);

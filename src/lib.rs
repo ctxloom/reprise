@@ -408,6 +408,10 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
         struct VariantOutcome {
             ambiguity_skips: u32,
             calls_inlined: u32,
+            /// The aggregate expansion budget refused this unit (NOT a benign
+            /// thin-delegation/no-resolvable-call skip) — counted separately so the
+            /// backstop can never fire silently.
+            budget_skipped: bool,
             /// The variant unit plus (over the gate only) its fused digest —
             /// the variant analog of the gate-trip digest moment, computed while
             /// this fresh tree is still resident.
@@ -423,10 +427,12 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
             .enumerate()
             .map(|(i, exp)| -> anyhow::Result<VariantOutcome> {
                 let ambiguity_skips = exp.ambiguity_skips;
+                let budget_skipped = exp.budget_skipped;
                 if exp.calls_inlined == 0 {
                     return Ok(VariantOutcome {
                         ambiguity_skips,
                         calls_inlined: 0,
+                        budget_skipped,
                         variant: None,
                     });
                 }
@@ -442,6 +448,7 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
                     return Ok(VariantOutcome {
                         ambiguity_skips,
                         calls_inlined: 0,
+                        budget_skipped: false,
                         variant: None,
                     });
                 };
@@ -455,6 +462,7 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
                     return Ok(VariantOutcome {
                         ambiguity_skips,
                         calls_inlined: 0,
+                        budget_skipped: false,
                         variant: None,
                     });
                 }
@@ -487,6 +495,7 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
                 Ok(VariantOutcome {
                     ambiguity_skips,
                     calls_inlined: exp.calls_inlined,
+                    budget_skipped: false,
                     variant: Some((variant, vd)),
                 })
             })
@@ -496,6 +505,7 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
         for outcome in outcomes {
             stats.ambiguity_skips += outcome.ambiguity_skips as usize;
             stats.calls_inlined += outcome.calls_inlined as usize;
+            stats.inline_budget_skipped_units += usize::from(outcome.budget_skipped);
             if let Some((variant, vd)) = outcome.variant {
                 variants.push(variant);
                 if let Some(vd) = vd {

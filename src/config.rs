@@ -107,6 +107,29 @@ pub struct InlineCfg {
     /// spliced mass when the callee folds).
     pub max_callee_tokens: u32,
     pub max_depth: u32,
+    /// Maximum nested SCC-partner splices. The SCC round exists to inline a mutual-recursion
+    /// partner ONCE, turning mutual recursion into direct self-recursion (§5.4; Rev 5 then
+    /// lowers it). Partners bypass `max_depth`/`max_callee_tokens` to let that round complete —
+    /// so without this cap a large SCC nests as deep as it has distinct members (measured: 31
+    /// on redis, against max_depth = 2) with no size limit, which is what produced a 25.1 M-node
+    /// single-unit expansion and OOM-killed an 8 GiB scan.
+    pub max_scc_depth: u32,
+    /// Aggregate per-unit expansion budget: max spliced nodes admitted into one unit's inline
+    /// variant. Over budget, the unit gets NO variant (never a truncated one), so this value
+    /// never enters any fingerprint — it selects a variant's presence, never its content.
+    ///
+    /// A pure backstop. After `max_scc_depth` it binds on NOTHING measured: the largest unit on
+    /// any of eight corpora is 12,232 spliced nodes (redis; next is linux/fs at 9,995, and p99
+    /// anywhere is ≤ 3,077), and zero units truncate at any value in [25k, 500k]. The default is
+    /// sited at **20× the largest unit ever observed** and ~100× below the pathology it exists to
+    /// stop (a 25.1 M-node single-unit expansion that OOM-killed a 16 GiB scan). A `NormNode` is
+    /// pinned at 64 B (`tree.rs`), so one pathological unit is bounded at ~16 MB. It is not set
+    /// higher because `lib.rs` collects every `Expansion` before consuming any, so the aggregate
+    /// ceiling scales with this value — no reason to loosen it past the margin actually needed.
+    ///
+    /// If this ever fires, `Stats::inline_budget_skipped_units` says so (and the terminal summary
+    /// shows it): a backstop that drops a unit's inline-tier recall must never do it silently.
+    pub max_expansion_nodes: u32,
     /// Skip a call site with more than this many resolution candidates
     /// (after the same-file → same-dir → repo-wide preference filter).
     pub max_candidates: usize,
@@ -118,6 +141,8 @@ impl Default for InlineCfg {
             enabled: true,
             max_callee_tokens: 120,
             max_depth: 2,
+            max_scc_depth: 1,
+            max_expansion_nodes: 250_000,
             max_candidates: 3,
         }
     }
@@ -559,6 +584,19 @@ mod tests {
         let toml = "[normalize]\nnormalizer = \"irr\"\n";
         let err = toml::from_str::<Config>(toml).unwrap_err().to_string();
         assert!(err.contains("irr"), "error names the bad value: {err}");
+    }
+
+    #[test]
+    fn inline_scc_and_budget_defaults_are_pinned() {
+        // inliner-expansion-budget WP: `max_scc_depth = 1` restores the documented
+        // "inline SCC partner once" intent (src/inline.rs module doc); the aggregate
+        // `max_expansion_nodes = 250_000` backstop sits 20x above the largest unit
+        // measured on any of eight corpora (redis, 12,232 spliced nodes) and ~100x
+        // below the 25.1 M-node pathology it exists to stop. Zero units truncate at
+        // any value in [25k, 500k], so the default is inert by measurement, not hope.
+        let cfg = Config::default();
+        assert_eq!(cfg.inline.max_scc_depth, 1);
+        assert_eq!(cfg.inline.max_expansion_nodes, 250_000);
     }
 
     #[test]

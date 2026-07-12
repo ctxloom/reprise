@@ -166,6 +166,14 @@ pub struct Stats {
     pub calls_inlined: usize,
     /// Units belonging to a mutual-recursion SCC of size ≥2 (spec §5.4).
     pub scc_units: usize,
+    /// Units that got NO inline variant because their expansion exceeded
+    /// `inline.max_expansion_nodes` (the aggregate backstop). Distinct from the
+    /// benign no-op skips (thin delegation D37 / no resolvable call), which share
+    /// the same `Expansion::skipped` shape but are NOT counted here: a backstop
+    /// that silently drops a whole unit's inline-tier recall is worse than no
+    /// backstop, so it reports itself. Expected 0 on every measured corpus — a
+    /// non-zero value means the budget is binding and should be re-sited.
+    pub inline_budget_skipped_units: usize,
     /// Units that emitted an api-profile signature (spec §5.7).
     pub api_signatures: usize,
     /// Units suppressed by `reprise:ignore` (spec §2/§12: visible so
@@ -272,9 +280,20 @@ impl ScanReport {
         } else {
             String::new()
         };
+        // The expansion backstop (`inline.max_expansion_nodes`) drops a unit's inline
+        // variant WHOLESALE when its expansion blows the budget. That is a real, if
+        // bounded, inline-tier recall loss, so it must be visible to the human running
+        // the scan — not just in `--format json`. Rendered only when nonzero (it is zero
+        // on every measured corpus), same as the unreadable-file drop above: a healthy
+        // scan's summary is unchanged.
+        let budget_skips = if s.inline_budget_skipped_units > 0 {
+            format!(", {} budget-skipped", s.inline_budget_skipped_units)
+        } else {
+            String::new()
+        };
         let mut out = format!(
             "reprise scan: {} files{}, {} units indexed ({} below floor, {} parse-degraded, \
-             {} suppressed), inline [{} variants, {} scc units, {} ambiguity skips], \
+             {} suppressed), inline [{} variants, {} scc units, {} ambiguity skips{}], \
              {} api signatures, cache [{} hits, {} misses], findings [{}] in {}ms\n",
             s.files_scanned,
             unreadable,
@@ -285,6 +304,7 @@ impl ScanReport {
             s.inline_variants,
             s.scc_units,
             s.ambiguity_skips,
+            budget_skips,
             s.api_signatures,
             s.cache_hits,
             s.cache_misses,
