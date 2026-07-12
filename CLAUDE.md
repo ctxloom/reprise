@@ -7,6 +7,48 @@ failure modes this project is defined against). Build, test, and lint go through
 (`just test`, `just lint`, `just fmt`, `just bench-mutations`, `just bench-mutations-ir`) —
 an `ltk` hook redirects raw `cargo`.
 
+## Instrument first. Understand. Then change.
+
+**No change to a mechanism lands on the strength of an argument about that mechanism.** Measure it,
+understand what the measurement says, and only then decide what to build. This is the project's
+first rule, and it is not ceremony — it is the rule the codebase keeps proving.
+
+A partial list of things that were believed, written into plans, and turned out to be false —
+each discovered only by measuring, and every one load-bearing at the time:
+
+- *"The inliner's caps bound expansion."* They exempt the mutual-recursion SCC from **both** the
+  depth and the size cap. One redis unit expanded to 25.1M nodes — 22× the whole corpus — and
+  exhausted the machine's memory. The size cap was also the **precision** guard; skipping it
+  manufactured clones out of a shared helper's mass.
+- *"The landmark index is ~2.6 GB."* It is 8.49 GB. A whole `Vec<(u32,u32)>` — 2.15 GB — was in
+  nobody's model.
+- *"Extraction is a 22.5 GB hump, near-tier is another."* They were the same bytes, counted twice
+  in two different sessions. Extraction's own peak is 12.54 GB; the peak is set in the near phase.
+- *"The peak is 22.6 GB."* That is a **glibc dev-build artifact**. The shipped binary is
+  musl + mimalloc and peaks at 15.8 GB. A whole optimization campaign was aimed at a build no user
+  runs.
+- *"The bag layer catches clone families landmark misses."* It has never proposed a single pair
+  landmark did not. Zero yield, on every corpus, always on.
+- *"`bench-retrieval` races real production code."* It **reimplements** the production helpers.
+
+The pattern is always the same: a plausible model, written down once, never checked, then built
+upon. **A number is either measured or it is labelled an estimate. Plans state which.** When a plan
+asserts a row size, a ratio, or a bound, the first stage measures it — and the measurement may
+delete the plan.
+
+Corollaries that follow from the same rule:
+
+- **Wall time on the dev box drifts ±50% batch-to-batch** (the same binary has measured 291s and
+  443s). **Interleave every wall comparison against a control** (A/B/A/B within one batch). A
+  non-interleaved read has already inverted two conclusions. Peak RSS is stable to <1%; wall is not.
+  Prefer *within-run ratios*, which are immune.
+- **`fs` and `drivers/` are different regimes, not different sizes of one** — the memory gate trips
+  at one and not the other, so trees are freed in one and never in the other. Do not extrapolate
+  between them.
+- **Instrument so the next person cannot repeat this.** Where a mechanism's value is unmeasurable,
+  the fix is a counter, not an argument. `verified_only_bag` did not exist, which is precisely why
+  a zero-yield join ran on every scan for the life of the project.
+
 ## Cross-language: converge the *tooling*, best-effort the *behavior*
 
 reprise supports many languages, and there are **two distinct axes** of cross-language "sharing."
