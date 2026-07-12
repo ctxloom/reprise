@@ -69,6 +69,13 @@ pub struct RetrievalStats {
     /// Total constellation hashes across every unit — the landmark index's size, and the
     /// largest memory row in a large scan. Directly governed by `retrieval.landmark_fan_out`.
     pub landmark_index_size: usize,
+    /// Rare peaks admitted by the rarity gate, summed over units — the seed count the
+    /// constellation index is built from (`landmark_index_size ≈ fan_out × this`, less
+    /// dedup and the per-unit tail). Counted because `memory::estimate_bytes` models the
+    /// index from `total_tokens`, and the peaks-per-token ratio is the load-bearing link
+    /// between them: this counter is what lets the next person re-check it instead of
+    /// trusting the constant.
+    pub landmark_admitted_peaks: usize,
 }
 
 /// Per-unit retrieval substrate, shared by every `Retriever` (candidate
@@ -547,6 +554,7 @@ impl Retriever for Landmark {
         // size of the constellation index, which is the largest memory row in a large
         // scan and ~41–46% of near-phase wall.
         let fan_out = cfg.retrieval.landmark_fan_out;
+        let admitted_peaks = std::sync::atomic::AtomicUsize::new(0);
         let landmarks: Vec<Vec<u128>> = reps
             .par_iter()
             .map(|rep| {
@@ -556,6 +564,7 @@ impl Retriever for Landmark {
                     .flat_map(|(h, offs, _)| offs.iter().map(move |o| (*o, *h)))
                     .collect();
                 peaks.sort_unstable();
+                admitted_peaks.fetch_add(peaks.len(), std::sync::atomic::Ordering::Relaxed);
                 let mut lms = Vec::new();
                 for i in 0..peaks.len() {
                     for j in i + 1..(i + 1 + fan_out).min(peaks.len()) {
@@ -590,6 +599,7 @@ impl Retriever for Landmark {
             0.0
         };
         stats.landmark_index_size += landmarks.iter().map(Vec::len).sum::<usize>();
+        stats.landmark_admitted_peaks += admitted_peaks.load(std::sync::atomic::Ordering::Relaxed);
         let mut out = Vec::new();
         for ((i, j), shared) in
             shared_count_pairs(landmarks.len(), |k| landmarks[k].as_slice(), df_cap, window)
