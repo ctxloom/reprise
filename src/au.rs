@@ -7,7 +7,6 @@
 //! graded (similarity-scored) Needleman-Wunsch/Smith-Waterman rather than
 //! binary LCS: a clone whose every statement was lightly edited still aligns.
 
-use crate::fingerprint::{HashMode, merkle, merkle_mode};
 use crate::intern::{Field, Kind, LSym, LabelInterner};
 use crate::lang::LanguageProfile;
 use crate::tree::{Label, NormNode};
@@ -65,7 +64,7 @@ struct Ctx<'a> {
     /// units keep the exact `LanguageProfile` answers, so their AU output is byte-identical.
     ir: bool,
     /// The scan's per-scan label interner — resolves `Label::External`/`LitKept` `LSym`
-    /// ids for fingerprint hashing ([`merkle`]/[`merkle_mode`]) and for the two fixed
+    /// ids for fingerprint hashing (`fingerprint::tree_hashes`) and for the two fixed
     /// synthetic-marker comparisons below (`has_next_sym`/`next_sym`).
     li: &'a LabelInterner,
     /// `li.intern("__has_next")`/`li.intern("__next")`, computed ONCE per `anti_unify`
@@ -75,19 +74,32 @@ struct Ctx<'a> {
     next_sym: LSym,
     holes: HashMap<(u128, u128), (u32, Hole)>,
     next_hole: u32,
-    /// Memo of input-subtree hashes keyed by node ADDRESS: exact merkle +
-    /// sorted MaskedAll subtree-hash multiset (whose len is the D1 token
-    /// count — one hash per node). Sound ONLY because every node ever passed
-    /// to `node_info` is borrowed from one of the two original input trees,
-    /// which are immovable for the whole `anti_unify` call — so no address is
-    /// ever reused for a different node mid-call. This invariant is load-
-    /// bearing: `flatten_operands` therefore collects `&NormNode` INTO the
-    /// input tree (never clones into a transient `Vec` that would free —
-    /// freeing under a stale entry lets the allocator hand the address to a
-    /// later node and return the wrong hash/token-count). Before this cache,
-    /// `au_list` recomputed `merkle`/`collect_hashes` from scratch for every
-    /// DP CELL of the similarity matrix — the dominant cost of the near tier
-    /// at 500k LOC (M4a perf pass; output-identical by construction).
+    /// Every node of BOTH input trees, hashed ONCE, bottom-up, before the DP starts
+    /// (`fingerprint::tree_hashes`). Pre-order, so a node's subtree is a contiguous
+    /// range — `node_info` SLICES it instead of re-walking and re-hashing it.
+    ///
+    /// This replaces a per-node `merkle`/`collect_hashes` recomputation whose cost was
+    /// O(k * depth): `collect_hashes` called the fully-recursive `merkle_mode` at EVERY
+    /// node of a subtree, so every subtree was re-hashed once per ANCESTOR. On `fs` that
+    /// was 925.7M node-hashes to serve 12.3M nodes (~75x redundant), and `anti_unify` was
+    /// ~25% of the entire scan. Hashing bottom-up is a pure memoization — the same
+    /// function of the same inputs — so the hashes are BIT-IDENTICAL; `tests` below pins
+    /// that node-by-node, and scan output is byte-identical.
+    hashes: crate::fingerprint::TreeHashes,
+    /// Node ADDRESS -> its pre-order index in `hashes`. Sound ONLY because every node
+    /// ever passed to `node_info` is borrowed from one of the two original input trees,
+    /// which are immovable for the whole `anti_unify` call — so no address is ever reused
+    /// for a different node mid-call. This invariant is load-bearing: `flatten_operands`
+    /// therefore collects `&NormNode` INTO the input tree (never clones into a transient
+    /// `Vec` that would free — freeing under a stale entry lets the allocator hand the
+    /// address to a later node and return the wrong hash/token-count). `tests/au.rs` is
+    /// the regression guard for exactly that.
+    index: HashMap<usize, u32>,
+    /// Memo of the SORTED MaskedAll multiset per node — the form the Jaccard similarity
+    /// consumes, and whose len is the D1 token count. Keyed by the same node address.
+    /// The hashes themselves are no longer recomputed here (they are sliced from
+    /// `hashes`); this now saves only the re-slice and re-sort for a subtree that several
+    /// DP CELLS of the similarity matrix ask about.
     memo: HashMap<usize, (u128, Rc<Vec<u128>>)>,
 }
 
@@ -97,9 +109,27 @@ impl Ctx<'_> {
         if let Some((exact, vec)) = self.memo.get(&key) {
             return (*exact, Rc::clone(vec));
         }
-        let exact = merkle(node, self.li);
-        let mut hashes = Vec::new();
-        collect_hashes(node, &mut hashes, self.li);
+        let (exact, mut hashes) = match self.index.get(&key) {
+            // The node's subtree is the contiguous pre-order range `i .. i + size`.
+            Some(&i) => {
+                let i = i as usize;
+                let end = i + self.hashes.sizes[i] as usize;
+                (self.hashes.exact[i], self.hashes.masked[i..end].to_vec())
+            }
+            None => {
+                // Unreachable under the `index` invariant above. Kept as a from-scratch
+                // fallback rather than a panic so a future caller that violates it is
+                // merely SLOW, never WRONG; `debug_assert` makes it a hard failure in
+                // tests, so the violation cannot land silently.
+                debug_assert!(
+                    false,
+                    "node_info on a node outside the two input trees — the address-keyed \
+                     index cannot see it (see Ctx::index)"
+                );
+                let th = crate::fingerprint::tree_hashes(&[node], self.li);
+                (th.exact[0], th.masked)
+            }
+        };
         hashes.sort_unstable();
         let vec = Rc::new(hashes);
         self.memo.insert(key, (exact, Rc::clone(&vec)));
@@ -169,6 +199,16 @@ pub fn anti_unify(
     ir: bool,
     li: &LabelInterner,
 ) -> AuOutcome {
+    // Hash both input trees ONCE, bottom-up, before the DP runs (see `Ctx::hashes`).
+    // Every node `node_info` will ever be asked about lives in one of these two trees, so
+    // this single O(k) pass replaces the old per-node, per-DP-cell re-hashing.
+    let hashes = crate::fingerprint::tree_hashes(&[a, b], li);
+    let index: HashMap<usize, u32> = hashes
+        .addrs
+        .iter()
+        .enumerate()
+        .map(|(i, &addr)| (addr, i as u32))
+        .collect();
     let mut ctx = Ctx {
         profile,
         ir,
@@ -177,6 +217,8 @@ pub fn anti_unify(
         next_sym: li.intern("__next"),
         holes: HashMap::new(),
         next_hole: 0,
+        hashes,
+        index,
         memo: HashMap::new(),
     };
     let template = au(a, b, &mut ctx);
@@ -433,13 +475,6 @@ fn similarity(a: &NormNode, b: &NormNode, ctx: &mut Ctx) -> f64 {
     }
 }
 
-fn collect_hashes(node: &NormNode, out: &mut Vec<u128>, li: &LabelInterner) {
-    out.push(merkle_mode(node, HashMode::MaskedAll, li));
-    for child in &node.children {
-        collect_hashes(child, out, li);
-    }
-}
-
 /// Collect operands of a same-kind, same-operator chain (mirrors the
 /// normalize-pass flatten; template-only shape, rebuilding is not needed).
 ///
@@ -668,4 +703,143 @@ fn kind_keyword(kind: Kind) -> Option<&'static str> {
         .collect()
     });
     KEYWORDS.get(&kind).copied()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, Normalizer};
+    use crate::fingerprint::{HashMode, merkle_mode, ops};
+    use crate::lang::Lang;
+
+    /// A tree deep enough that the OLD per-node `merkle_mode` walk pays the depth
+    /// factor visibly: each nested level re-hashes everything below it.
+    const DEEP_A: &str = "\
+def g(a, b, c, d):
+    if a > b:
+        for i in range(c):
+            while d > 0:
+                r = a + b * c - d
+                s = (a + b) * (c - d)
+                d = d - r + s
+    return d
+";
+    const DEEP_B: &str = "\
+def h(a, b, c, d):
+    if a > b:
+        for i in range(c):
+            while d > 0:
+                r = a + b * c - d
+                s = (a - b) * (c + d)
+                d = d + r - s
+    return d
+";
+
+    fn nodes(n: &NormNode) -> u64 {
+        1 + n.children.iter().map(nodes).sum::<u64>()
+    }
+
+    struct Fixture {
+        li: std::sync::Arc<crate::intern::LabelInterner>,
+        ua: crate::unit::Unit,
+        ub: crate::unit::Unit,
+        ir: bool,
+    }
+
+    fn fixture() -> Fixture {
+        let cfg = Config::default();
+        let li = crate::intern::LabelInterner::new();
+        let ua =
+            crate::unit::units_from_source_with_interner(DEEP_A, Lang::Python, &cfg, &li).remove(0);
+        let ub =
+            crate::unit::units_from_source_with_interner(DEEP_B, Lang::Python, &cfg, &li).remove(0);
+        let ir = cfg.normalize.normalizer == Normalizer::Ir
+            && crate::frontend::has_ir_frontend(Lang::Python);
+        Fixture { li, ua, ub, ir }
+    }
+
+    /// THE O(k) PROPERTY — the defect this test exists to pin.
+    ///
+    /// `anti_unify` must hash each node of its two input trees a BOUNDED number of
+    /// times — once per hash mode (`Exact` + `MaskedAll`), from one bottom-up pass —
+    /// NOT once per ancestor. The old `collect_hashes` called the fully-recursive
+    /// `merkle_mode` at EVERY node of the subtree, so a node was re-hashed once for
+    /// each of its ancestors: O(k * depth), which on `fs` meant 925.7M node-hashes to
+    /// serve 12.3M nodes (~75x redundant).
+    ///
+    /// Asserted on a COUNTER, never on wall time: wall drifts ±50% batch-to-batch on
+    /// this box, the op count does not drift at all.
+    #[test]
+    fn anti_unify_hashes_each_node_once_per_mode() {
+        let f = fixture();
+        let (ta, tb) = (f.ua.tree.expect_resident(), f.ub.tree.expect_resident());
+        let profile = (!f.ir).then(|| Lang::Python.profile());
+        let k = nodes(ta) + nodes(tb);
+
+        // Snapshot AFTER extraction (which hashes too) so we count only anti_unify.
+        let before = ops::local();
+        let _ = anti_unify(ta, tb, profile, f.ir, &f.li);
+        let used = ops::local() - before;
+
+        // Exactly two hashes per node: one `Exact`, one `MaskedAll`, in a single
+        // bottom-up pass over each input tree.
+        assert_eq!(
+            used,
+            2 * k,
+            "anti_unify computed {used} node-hashes for {k} nodes ({:.1}x per node); \
+             a node must be hashed ONCE PER MODE (2 * {k} = {}). More than that means \
+             a subtree is being re-hashed once per ancestor (the O(k*depth) defect).",
+            used as f64 / k as f64,
+            2 * k,
+        );
+    }
+
+    /// The memoized bottom-up hashes must be BIT-IDENTICAL to the unmemoized
+    /// recursive `merkle_mode` — for EVERY node, in BOTH modes. This is the whole
+    /// safety claim: the change is a pure memoization of a deterministic function, so
+    /// if any hash moves, the memo is wrong. (Byte-identity of scan output is the
+    /// outer gate; this is the same invariant pinned at the unit.)
+    #[test]
+    fn bottom_up_hashes_equal_unmemoized_merkle_for_every_node() {
+        let f = fixture();
+
+        for root in [f.ua.tree.expect_resident(), f.ub.tree.expect_resident()] {
+            let th = crate::fingerprint::tree_hashes(&[root], &f.li);
+            assert_eq!(th.masked.len() as u64, nodes(root), "one slot per node");
+
+            // Walk the tree in the SAME pre-order the pass uses, and check each node
+            // against a from-scratch recursive hash of that node.
+            fn check(
+                node: &NormNode,
+                i: &mut usize,
+                th: &crate::fingerprint::TreeHashes,
+                li: &crate::intern::LabelInterner,
+            ) {
+                let idx = *i;
+                *i += 1;
+                assert_eq!(
+                    th.masked[idx],
+                    merkle_mode(node, HashMode::MaskedAll, li),
+                    "MaskedAll hash diverged at pre-order {idx} (kind {})",
+                    node.kind.as_str(),
+                );
+                assert_eq!(
+                    th.exact[idx],
+                    merkle_mode(node, HashMode::Exact, li),
+                    "Exact hash diverged at pre-order {idx} (kind {})",
+                    node.kind.as_str(),
+                );
+                for c in &node.children {
+                    check(c, i, th, li);
+                }
+                // The subtree range must be exactly this node's subtree.
+                assert_eq!(
+                    th.sizes[idx] as usize,
+                    *i - idx,
+                    "subtree size wrong at pre-order {idx}",
+                );
+            }
+            check(root, &mut 0, &th, &f.li);
+        }
+    }
 }

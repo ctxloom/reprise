@@ -136,6 +136,16 @@ fn run() -> anyhow::Result<i32> {
         } => {
             let config = reprise::Config::load(&path)?;
             let report = reprise::scan(&path, &config)?;
+            // Instrumented builds only (`--features hash-counter`, never shipped): the
+            // scan-wide node-hash count. Wall time on the dev box drifts ±50%
+            // batch-to-batch; this count does not drift, so it — not a stopwatch — is the
+            // primary evidence for a change to the hashing path.
+            #[cfg(feature = "hash-counter")]
+            eprintln!(
+                "REPRISE_HASH_OPS {} AU_NODES {}",
+                reprise::fingerprint::ops::global(),
+                reprise::fingerprint::ops::au_nodes()
+            );
             // `scan` always exits 0, so a broken pipe exits 0 too.
             match format.as_str() {
                 "terminal" => emit(

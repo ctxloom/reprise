@@ -72,12 +72,73 @@ fn push_label(buf: &mut Vec<u8>, label: &Option<Label>, mode: HashMode, li: &Lab
     }
 }
 
+/// Node-hash op counter — the load-immune instrument for the hashing hot path.
+///
+/// "Instrument first. Understand. Then change." (CLAUDE.md): the near tier's cost is a
+/// COUNT of node-hashes, not a wall time, so the count is what we measure. Wall time on
+/// this box drifts ±50% batch-to-batch; this counter does not drift at all.
+///
+/// Compiled ONLY in test builds (`cfg(test)`) and under the opt-in `hash-counter`
+/// feature. A production build carries no counter, no atomic, and no branch — the
+/// `bump()` call sites vanish entirely.
+///
+/// Two counters, because the two consumers need different things:
+/// - `local()` is a THREAD-LOCAL count, so a unit test can assert an EXACT op count even
+///   while other tests run concurrently in the same process. It cannot be polluted.
+/// - `global()` is the process-wide sum across rayon's workers — the scan-level figure.
+#[cfg(any(test, feature = "hash-counter"))]
+pub mod ops {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static GLOBAL: AtomicU64 = AtomicU64::new(0);
+    static AU_NODES: AtomicU64 = AtomicU64::new(0);
+
+    thread_local! {
+        static LOCAL: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(super) fn bump() {
+        #[cfg(feature = "hash-counter")]
+        GLOBAL.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        LOCAL.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Nodes walked by `tree_hashes` — i.e. the near tier's OWN hashing work, summed over
+    /// every `anti_unify` call. Separates the near tier's share of `global()` from
+    /// extraction's (`subtree_inventory`/`fold`/`normalize` hash the corpus too, and this
+    /// patch does not touch them). Also the denominator for the cross-pair-cache question:
+    /// this counts a unit's nodes once per PAIR it appears in.
+    pub(super) fn bump_au_nodes() {
+        #[cfg(feature = "hash-counter")]
+        AU_NODES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Node-hashes computed by THIS thread so far (exact; immune to other tests).
+    pub fn local() -> u64 {
+        LOCAL.with(Cell::get)
+    }
+
+    /// Node-hashes computed by every thread so far (the scan-wide figure).
+    pub fn global() -> u64 {
+        GLOBAL.load(Ordering::Relaxed)
+    }
+
+    /// Nodes the near tier hashed, scan-wide (2 hashes each: `Exact` + `MaskedAll`).
+    pub fn au_nodes() -> u64 {
+        AU_NODES.load(Ordering::Relaxed)
+    }
+}
+
 fn hash_from_parts(
     node: &NormNode,
     mode: HashMode,
     child_hashes: &[u128],
     li: &LabelInterner,
 ) -> u128 {
+    #[cfg(any(test, feature = "hash-counter"))]
+    ops::bump();
     let mut buf = Vec::with_capacity(64 + 16 * child_hashes.len());
     buf.extend_from_slice(node.kind.as_str().as_bytes());
     buf.push(0);
@@ -105,6 +166,85 @@ pub fn merkle_mode(node: &NormNode, mode: HashMode, li: &LabelInterner) -> u128 
 /// Whole-unit exact structural hash (tier `exact-normalized`).
 pub fn merkle(node: &NormNode, li: &LabelInterner) -> u128 {
     merkle_mode(node, HashMode::Exact, li)
+}
+
+/// Every node's hashes, computed ONCE, bottom-up — the near tier's (`au.rs`) view of an
+/// input tree.
+///
+/// All three vectors are indexed by PRE-ORDER position, and pre-order has the property
+/// this type is built on: a node's subtree is a CONTIGUOUS range. Node `i`'s subtree is
+/// exactly `i .. i + sizes[i]`, so "the multiset of hashes under node `i`" is a slice —
+/// no walk, no re-hashing.
+///
+/// Why this exists: `au::Ctx::node_info` needs, for many nodes of the two units under
+/// comparison, that node's exact hash and the multiset of `MaskedAll` hashes beneath it.
+/// It used to get them by calling the fully-recursive `merkle_mode` at every node of the
+/// subtree — so each node was re-hashed once per ANCESTOR (O(k * depth)). On the `fs`
+/// corpus that was 925.7M node-hashes to serve 12.3M nodes. Hashing each node once and
+/// slicing makes it O(k), and is a pure memoization of a deterministic function: the
+/// hashes are BIT-IDENTICAL to the recursive ones (each node still hashes exactly
+/// `hash_from_parts(node, mode, its children's hashes)` — the same function of the same
+/// inputs, just not recomputed). `au::tests` pins that equality node-by-node.
+///
+/// This is the same children-once-accumulated-upward shape `walk_inventory` below already
+/// uses; the two are the file's one hashing pattern, not two.
+pub struct TreeHashes {
+    /// `HashMode::MaskedAll` hash per node, pre-order.
+    pub masked: Vec<u128>,
+    /// `HashMode::Exact` hash per node, pre-order.
+    pub exact: Vec<u128>,
+    /// Subtree node count per node, pre-order — node `i` spans `i .. i + sizes[i]`.
+    pub sizes: Vec<u32>,
+    /// Node ADDRESS per node, pre-order, so a caller can map a `&NormNode` it holds back
+    /// to its index. Sound only while the trees are immovable (see `au::Ctx`).
+    pub addrs: Vec<usize>,
+}
+
+/// Hash every node of each root in `roots`, bottom-up, in one pass (spec §5.5).
+///
+/// Roots are laid out consecutively in one set of arrays: each root's pre-order block
+/// follows the previous one, so subtree ranges stay contiguous and valid across roots.
+pub fn tree_hashes(roots: &[&NormNode], li: &LabelInterner) -> TreeHashes {
+    let mut th = TreeHashes {
+        masked: Vec::new(),
+        exact: Vec::new(),
+        sizes: Vec::new(),
+        addrs: Vec::new(),
+    };
+    for root in roots {
+        walk_tree_hashes(root, li, &mut th);
+    }
+    th
+}
+
+/// Children first, then the parent from its children's hashes — so each node is hashed
+/// exactly once per mode. Returns `(masked, exact, subtree_size)` to its parent.
+fn walk_tree_hashes(node: &NormNode, li: &LabelInterner, th: &mut TreeHashes) -> (u128, u128, u32) {
+    #[cfg(any(test, feature = "hash-counter"))]
+    ops::bump_au_nodes();
+    // Claim this node's pre-order slot BEFORE descending, so children land after it.
+    let idx = th.masked.len();
+    th.masked.push(0);
+    th.exact.push(0);
+    th.sizes.push(0);
+    th.addrs.push(std::ptr::from_ref(node) as usize);
+
+    let mut child_masked = Vec::with_capacity(node.children.len());
+    let mut child_exact = Vec::with_capacity(node.children.len());
+    let mut size = 1u32;
+    for child in &node.children {
+        let (m, e, s) = walk_tree_hashes(child, li, th);
+        child_masked.push(m);
+        child_exact.push(e);
+        size += s;
+    }
+
+    let masked = hash_from_parts(node, HashMode::MaskedAll, &child_masked, li);
+    let exact = hash_from_parts(node, HashMode::Exact, &child_exact, li);
+    th.masked[idx] = masked;
+    th.exact[idx] = exact;
+    th.sizes[idx] = size;
+    (masked, exact, size)
 }
 
 /// One subtree of the bag inventory: hash + pre-order token offset + size.

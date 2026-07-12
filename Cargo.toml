@@ -84,6 +84,15 @@ xxhash-rust = { version = "0.8.16", features = ["xxh3"] }
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 tikv-jemallocator = "0.7"
 
+# Opt-in instrumentation, OFF by default and never in a shipped build. Compiles the
+# node-hash op counter in `src/fingerprint.rs` (`fingerprint::ops`) into a release
+# binary, so the near tier's hashing cost can be counted on a real corpus scan. Wall
+# time on the dev box drifts ±50% batch-to-batch (CLAUDE.md); this counter does not
+# drift, which is why it — not a stopwatch — is the primary evidence for a hashing
+# change. Unit tests get the same counter for free via `cfg(test)`.
+[features]
+hash-counter = []
+
 # The root crate is also the workspace root. Server surfaces live in additive
 # crates under crates/ (docs/SERVERS.md D-SRV-2) so the CLI's buildless,
 # tokio-free, single-static-binary profile is untouched — `cargo build`
