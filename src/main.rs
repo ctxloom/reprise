@@ -2,15 +2,39 @@ use anyhow::bail;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-// On musl (the fully-static Linux release/`install-static` build) the default
-// allocator is pathologically slow under reprise's rayon-parallel,
-// allocation-heavy scan — ~16x vs glibc on the 500k perf corpus (77s vs 4.7s),
-// which blows the ≤10s perf gate. mimalloc restores glibc-class performance.
-// glibc and macOS builds keep the system allocator (already fast). Gated by
-// target_env so it only affects musl, mirroring ripgrep. See DECISIONS.md D42.
-#[cfg(target_env = "musl")]
+// jemalloc on every target EXCEPT Windows — D42's musl-only gate is lifted (mostly).
+// Two independent, separately-measured reasons:
+//
+//  1. musl (D42's, unchanged): the default musl allocator is ~16x slower than glibc
+//     under the rayon-parallel scan (77s vs 4.7s on the 500k perf corpus).
+//
+//  2. glibc (dev/CI build — the allocator-residual investigation): glibc malloc
+//     cannot give back the trees the memory gate frees. Extraction packs ~12.7 GB of
+//     `NormNode` (64 B each) into rayon's per-thread arenas as MILLIONS of small
+//     chunks; the gate then spills the trees and frees them, leaving ~8.7 GB of free
+//     chunks (18.3 M of them at drivers/ scale) scattered MID-ARENA — so almost no
+//     page is wholly free and `malloc_trim` reclaims ~nothing. The near tier then
+//     asks for LARGE contiguous Vecs (the landmark entries/events), which exceed the
+//     mmap threshold and are served by FRESH mmap rather than out of that 8.7 GB —
+//     the freed memory is the wrong SHAPE to satisfy the new demand, so both are
+//     resident at once. jemalloc's arena/extent reclaim returns it, measured at
+//     drivers/ scale (interleaved): peak RSS 22.70 GB -> 15.37 GB (-7.33 GB, -32%)
+//     AND wall -29%. jemalloc also measured strictly better than mimalloc (which
+//     D42 originally used on musl) on both drivers/ and fs/, with no fs-scale
+//     regression, so it replaces mimalloc everywhere it can, rather than gating
+//     per-target. Output identical.
+//
+// This also makes the dev/CI (glibc) build match the SHIPPED (musl) binary, which
+// previously had mimalloc on musl only: the 22.6 GB peak that every Tier-2 memory
+// budget was built on was a glibc-dev-build artifact the release binary never had.
+//
+// Windows is excluded, not by choice: tikv-jemalloc-sys fails to build for
+// x86_64-pc-windows-gnu (reprise's shipped Windows target) — confirmed by attempting
+// it — mirroring long-unresolved upstream Windows gaps in jemalloc itself. Windows
+// keeps the system allocator, exactly as before this patch (no regression, no change).
+#[cfg(not(target_os = "windows"))]
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[derive(Parser)]
 #[command(
