@@ -8,8 +8,6 @@ pub mod diagnostics;
 
 use reprise::lang::Lang;
 use reprise::report::{Group, Member};
-use std::path::Path;
-use std::process::Command;
 
 /// Map an MCP/LSP language argument to a `reprise` language.
 ///
@@ -50,90 +48,14 @@ pub fn split_primary(group: &Group) -> Option<(&Member, &[Member])> {
     group.members.split_first()
 }
 
-/// How a server chooses `check`'s base ref when the caller did not pass one
-/// (docs/SERVERS.md §5). Precedence, highest first:
-///   1. an explicit base the caller supplies (e.g. an MCP `base` argument),
-///   2. `[baseline] ref` pinned in `reprise.toml` (`config.baseline.pinned`),
-///   3. the merge-base of `HEAD` with the repo's default branch — the
-///      interactive PR-preview base,
-///   4. `HEAD`, when git is unavailable or history is too shallow for a base.
+/// `check`'s base-ref resolution — explicit → pinned `[baseline] ref` →
+/// merge-base with the default branch (the PR base) → `HEAD`.
 ///
-/// Infallible: it always yields *some* ref, degrading to `HEAD` rather than
-/// erroring, so a server never fails a request purely on baseline resolution.
-pub fn resolve_base(root: &Path, explicit: Option<&str>, cfg: &reprise::Config) -> String {
-    explicit_or_pinned(explicit, cfg)
-        .unwrap_or_else(|| merge_base_with_default(root).unwrap_or_else(|| "HEAD".to_string()))
-}
-
-/// The git-free half of [`resolve_base`]: an explicit base, else the pinned
-/// config ref. `None` when neither is set (blank/whitespace counts as unset),
-/// leaving the caller to fall back to the git merge-base.
-fn explicit_or_pinned(explicit: Option<&str>, cfg: &reprise::Config) -> Option<String> {
-    if let Some(b) = explicit.map(str::trim).filter(|b| !b.is_empty()) {
-        return Some(b.to_string());
-    }
-    cfg.baseline
-        .pinned
-        .as_deref()
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .map(String::from)
-}
-
-/// The merge-base commit between `HEAD` and the repo's default branch. `None`
-/// if git is absent, `root` is not a repo, or no base is found — [`resolve_base`]
-/// then falls back to `HEAD`.
-fn merge_base_with_default(root: &Path) -> Option<String> {
-    let default = default_branch(root)?;
-    let sha = git(root, &["merge-base", "HEAD", &default])?;
-    let sha = sha.trim();
-    (!sha.is_empty()).then(|| sha.to_string())
-}
-
-/// The repo's default branch ref: the remote's advertised default
-/// (`origin/HEAD` → e.g. `origin/main`), else the first common branch that
-/// actually exists.
-fn default_branch(root: &Path) -> Option<String> {
-    if let Some(sym) = git(
-        root,
-        &[
-            "symbolic-ref",
-            "--quiet",
-            "--short",
-            "refs/remotes/origin/HEAD",
-        ],
-    ) {
-        let name = sym.trim();
-        if !name.is_empty() {
-            return Some(name.to_string());
-        }
-    }
-    ["origin/main", "origin/master", "main", "master"]
-        .into_iter()
-        .find(|cand| git(root, &["rev-parse", "--verify", "--quiet", cand]).is_some())
-        .map(String::from)
-}
-
-/// Run a git subcommand in `root`, returning trimmed-nothing stdout on a clean
-/// exit and `None` otherwise. Never panics: a missing git binary is just `None`.
-///
-/// Scrubs GIT_INDEX_FILE/GIT_DIR/GIT_WORK_TREE for the same reason as
-/// `reprise::check::git_cmd`: an inherited value redirects this child at the
-/// CALLER's repo state (e.g. a pre-commit hook's index) instead of `root`.
-fn git(root: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .output()
-        .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
-}
+/// Re-exported from the core (`reprise::baseline::resolve_base`), NOT
+/// reimplemented: the CLI and both servers must resolve the base identically, or
+/// a local pre-commit run and CI would gate different diffs (docs/SERVERS.md §5,
+/// DECISIONS.md D52).
+pub use reprise::baseline::resolve_base;
 
 #[cfg(test)]
 mod tests {
@@ -194,22 +116,5 @@ mod tests {
         assert_eq!(primary.name, "a.rs");
         assert_eq!(related.len(), 2);
         assert!(split_primary(&group_with(0.1, vec![])).is_none());
-    }
-
-    #[test]
-    fn base_precedence_is_explicit_then_pinned_then_none() {
-        let mut cfg = reprise::Config::default();
-        cfg.baseline.pinned = Some("v1.4.0".into());
-        assert_eq!(
-            explicit_or_pinned(Some("origin/main"), &cfg).as_deref(),
-            Some("origin/main")
-        );
-        // Blank explicit falls through to the pinned ref.
-        assert_eq!(
-            explicit_or_pinned(Some("  "), &cfg).as_deref(),
-            Some("v1.4.0")
-        );
-        assert_eq!(explicit_or_pinned(None, &cfg).as_deref(), Some("v1.4.0"));
-        assert_eq!(explicit_or_pinned(None, &reprise::Config::default()), None);
     }
 }

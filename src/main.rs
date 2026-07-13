@@ -182,11 +182,12 @@ fn run() -> anyhow::Result<i32> {
             verbose,
         } => {
             let config = reprise::Config::load(&path)?;
-            let base = base
-                .or_else(|| config.baseline.pinned.clone())
-                .ok_or_else(|| anyhow::anyhow!(
-                    "no base ref: pass --base <ref> or pin one in reprise.toml ([baseline] ref = \"...\")"
-                ))?;
+            // `check` is a PR check: bare `reprise check .` asks "what does this
+            // BRANCH add, relative to the default branch?" — so the base resolves
+            // explicit → pinned → merge-base with the default branch → HEAD, via
+            // the SAME helper both servers use. A CLI-only resolution rule would
+            // let a local pre-commit run and CI gate different diffs.
+            let base = reprise::baseline::resolve_base(&path, base.as_deref(), &config);
             let report = reprise::check::run(&path, &config, &base, fail_on.as_deref())?;
             // Compute the gate code UP FRONT: exit 1 only for real findings, else 0
             // (errors above already mapped to 2). A broken pipe (`… | head`) must exit

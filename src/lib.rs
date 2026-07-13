@@ -24,6 +24,7 @@ pub mod normalize;
 pub mod pack;
 pub mod report;
 pub mod seq;
+pub mod source;
 pub mod stream;
 #[cfg(test)]
 pub(crate) mod test_utils;
@@ -96,7 +97,22 @@ pub struct CorpusUnits {
 /// a walk+extract loop, so every caller shares one walk/cache/extract path and its
 /// D19 cache-reuse (docs/SERVERS.md §7 M1, DECISIONS.md D46).
 pub fn corpus_units(root: &Path, config: &Config) -> anyhow::Result<CorpusUnits> {
-    let files = walk::collect_files(root, config)?;
+    corpus_units_from(&source::FsSource::new(root), config)
+}
+
+/// [`corpus_units`] over an arbitrary [`ContentSource`](source::ContentSource) —
+/// the live checkout (`scan`), or a git tree with no checkout at all (`check`,
+/// reading the index or a base ref straight from the object store).
+///
+/// Unit identity is source-independent: paths are `source.root()`-relative and
+/// the D19 cache key is content-addressed, so a file whose staged bytes equal its
+/// on-disk bytes is a cache HIT across the two sources rather than a re-extraction.
+pub fn corpus_units_from(
+    source: &dyn source::ContentSource,
+    config: &Config,
+) -> anyhow::Result<CorpusUnits> {
+    let root = source.root();
+    let files = source.files(config)?;
 
     // Interning WP (session `stark-mixed-front`): ONE fresh per-scan `LabelInterner`
     // for this whole `corpus_units` call — scoped exactly to this call (per the
@@ -137,10 +153,10 @@ pub fn corpus_units(root: &Path, config: &Config) -> anyhow::Result<CorpusUnits>
     let outcomes: Vec<(std::path::PathBuf, FileOutcome)> = files
         .par_iter()
         .map(|(path, lang)| {
-            let outcome = match std::fs::read_to_string(path) {
-                Err(_) => FileOutcome::Unreadable,
-                Ok(src) if walk::is_generated(&src, config) => FileOutcome::SkippedGenerated,
-                Ok(src) => {
+            let outcome = match source.read(path) {
+                None => FileOutcome::Unreadable,
+                Some(src) if walk::is_generated(&src, config) => FileOutcome::SkippedGenerated,
+                Some(src) => {
                     // D8/D19 version-keyed per-file cache: a hit is
                     // byte-identical to a cold extraction by contract.
                     let key = cache::key(&baseline::relative_file(path, root), &src, config);
@@ -284,8 +300,19 @@ impl Drop for PackDirCleanup {
     }
 }
 
-/// Full-repo scan (spec §2 `reprise scan`).
+/// Full-repo scan (spec §2 `reprise scan`) over the live checkout.
 pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
+    scan_source(&source::FsSource::new(root), config)
+}
+
+/// [`scan`] over an arbitrary [`ContentSource`](source::ContentSource). `check`
+/// scans a git tree through this — the index for the prospective commit, the base
+/// ref for base state — so it never materialises a checkout to read.
+pub fn scan_source(
+    source: &dyn source::ContentSource,
+    config: &Config,
+) -> anyhow::Result<ScanReport> {
+    let root = source.root();
     let started = Instant::now();
     let CorpusUnits {
         mut units,
@@ -296,7 +323,7 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
         source_digests,
         mut stats,
         label_interner,
-    } = corpus_units(root, config)?;
+    } = corpus_units_from(source, config)?;
     let plain_count = units.len();
 
     let mut phase_started = started;
@@ -695,8 +722,13 @@ pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
                 let mut mem = |u: usize, range: (usize, usize)| {
                     let unit = &units[u];
                     let src: &str = src_cache.entry(unit.file.clone()).or_insert_with(|| {
-                        std::fs::read_to_string(&unit.file)
-                            .ok()
+                        // Re-read through the SAME source the units came from. Going to
+                        // the filesystem here would render a git-sourced scan's line spans
+                        // against worktree bytes — the digest guard would catch the
+                        // mismatch and blank them, so the bug would show up as silently
+                        // missing line numbers rather than as an error.
+                        source
+                            .read(&unit.file)
                             .filter(|text| {
                                 Some(xxhash_rust::xxh3::xxh3_128(text.as_bytes()))
                                     == source_digests.get(&unit.file).copied()

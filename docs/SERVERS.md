@@ -178,7 +178,8 @@ synthetic).
   new code — bounded by the language partition, but the real cost.
 - **Unlocks:** dirty-buffer live-as-you-type (D-SRV-4) via an extracted `analyze(units,
   sources, cfg) -> ScanReport` (from the ~450-line `scan()`); and warm baseline state making
-  the live drift guardrail (M4) affordable per-save instead of a fresh git worktree each time.
+  the live drift guardrail (M4) affordable per-save instead of a fresh base scan each time
+  (`check` reads the base ref from the object store, never a worktree — D52).
 - **Gate:** a written latency trigger (target repo + threshold), not a vibe (cf. D-IR-7).
 
 ## 7. Milestones

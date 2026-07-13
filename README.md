@@ -335,9 +335,12 @@ protocol fault, so the model reads what went wrong and can fix its call.
 `reprise_check` resolves its base ref when `base` is omitted, in this order: the
 pinned `[baseline] ref` from `reprise.toml`, then the merge-base of `HEAD` with
 the repo's default branch, then `HEAD`. It always resolves to something, so an
-agent's call never fails on baseline resolution alone. The CLI is stricter — bare
-`reprise check .` with no `--base` and no pinned ref is an error rather than a
-guess.
+agent's call never fails on baseline resolution alone. **The CLI resolves it the
+same way, through the same helper** (`reprise::baseline::resolve_base`): bare
+`reprise check .` means "what does this branch add, relative to the default
+branch?" — the PR question the command exists to answer. One resolution rule for
+the CLI and both servers is deliberate: a base that differed between a local
+pre-commit run and CI would turn a green hook into a red PR.
 
 `reprise_find_similar` is the one to reach for while writing code, and it answers
 the question the whole tool exists for: does this helper already exist? Pass a

@@ -1276,3 +1276,80 @@ and the other never was.
 
 Spec §5.5.4/§9 updated (PLAN.md); `docs/substantiality-metric.md` and `CALIBRATION.md` annotated
 where they described the gate as live.
+
+## D52 — `check` reads the git object store: the INDEX, never the worktree (supersedes D41's base-worktree + archive fallback; 2026-07-13)
+
+`reprise check` resolved both halves of its input from the **working tree**: the changed-unit set
+came from `git diff -U0 <base>` (no `--cached`), and the file *content* came from a filesystem walk.
+Base state was synthesized by materialising the base ref as a real checkout — `git worktree add`
+**inside the scanned repo**, removed in `Drop`, with a `git archive | tar` fallback (D41(b)) for
+clones where `worktree add` fails.
+
+Both halves were wrong, and for the same reason: **the scanner could only read a filesystem**, so
+`check` had to conjure a filesystem to read.
+
+**Defect 1 — it judged code that was not being committed.** Reported from the field: a commit of
+five staged files was failed by `inconsistent-update` findings in two files that were merely *dirty*
+in the checkout, left there by a different concurrent session. On a shared or multi-agent working
+tree — the workflow reprise is explicitly built for — the flagship pre-commit gate fails commits
+over other people's work-in-progress. A gate that cries wolf is a gate people disable, and CLAUDE.md
+tells agents never to bypass it.
+
+**Defect 2 — a report-only tool wrote to the scanned repo.** `Drop` does not run on `SIGKILL`, and
+an OOM-killed scan is exactly that; a killed `check` strands a worktree registration in the *user's*
+`.git`. Not observed in the wild, but structural.
+
+**The decision: make the content source an abstraction** (`src/source.rs`, `ContentSource`).
+`scan` reads the live checkout (`FsSource`). `check` reads git objects (`GitSource`): the **index**
+for the prospective commit, the **base ref** for base state — via `ls-files --stage` / `ls-tree -r`
+plus one `cat-file --batch` pass. `git diff` gains `--cached`.
+
+Consequences:
+- **The bytes judged are the bytes committed.** An unstaged edit is invisible to `check` by
+  construction, not by filtering. (Filtering findings to the staged *file list* while still reading
+  worktree *content* was considered and rejected — it fingerprints bytes that are not being
+  committed.)
+- **No worktree is created in a user repo, ever.** The guarantee is structural rather than
+  best-effort cleanup, so `Drop`-vs-`SIGKILL` stops mattering.
+- **D41(b)'s archive fallback is deleted, not ported.** It existed solely to work around checkout
+  layouts where `worktree add` fails; object reads do not care about checkout layout. Its
+  shell-injection hardening (cute-coral) is preserved by construction: the base ref is resolved to a
+  SHA via `rev-parse` and passed as a verbatim argv element, never through a shell.
+- **Cache-neutral.** The D19 per-file cache is content-addressed, so a staged blob whose bytes equal
+  the on-disk bytes is a cache HIT across sources (measured on ctxloom: 1031 hits, 0 misses).
+- **`scan` is byte-identical** — verified on reprise itself and on ctxloom, every group, finding and
+  stat, timings excluded.
+
+**In CI this changes nothing:** a CI checkout has index == HEAD, so `--cached` against the merge-base
+yields exactly the PR's changes. It changes local use: `check` now reports on what you have *staged*.
+An unstaged edit is not part of the prospective commit and is not reported.
+
+## D53 — `check` is a PR check: the CLI resolves the merge-base by default (2026-07-13)
+
+`check` is specified as PR mode (PLAN.md §2; README: "this is what runs in CI on a PR"), and the
+base-resolution policy for it already existed — `resolve_base`: explicit → pinned `[baseline] ref`
+→ **merge-base with the default branch** → `HEAD`. But it lived in `reprise-server-core` and was
+wired into the **MCP and LSP servers only**. The CLI required an explicit `--base` or a pinned ref
+and **errored** otherwise. The flagship PR check had no PR base.
+
+**What that cost.** The one deployment that mattered — a real pre-commit hook — could not use the
+default, so it pinned `--base HEAD`. That silently turns a PR gate into a **per-commit** gate: a
+duplicate introduced in branch commit 1 is no longer "touched" by commit 2, so it passes the local
+hook and then fails in CI, which diffs against the merge-base. **The local gate and the PR gate
+disagreed by construction.** With `--base HEAD`, the only thing separating "the commit" from "the
+checkout" is the index — which is precisely the confusion D52 had to untangle.
+
+**Decision.** `resolve_base` moves into the core (`reprise::baseline`), and the CLI uses it. Bare
+`reprise check .` now answers the question the command is for. `reprise-server-core` re-exports it
+rather than keeping a copy: **one resolution rule for the CLI and both servers**, because a base
+that differs between a local run and CI turns a green hook into a red PR.
+
+This also retires an axis-1 duplication: server-core carried its own `git()` helper whose doc
+comment said it scrubbed `GIT_INDEX_FILE` "for the same reason as `reprise::check::git_cmd`". The
+core helper is now the only one.
+
+**Consequence for hooks.** A pre-commit hook should pass no base (or the merge-base) rather than
+`--base HEAD`, so it previews exactly what CI will say. Once every copy of a duplicate lives on the
+branch, the gate stays quiet; while the branch carries a finding, it keeps reporting — which is what
+a drift gate is for. Base state is SHA-keyed and cached, so the extra scope costs one cached base
+scan.

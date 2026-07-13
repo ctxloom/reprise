@@ -3,6 +3,7 @@ sessions:
   - tidal-moral-chive
   - pulpy-wooly-list
   - sixth-flaky-saint
+  - woozy-uncut-comic
 ---
 
 # Implementation Plan: Semantic-ish Duplicate Detection for LLM-Generated Code
@@ -58,7 +59,7 @@ A CLI tool named **`reprise`**, written in **Rust**, using the `tree-sitter` cra
 Three modes:
 
 - `reprise scan <path>` — full-repo scan, emits a ranked report of duplicate groups.
-- `reprise check <path> --base <git-ref>` — PR mode: only functions added/modified since `<git-ref>` are queried against the index of the whole repo. Exit code nonzero above a configurable severity threshold, for CI. Also emits `inconsistent-update` findings (§6) when the diff touches some but not all members of a known duplicate group.
+- `reprise check <path> --base <git-ref>` — PR mode: only functions added/modified since `<git-ref>` are queried against the index of the whole repo. Exit code nonzero above a configurable severity threshold, for CI. Also emits `inconsistent-update` findings (§6) when the diff touches some but not all members of a known duplicate group. **`check` weighs the prospective COMMIT: it reads the git index and the base ref straight from the object store, never the working tree (D52).** So an unstaged edit is invisible to it — otherwise a pre-commit hook on a shared checkout would fail commits over edits nobody is committing. (In CI this is a distinction without a difference: index == HEAD there.)
 - `reprise baseline <path>` — writes all current findings, keyed by their stable structural/template fingerprints (§6.1), to a checked-in `reprise-baseline.json`. Subsequent `check` runs fail only on findings **not in the baseline or worsened since it** (divergence ratio increased, member added). This is the legacy-repo adoption path: without it, the first run on any existing codebase fails CI permanently. An inline `reprise:ignore` comment pragma (on the unit's first line) suppresses a specific unit from all tiers; suppression counts appear in scan stats so they can't silently accumulate.
 - Output formats: human-readable terminal (default), JSON (`--format json`), SARIF (`--format sarif`), CPD-XML (`--format cpd`), jscpd-JSON (`--format jscpd`) — see §6.1. Every finding must carry **original source coordinates** (file, line span) for all members of a duplicate group, the tier that produced it (§5), and a similarity score.
 

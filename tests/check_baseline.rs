@@ -108,6 +108,15 @@ fn git(dir: &Path, args: &[&str]) {
     );
 }
 
+/// The edits under test are the PROSPECTIVE COMMIT. `check` judges the git index
+/// — the bytes about to be committed — so a test that writes a drift must STAGE
+/// it. An unstaged edit is deliberately invisible to `check`: that is the
+/// contract, and `tests/check_staged.rs` pins it (a pre-commit hook must not
+/// fail a commit over another session's work-in-progress).
+fn stage_all(root: &Path) {
+    git(root, &["add", "-A"]);
+}
+
 fn git_repo_with_family() -> TempDir {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
@@ -299,6 +308,7 @@ fn drift_scenario_emits_inconsistent_update_naming_untouched_members() {
         .replace("90", "77");
     fs::write(root.join("m0.rs"), edited).unwrap();
 
+    stage_all(root);
     let report = reprise::check::run(root, &cfg, "HEAD", None).unwrap();
     assert!(report.failed(), "inconsistent update must fail CI");
     let iu: Vec<_> = report
@@ -365,6 +375,7 @@ fn consolidating_a_dup_group_into_one_helper_does_not_fire_inconsistent_update()
     fs::write(root.join("dup.rs"), &consolidated).unwrap();
 
     let cfg = Config::default();
+    stage_all(root);
     let report = reprise::check::run(root, &cfg, "HEAD", None).unwrap();
     assert!(
         !report
@@ -388,6 +399,7 @@ fn baselined_untouched_findings_are_exempt() {
 
     // Touch only the unrelated file.
     fs::write(root.join("unrelated.rs"), UNRELATED.replace("0x5A", "0x5B")).unwrap();
+    stage_all(root);
     let report = reprise::check::run(root, &cfg, "HEAD", None).unwrap();
     assert!(!report.failed(), "{:#?}", report.findings);
     assert!(report.baseline_total >= 1);
@@ -412,6 +424,7 @@ fn new_duplicate_involving_touched_unit_fails() {
     fs::write(root.join("n1.rs"), copy).unwrap();
     git(root, &["add", "."]);
 
+    stage_all(root);
     let report = reprise::check::run(root, &cfg, "HEAD", None).unwrap();
     assert!(report.failed(), "{:#?}", report.findings);
     assert!(
@@ -435,6 +448,7 @@ fn member_added_to_baselined_group_is_worsened() {
     fs::write(root.join("m3.rs"), family_member(3)).unwrap();
     git(root, &["add", "."]);
 
+    stage_all(root);
     let report = reprise::check::run(root, &cfg, "HEAD", None).unwrap();
     assert!(report.failed(), "{:#?}", report.findings);
     assert!(
@@ -458,6 +472,7 @@ fn fail_on_none_disables_the_gate() {
     let edited = family_member(0).replace("total", "running_sum");
     fs::write(root.join("m0.rs"), edited).unwrap();
 
+    stage_all(root);
     let report = reprise::check::run(root, &cfg, "HEAD", Some("none")).unwrap();
     assert!(!report.failed());
     // The finding is still reported, it just doesn't gate.
@@ -480,6 +495,7 @@ fn check_without_baseline_file_synthesizes_base_state_from_two_scan() {
     let edited = family_member(0).replace("total", "running_sum");
     fs::write(root.join("m0.rs"), edited).unwrap();
 
+    stage_all(root);
     let report = reprise::check::run(root, &Config::default(), "HEAD", None).unwrap();
     // Two-scan mode: base state comes from scanning the base ref, so the
     // pre-existing group IS the base state (not "everything is new") and the
@@ -530,6 +546,7 @@ fn cli_check_exit_codes() {
     // Drifted member: nonzero, and the report names the tier.
     let edited = family_member(0).replace("total", "running_sum");
     fs::write(root.join("m0.rs"), edited).unwrap();
+    stage_all(root);
     let out = Command::new(bin)
         .args(["check"])
         .arg(root)
@@ -597,6 +614,7 @@ fn check_emits_only_substantial_regions() {
     let mut a = std::fs::read_to_string(root.join("a.py")).unwrap();
     a.push_str("\n# touch\n");
     std::fs::write(root.join("a.py"), a).unwrap();
+    stage_all(root);
     let report = reprise::check::run(root, &reprise::Config::default(), "HEAD", None).unwrap();
     assert!(
         !report
@@ -657,6 +675,7 @@ fn check_without_baseline_prints_adoption_hint() {
     let mut a = std::fs::read_to_string(root.join("a.py")).unwrap();
     a.push_str("\n# touch\n");
     std::fs::write(root.join("a.py"), a).unwrap();
+    stage_all(root);
     let report = reprise::check::run(root, &reprise::Config::default(), "HEAD", None).unwrap();
     assert!(
         report.base_state.starts_with("base-scan"),
@@ -676,6 +695,7 @@ fn two_scan_mode_fires_inconsistent_update_without_any_baseline_file() {
     git(root, &["commit", "-qm", "init"]);
     let cfg = Config::default();
     // Pre-existing duplication, untouched: exempt, exit clean.
+    stage_all(root);
     let clean = reprise::check::run(root, &cfg, "HEAD", None).unwrap();
     assert!(
         !clean.failed(),
@@ -689,6 +709,7 @@ fn two_scan_mode_fires_inconsistent_update_without_any_baseline_file() {
     src = src.replace("> 450", "> 999");
     assert!(src.contains("> 999"), "edit did not apply");
     fs::write(&f0, src).unwrap();
+    stage_all(root);
     let report = reprise::check::run(root, &cfg, "HEAD", None).unwrap();
     let iu = report
         .findings
@@ -706,6 +727,7 @@ fn two_scan_mode_fires_inconsistent_update_without_any_baseline_file() {
     // Transient base-state cache exists under .reprise (never in VCS).
     assert!(root.join(".reprise/base-state").is_dir());
     // Second run reuses it.
+    stage_all(root);
     let again = reprise::check::run(root, &cfg, "HEAD", None).unwrap();
     assert_eq!(again.base_state, "base-scan (cached)");
 }
@@ -744,6 +766,7 @@ fn region_drift_is_span_precise() {
     let mut src = fs::read_to_string(root.join("big.py")).unwrap();
     src = src.replace("audit(step_7, 7)", "audit_v2(step_7, 7, path)");
     fs::write(root.join("big.py"), src).unwrap();
+    stage_all(root);
     let report = reprise::check::run(root, &cfg, "HEAD", None).unwrap();
     assert!(
         !report
@@ -758,6 +781,7 @@ fn region_drift_is_span_precise() {
     let mut src = fs::read_to_string(root.join("big.py")).unwrap();
     src = src.replace("validate(entry, STRICT)", "validate(entry, LENIENT)");
     fs::write(root.join("big.py"), src).unwrap();
+    stage_all(root);
     let report = reprise::check::run(root, &cfg, "HEAD", None).unwrap();
     assert!(
         report
@@ -789,6 +813,7 @@ fn accept_drift_pragma_demotes_iu_to_info() {
         marked.replace("total", "running_sum").replace("90", "77"),
     )
     .unwrap();
+    stage_all(root);
     let report = reprise::check::run(root, &Config::default(), "HEAD", None).unwrap();
     let iu: Vec<_> = report
         .findings
@@ -803,6 +828,7 @@ fn accept_drift_pragma_demotes_iu_to_info() {
     fs::write(root.join("m0.rs"), &marked).unwrap(); // revert
     let m1 = family_member(1).replace("acc", "running_sum");
     fs::write(root.join("m1.rs"), m1).unwrap();
+    stage_all(root);
     let report = reprise::check::run(root, &Config::default(), "HEAD", None).unwrap();
     assert!(
         report.failed(),

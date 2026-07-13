@@ -125,3 +125,110 @@ impl Baseline {
         Ok(baseline)
     }
 }
+
+// ---------- base-ref resolution (docs/SERVERS.md §5) ----------
+
+/// How `check` chooses its base ref. Precedence, highest first:
+///   1. an explicit base the caller supplies (`--base`, an MCP `base` argument),
+///   2. `[baseline] ref` pinned in `reprise.toml` (`config.baseline.pinned`),
+///   3. the merge-base of `HEAD` with the repo's default branch — **the PR base**,
+///   4. `HEAD`, when git is unavailable or history is too shallow for a base.
+///
+/// Infallible: it always yields *some* ref, degrading to `HEAD` rather than
+/// erroring, so no caller fails a request purely on baseline resolution.
+///
+/// `check` is a PR check (spec §2): the question it answers is "what does this
+/// BRANCH add, relative to the default branch?" — so rung 3 is the default that
+/// makes the bare command mean the thing the command is for. It is shared by the
+/// CLI and both servers precisely so a local pre-commit run and CI cannot
+/// disagree about what is being gated: a base that differs between them turns a
+/// green hook into a red PR.
+pub fn resolve_base(root: &Path, explicit: Option<&str>, cfg: &crate::Config) -> String {
+    explicit_or_pinned(explicit, cfg)
+        .unwrap_or_else(|| merge_base_with_default(root).unwrap_or_else(|| "HEAD".to_string()))
+}
+
+/// The git-free half of [`resolve_base`]: an explicit base, else the pinned
+/// config ref. `None` when neither is set (blank/whitespace counts as unset),
+/// leaving the caller to fall back to the git merge-base.
+fn explicit_or_pinned(explicit: Option<&str>, cfg: &crate::Config) -> Option<String> {
+    if let Some(b) = explicit.map(str::trim).filter(|b| !b.is_empty()) {
+        return Some(b.to_string());
+    }
+    cfg.baseline
+        .pinned
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(String::from)
+}
+
+/// The merge-base commit between `HEAD` and the repo's default branch. `None`
+/// if git is absent, `root` is not a repo, or no base is found — [`resolve_base`]
+/// then falls back to `HEAD`.
+fn merge_base_with_default(root: &Path) -> Option<String> {
+    let default = default_branch(root)?;
+    let sha = git_stdout(root, &["merge-base", "HEAD", &default])?;
+    let sha = sha.trim();
+    (!sha.is_empty()).then(|| sha.to_string())
+}
+
+/// The repo's default branch ref: the remote's advertised default
+/// (`origin/HEAD` → e.g. `origin/main`), else the first common branch that
+/// actually exists.
+fn default_branch(root: &Path) -> Option<String> {
+    if let Some(sym) = git_stdout(
+        root,
+        &[
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ],
+    ) {
+        let name = sym.trim();
+        if !name.is_empty() {
+            return Some(name.to_string());
+        }
+    }
+    ["origin/main", "origin/master", "main", "master"]
+        .into_iter()
+        .find(|cand| git_stdout(root, &["rev-parse", "--verify", "--quiet", cand]).is_some())
+        .map(String::from)
+}
+
+/// Stdout of a git subcommand in `root` on a clean exit, else `None`. Never
+/// panics: a missing git binary is just `None`. Spawns through
+/// [`crate::check::git_cmd`], which scrubs the hook-injected git env — an
+/// inherited `GIT_INDEX_FILE` points a child at the CALLER's index (a
+/// pre-commit hook's), not at `root`.
+fn git_stdout(root: &Path, args: &[&str]) -> Option<String> {
+    let out = crate::check::git_cmd(root).args(args).output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+#[cfg(test)]
+mod base_resolution_tests {
+    use super::*;
+
+    #[test]
+    fn base_precedence_is_explicit_then_pinned_then_merge_base() {
+        let mut cfg = crate::Config::default();
+        cfg.baseline.pinned = Some("v1.4.0".into());
+        assert_eq!(
+            explicit_or_pinned(Some("origin/main"), &cfg).as_deref(),
+            Some("origin/main")
+        );
+        // Blank explicit falls through to the pinned ref.
+        assert_eq!(
+            explicit_or_pinned(Some("  "), &cfg).as_deref(),
+            Some("v1.4.0")
+        );
+        assert_eq!(explicit_or_pinned(None, &cfg).as_deref(), Some("v1.4.0"));
+        // Neither set: the caller falls back to the merge-base with the default
+        // branch (the PR base), and finally to HEAD — never an error.
+        assert_eq!(explicit_or_pinned(None, &crate::Config::default()), None);
+    }
+}
