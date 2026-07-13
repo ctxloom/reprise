@@ -117,6 +117,18 @@ fn inline_variant_converges_with_hand_inlined_copy() {
         chain.iter().any(|c| c.contains("adjust_price")),
         "chain does not name the expanded callee: {chain:?}"
     );
+    // Members must come out in (file, span) order regardless of match order.
+    let keys: Vec<_> = groups[0]
+        .members
+        .iter()
+        .map(|m| (m.file.clone(), m.line_span))
+        .collect();
+    let mut sorted = keys.clone();
+    sorted.sort();
+    assert_eq!(
+        keys, sorted,
+        "inline-group members must be (file, span)-ordered"
+    );
 }
 
 #[test]
@@ -301,6 +313,18 @@ fn inline_variant_converges_with_hand_inlined_copy_ir() {
     assert!(
         chain.iter().any(|c| c.contains("adjust_price")),
         "chain does not name the expanded callee: {chain:?}"
+    );
+    // Members must come out in (file, span) order regardless of match order.
+    let keys: Vec<_> = groups[0]
+        .members
+        .iter()
+        .map(|m| (m.file.clone(), m.line_span))
+        .collect();
+    let mut sorted = keys.clone();
+    sorted.sort();
+    assert_eq!(
+        keys, sorted,
+        "inline-group members must be (file, span)-ordered"
     );
 }
 

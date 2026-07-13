@@ -127,6 +127,33 @@ fn commutative_chain_flatten_converges_on_both_normalizers() {
     }
 }
 
+#[test]
+fn near_group_members_are_ordered_by_file_and_span() {
+    // Three near-variants of one function land in one near group; the report
+    // must list members in (file, span) order regardless of match order.
+    let a = "fn total(xs: &[i64], floor: i64) -> i64 {\n    let mut acc = 0;\n    for x in xs {\n        if *x > floor {\n            acc += x;\n        } else {\n            acc -= 1;\n        }\n        acc *= 2;\n    }\n    acc\n}\n";
+    let b = "fn total(xs: &[i64], floor: i64) -> i64 {\n    let mut acc = 0;\n    for i in 0..xs.len() {\n        if *xs[i] > floor {\n            acc += xs[i];\n        } else {\n            acc -= 1;\n        }\n        acc *= 2;\n    }\n    acc\n}\n";
+    let b2 = b.replace("acc *= 2;", "acc *= 2;\n        acc += floor;");
+    let c = b.replace("acc *= 2;", "acc *= 2;\n        acc -= floor;");
+    let report = scan_snippets("rs", &[a, &b2, &c]);
+    let group = report
+        .groups
+        .iter()
+        .find(|g| g.tier.to_string() == "near-normalized" && g.members.len() >= 3)
+        .unwrap_or_else(|| panic!("no 3-member group: {:#?}", report.groups));
+    let keys: Vec<_> = group
+        .members
+        .iter()
+        .map(|m| (m.file.clone(), m.line_span))
+        .collect();
+    let mut sorted = keys.clone();
+    sorted.sort();
+    assert_eq!(
+        keys, sorted,
+        "group members must be ordered by (file, span)"
+    );
+}
+
 // ---------- recursion lowering (spec §5.2.2, Rev 5) ----------
 
 const PY_ITER: &str = "def reduce_pair(a, b, log):\n    while b != 0:\n        log.append(\"step: \" + str(a) + \" \" + str(b))\n        a, b = b, a % b\n    return a\n";

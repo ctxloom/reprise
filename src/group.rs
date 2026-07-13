@@ -116,7 +116,9 @@ pub fn build_inline_exact_groups(
             .iter()
             .map(|&i| crate::unit::base_of(units, i))
             .collect();
-        base_members.sort_by_key(|&i| (units[i].file.clone(), units[i].byte_span));
+        base_members.sort_by(|&a, &b| {
+            (&units[a].file, units[a].byte_span).cmp(&(&units[b].file, units[b].byte_span))
+        });
         base_members.dedup();
         if base_members.len() < 2 {
             continue;

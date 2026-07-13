@@ -1165,7 +1165,9 @@ fn build_groups(
         .map(|acc| {
             let best = acc.best.unwrap();
             let mut member_units = acc.members;
-            member_units.sort_by_key(|&i| (units[i].file.clone(), units[i].byte_span));
+            member_units.sort_by(|&a, &b| {
+                (&units[a].file, units[a].byte_span).cmp(&(&units[b].file, units[b].byte_span))
+            });
             NearGroup {
                 member_units,
                 tier,
