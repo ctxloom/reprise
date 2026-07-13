@@ -140,3 +140,22 @@ SIMILARITY-IR principle 5) and explodes `#include` into every file. Deep expansi
 ever wanted, is the **opt-in requires-build tier** (D44's escape hatch, PLAN.md §11), never the default.
 ("C and Rust both have a preprocessor" is an SP3 lure — textual `#define` ≠ hygienic AST macros; do not
 lump them. Even C vs C++ preprocessing must be *proven* equal by corpus before sharing a node.)
+
+## Dispatching agents — worktrees leak, and artifacts fall into them
+
+Agents dispatched with worktree isolation get their own git worktree, which the harness auto-removes
+**only if the agent left it unchanged.** Nearly every agent here is a *measurement* agent that applies
+an instrumentation patch — so nearly none qualifies, and each leaves a worktree behind carrying a full
+`target/` dir. Thirty accumulated once, at 483 MB. Two rules, both learned the hard way:
+
+- **Give agents ABSOLUTE artifact paths.** An agent that writes a report to a *relative* path writes it
+  inside its own worktree, where pruning destroys it. Two worktrees were found holding 184 MB of
+  measurement artifacts; they happened to have been synced, which was luck, not design.
+- **Sweep, then prune, at the end of a batch.** Sweeping is lossless if done right: branches survive
+  worktree removal (only *uncommitted* content dies), so capture each worktree's `git diff HEAD` plus
+  its untracked files first, then remove. Never bulk-delete worktrees without that capture.
+
+The same hazard runs the other way: **`reprise check` creates a `git worktree` inside the repo it
+scans** (`src/check.rs`, cleaned in `Drop`) — and `Drop` does not run on SIGKILL, which an OOM-killed
+scan is. A report-only tool must not leave admin state in a user's `.git`. Reading content from the git
+object store instead of a materialized checkout is the standing fix.
