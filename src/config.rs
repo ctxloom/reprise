@@ -676,7 +676,10 @@ mod tests {
         let toml = "[retrieval]\nretriever = \"winnowing\"\n";
         let cfg: Config = toml::from_str(toml).unwrap();
         let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("winnowing"), "error names the bad value: {err}");
+        assert!(
+            err.contains("winnowing"),
+            "error names the bad value: {err}"
+        );
         assert!(err.contains("landmark"), "error lists the known set: {err}");
         assert!(err.contains("retriever"), "error names the key: {err}");
     }
