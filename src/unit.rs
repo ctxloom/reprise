@@ -381,28 +381,52 @@ pub fn extract_file_units_keep_raw(
             std::mem::replace(&mut raw.tree, NormNode::new("", None, (0, 0), Vec::new()));
         let (tree, found) = pass_and_fold(raw_tree.clone(), lang, cfg, label_interner);
         let unit = unit_from_tree(path, lang, &raw, tree, accept_drift, label_interner);
-        for f in found {
-            // Report a run only when the duplicated mass clears the sequence floor.
-            if f.template_tokens * f.count >= cfg.thresholds.min_seq_tokens {
-                out.repeats.push(InternalRepeat {
-                    file: path.to_path_buf(),
-                    lang,
-                    unit_name: raw.name.clone(),
-                    line_span: (
-                        byte_to_line(src, f.byte_span.0),
-                        byte_to_line(src, f.byte_span.1),
-                    ),
-                    count: f.count,
-                    template_tokens: f.template_tokens,
-                    unit_fp: unit.fingerprint,
-                    template_hash: f.template_hash,
-                });
-            }
-        }
+        out.repeats.extend(repeat_findings(
+            found,
+            path,
+            src,
+            lang,
+            &raw.name,
+            unit.fingerprint,
+            cfg.thresholds.min_seq_tokens,
+        ));
         out.units.push(unit);
         out.raw_trees.push(raw_tree);
     }
     out
+}
+
+/// An [`InternalRepeat`] for every fold finding whose duplicated mass clears the
+/// sequence floor (`template_tokens * count >= min_seq_tokens`) — the report gate both
+/// extraction paths share.
+fn repeat_findings(
+    found: Vec<fold::RepeatFinding>,
+    path: &Path,
+    src: &str,
+    lang: Lang,
+    unit_name: &str,
+    unit_fp: u128,
+    min_seq_tokens: u32,
+) -> Vec<InternalRepeat> {
+    let mut repeats = Vec::new();
+    for f in found {
+        if f.template_tokens * f.count >= min_seq_tokens {
+            repeats.push(InternalRepeat {
+                file: path.to_path_buf(),
+                lang,
+                unit_name: unit_name.to_string(),
+                line_span: (
+                    byte_to_line(src, f.byte_span.0),
+                    byte_to_line(src, f.byte_span.1),
+                ),
+                count: f.count,
+                template_tokens: f.template_tokens,
+                unit_fp,
+                template_hash: f.template_hash,
+            });
+        }
+    }
+    repeats
 }
 
 /// The IR-normalizer extraction path (D-IR-1a): each function is lowered directly to
@@ -441,24 +465,15 @@ fn extract_ir_file_units(
         );
         let fingerprint = fingerprint::merkle(&tree, label_interner);
         let token_count = tree.token_count();
-        for f in found {
-            // Report a run only when the duplicated mass clears the sequence floor.
-            if f.template_tokens * f.count >= cfg.thresholds.min_seq_tokens {
-                out.repeats.push(InternalRepeat {
-                    file: path.to_path_buf(),
-                    lang,
-                    unit_name: u.name.clone(),
-                    line_span: (
-                        byte_to_line(src, f.byte_span.0),
-                        byte_to_line(src, f.byte_span.1),
-                    ),
-                    count: f.count,
-                    template_tokens: f.template_tokens,
-                    unit_fp: fingerprint,
-                    template_hash: f.template_hash,
-                });
-            }
-        }
+        out.repeats.extend(repeat_findings(
+            found,
+            path,
+            src,
+            lang,
+            &u.name,
+            fingerprint,
+            cfg.thresholds.min_seq_tokens,
+        ));
         // Retain the pre-abstraction lowered tree (not the canonical `tree`): the
         // inline phase (spec §5.4) splices callee bodies by name and re-runs the
         // passes on the result, exactly as the historical path keeps pre-`apply_passes`

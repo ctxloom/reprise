@@ -7,12 +7,16 @@ use reprise::report::ScanReport;
 use std::fs;
 use tempfile::TempDir;
 
-fn scan_snippets(ext: &str, sources: &[&str]) -> ScanReport {
+fn scan_with(ext: &str, sources: &[&str], cfg: &Config) -> ScanReport {
     let dir = TempDir::new().unwrap();
     for (i, src) in sources.iter().enumerate() {
         fs::write(dir.path().join(format!("m{i}.{ext}")), src).unwrap();
     }
-    reprise::scan(dir.path(), &Config::default()).unwrap()
+    reprise::scan(dir.path(), cfg).unwrap()
+}
+
+fn scan_snippets(ext: &str, sources: &[&str]) -> ScanReport {
+    scan_with(ext, sources, &Config::default())
 }
 
 // ---------- api-profile retune (spec §7.4d, D29) ----------
@@ -78,15 +82,23 @@ fn gather_features(probe: &Probe) -> Vec<String> {
     features
 }
 "#;
-    let report = scan_snippets("rs", &[src]);
-    assert!(
-        report
-            .groups
-            .iter()
-            .any(|g| g.tier.to_string() == "internal-repeat"),
-        "statement-run internal-repeat lost: {:#?}",
-        report.groups
-    );
+    // Both extraction paths gate fold findings on the same sequence floor and must
+    // report the run identically.
+    let mut historical = Config::default();
+    historical.normalize.normalizer = reprise::config::Normalizer::Historical;
+    for report in [
+        scan_snippets("rs", &[src]),
+        scan_with("rs", &[src], &historical),
+    ] {
+        assert!(
+            report
+                .groups
+                .iter()
+                .any(|g| g.tier.to_string() == "internal-repeat"),
+            "statement-run internal-repeat lost: {:#?}",
+            report.groups
+        );
+    }
 }
 
 /// Python case_clause tables get the same treatment as Rust match arms.
