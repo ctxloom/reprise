@@ -99,6 +99,34 @@ fn commutative_operand_order_converges() {
     assert_pair(&scan_snippets("py", &[a, b]), &["exact-normalized"]);
 }
 
+#[test]
+fn commutative_chain_flatten_converges_on_both_normalizers() {
+    // A 4-term chain exercises the left-spine flatten recursion (not just a single
+    // binary node) on BOTH consumers of chain flattening: the historical
+    // canonicalizer and the IR comm-sort pass.
+    let a = "def blend(a, b, c, d):\n    total = a + b + c + d\n    flag = total > 10 and a > 0 and d > 0\n    if flag:\n        total += b + a + d + c\n        total *= 3\n    return total\n";
+    let b = "def blend(a, b, c, d):\n    total = d + c + b + a\n    flag = d > 0 and a > 0 and total > 10\n    if flag:\n        total += c + d + a + b\n        total *= 3\n    return total\n";
+    assert_pair(
+        &scan_snippets_historical("py", &[a, b]),
+        &["exact-normalized"],
+    );
+    assert_pair(&scan_snippets_ir("py", &[a, b]), &["exact-normalized"]);
+    // Precision control: `-` is not commutative, so the same operand reorder must
+    // not converge to an exact match on either normalizer.
+    let c = a.replace('+', "-");
+    let d = b.replace('+', "-");
+    for report in [
+        scan_snippets_historical("py", &[&c, &d]),
+        scan_snippets_ir("py", &[&c, &d]),
+    ] {
+        assert_ne!(
+            pair_tier(&report).as_deref(),
+            Some("exact-normalized"),
+            "a reordered non-commutative chain must not converge exactly"
+        );
+    }
+}
+
 // ---------- recursion lowering (spec §5.2.2, Rev 5) ----------
 
 const PY_ITER: &str = "def reduce_pair(a, b, log):\n    while b != 0:\n        log.append(\"step: \" + str(a) + \" \" + str(b))\n        a, b = b, a % b\n    return a\n";

@@ -172,7 +172,7 @@ fn comm_sort_edits(node: &NormNode, out: &mut Vec<Edit>, li: &LabelInterner) -> 
     if is_commutative_chain(node) {
         let op = node.children[1].clone();
         let mut operands = Vec::new();
-        flatten_chain(node, op.kind, &mut operands);
+        flatten_chain(node, kind::id::BINOP, op.kind, &mut operands);
         let operands: Vec<NormNode> = operands
             .iter()
             .map(|o| comm_sort_edits(o, out, li))
@@ -221,10 +221,12 @@ pub(crate) fn sort_perm(operands: &[NormNode], li: &LabelInterner) -> Vec<u32> {
     perm
 }
 
-/// Collect operands of a same-operator commutative chain (left-assoc), field-stripped.
-pub(crate) fn flatten_chain(node: &NormNode, op: Kind, out: &mut Vec<NormNode>) {
-    if node.kind == kind::id::BINOP && node.children.len() == 3 && node.children[1].kind == op {
-        flatten_chain(&node.children[0], op, out);
+/// Collect operands of a same-kind, same-operator chain (left-assoc parses),
+/// field-stripped. `kind` is the chain's node kind — [`kind::id::BINOP`] on the IR
+/// path, the profile's binary kind on the historical canonicalizer.
+pub(crate) fn flatten_chain(node: &NormNode, kind: Kind, op: Kind, out: &mut Vec<NormNode>) {
+    if node.kind == kind && node.children.len() == 3 && node.children[1].kind == op {
+        flatten_chain(&node.children[0], kind, op, out);
         let mut rhs = node.children[2].clone();
         rhs.field = None;
         out.push(rhs);

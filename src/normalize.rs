@@ -317,7 +317,7 @@ fn canonicalize_order(
         && let Some(op) = this_op
     {
         let mut operands = Vec::new();
-        flatten_chain(&node, node.kind, op, &mut operands);
+        crate::ir::pass::flatten_chain(&node, node.kind, op, &mut operands);
         if operands.len() >= 2 {
             let op_node = node.children.iter().find(|c| c.kind == op).unwrap().clone();
             // Masked hash first (stable when local indices shift — the D2
@@ -367,20 +367,6 @@ fn canonicalize_order(
         });
     }
     node
-}
-
-/// Collect operands of a same-kind, same-operator chain (left-assoc parses).
-fn flatten_chain(node: &NormNode, kind: Kind, op: Kind, out: &mut Vec<NormNode>) {
-    if node.kind == kind && node.children.len() == 3 && node.children[1].kind == op {
-        flatten_chain(&node.children[0], kind, op, out);
-        let mut rhs = node.children[2].clone();
-        rhs.field = None;
-        out.push(rhs);
-    } else {
-        let mut n = node.clone();
-        n.field = None;
-        out.push(n);
-    }
 }
 
 /// Spec §5.2.4: locals become positional `Local(n)` by first occurrence;

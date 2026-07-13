@@ -238,7 +238,7 @@ fn apply_comm_sort(
     if pass::is_commutative_chain(&node) {
         let op = node.children[1].clone();
         let mut operands = Vec::new();
-        pass::flatten_chain(&node, op.kind, &mut operands);
+        pass::flatten_chain(&node, crate::ir::kind::id::BINOP, op.kind, &mut operands);
         let operands: Vec<NormNode> = operands
             .into_iter()
             .map(|o| apply_comm_sort(o, edits, log))
