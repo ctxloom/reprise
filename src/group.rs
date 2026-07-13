@@ -755,19 +755,7 @@ mod tests {
         // group shapes over a small file/name/span alphabet so subset
         // relations (and ties) actually occur, checked against the original
         // O(participating²) rescan.
-        struct Lcg(u64);
-        impl Lcg {
-            fn next(&mut self) -> u64 {
-                self.0 = self
-                    .0
-                    .wrapping_mul(6_364_136_223_846_793_005)
-                    .wrapping_add(1);
-                self.0
-            }
-            fn range(&mut self, n: u32) -> u32 {
-                (self.next() % u64::from(n)) as u32
-            }
-        }
+        use crate::test_utils::Lcg;
         let tiers = [
             Tier::ExactNormalized,
             Tier::NearNormalized,
@@ -817,19 +805,7 @@ mod tests {
     fn contained_flags_matches_brute_force_oracle() {
         // Deterministic LCG (no external rand dependency) exercising many
         // random file/span/group shapes against the O(n²) oracle above.
-        struct Lcg(u64);
-        impl Lcg {
-            fn next(&mut self) -> u64 {
-                self.0 = self
-                    .0
-                    .wrapping_mul(6_364_136_223_846_793_005)
-                    .wrapping_add(1);
-                self.0
-            }
-            fn range(&mut self, n: u32) -> u32 {
-                (self.next() % u64::from(n)) as u32
-            }
-        }
+        use crate::test_utils::Lcg;
 
         for seed in 0..50u64 {
             let mut rng = Lcg(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1));

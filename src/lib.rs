@@ -25,6 +25,8 @@ pub mod pack;
 pub mod report;
 pub mod seq;
 pub mod stream;
+#[cfg(test)]
+pub(crate) mod test_utils;
 pub mod tree;
 pub mod unit;
 pub mod walk;
@@ -1036,19 +1038,7 @@ mod tests {
         // `contained_flags` oracle test in group.rs: many random
         // file/name/is_test unit shapes, checked against every (file, name)
         // combination that appears, both hit and miss.
-        struct Lcg(u64);
-        impl Lcg {
-            fn next(&mut self) -> u64 {
-                self.0 = self
-                    .0
-                    .wrapping_mul(6_364_136_223_846_793_005)
-                    .wrapping_add(1);
-                self.0
-            }
-            fn range(&mut self, n: u32) -> u32 {
-                (self.next() % u64::from(n)) as u32
-            }
-        }
+        use crate::test_utils::Lcg;
 
         for seed in 0..50u64 {
             let mut rng = Lcg(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1));
