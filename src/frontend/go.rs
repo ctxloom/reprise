@@ -14,7 +14,7 @@ use super::Lowering as L;
 use super::{
     Frontend, block, break_guard, call_ext, eq_guard, is_true_literal, lower_aug_assign,
     lower_body, lower_source, lower_unit, make_arm, make_branch, make_index, matches_guard, native,
-    or_chain, push_else_arm,
+    or_chain, push_else_arm, span_of, text,
 };
 use crate::ir::kind;
 use crate::ir::transform::{TransformKind, TransformLog, Witness};
@@ -39,10 +39,6 @@ pub fn lower_go_source(src: &str) -> Option<(NormNode, TransformLog)> {
 }
 
 pub(crate) struct Go;
-
-fn span_of(node: Node) -> (u32, u32) {
-    (node.start_byte() as u32, node.end_byte() as u32)
-}
 
 /// The data-driven Go dispatch table (D-SP4-2; `docs/sp4-grammar-lift-plan.md` §4), following the
 /// Python increment-2 pattern (uniform arms as data; language-local lowerings as [`super::Lowering::Std`]
@@ -557,7 +553,7 @@ fn lower_assignment_stmt(
 ) -> NormNode {
     let is_plain = node
         .child_by_field_name("operator")
-        .map(|o| span_text(o, src) == "=")
+        .map(|o| text(o, src) == "=")
         .unwrap_or(false);
     if is_plain {
         lower_assign_go(fe, node, field, span, false, src, log)
@@ -656,10 +652,6 @@ fn lower_values(fe: &dyn Frontend, list: Node, src: &str, log: &mut TransformLog
         }
     }
     out
-}
-
-fn span_text<'a>(node: Node, src: &'a str) -> &'a str {
-    node.utf8_text(src.as_bytes()).unwrap_or_default()
 }
 
 #[cfg(test)]

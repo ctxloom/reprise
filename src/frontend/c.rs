@@ -27,7 +27,7 @@ use super::Lowering as L;
 use super::{
     Frontend, block_wrap, break_guard, is_true_literal, lit, lower_assign, lower_aug_assign,
     lower_body, lower_source, lower_unary_positional, lower_unit, make_arm, make_index, native,
-    push_else_arm,
+    push_else_arm, span_of, text,
 };
 use crate::ir::kind;
 use crate::ir::transform::{TransformKind, TransformLog, Witness};
@@ -52,14 +52,6 @@ pub fn lower_c_source(src: &str) -> Option<(NormNode, TransformLog)> {
 }
 
 pub(crate) struct C;
-
-fn span_of(node: Node) -> (u32, u32) {
-    (node.start_byte() as u32, node.end_byte() as u32)
-}
-
-fn text<'a>(node: Node, src: &'a str) -> &'a str {
-    node.utf8_text(src.as_bytes()).unwrap_or_default()
-}
 
 /// The data-driven C dispatch table (mirrors the Go/Python/Rust `MAP` pattern, D-SP4). Every
 /// **uniform** arm — a CST kind handled by a *shared* [`super`] helper — is data; C's

@@ -632,11 +632,11 @@ fn find_kind<'a>(node: Node<'a>, k: &str, depth: u32) -> Option<Node<'a>> {
 
 // ---- shared lowering helpers (language-agnostic; the algorithm, written once) ----
 
-fn span_of(node: Node) -> (u32, u32) {
+pub(crate) fn span_of(node: Node) -> (u32, u32) {
     (node.start_byte() as u32, node.end_byte() as u32)
 }
 
-fn text<'a>(node: Node, src: &'a str) -> &'a str {
+pub(crate) fn text<'a>(node: Node, src: &'a str) -> &'a str {
     node.utf8_text(src.as_bytes()).unwrap_or_default()
 }
 
