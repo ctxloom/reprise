@@ -458,7 +458,7 @@ fn abstract_literals(
                 .literal_bucket(node.kind.as_str())
                 .unwrap_or(Bucket::Str);
             let key = match bucket {
-                Bucket::Str | Bucket::Char => inner_text(&text),
+                Bucket::Str | Bucket::Char => crate::frontend::lit_inner_text(&text),
                 _ => text.trim().to_string(),
             };
             node.label = Some(if keep.iter().any(|k| k == &key) {
@@ -478,22 +478,6 @@ fn abstract_literals(
         label_interner,
     );
     root
-}
-
-/// Strip prefix letters (r/b/f/u) and symmetric quotes to get literal content
-/// for keep-list comparison.
-fn inner_text(text: &str) -> String {
-    let stripped = text.trim_start_matches(|c: char| c.is_ascii_alphabetic() || c == '#');
-    let stripped = stripped.trim_end_matches('#');
-    for quote in ["\"\"\"", "'''", "\"", "'"] {
-        if stripped.len() >= 2 * quote.len()
-            && stripped.starts_with(quote)
-            && stripped.ends_with(quote)
-        {
-            return stripped[quote.len()..stripped.len() - quote.len()].to_string();
-        }
-    }
-    stripped.to_string()
 }
 
 /// Spec §5.2.7: `pass` bodies, empty `else`, and loop-tail `continue`

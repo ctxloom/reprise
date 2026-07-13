@@ -699,8 +699,8 @@ pub(crate) fn lit(
 }
 
 /// Strip prefix letters (`r`/`b`/`f`/`u`) and symmetric quotes to get literal content
-/// for keep-list comparison (ported from the historical `normalize::inner_text`).
-fn lit_inner_text(text: &str) -> String {
+/// for keep-list comparison (shared with the historical normalizer's literal pass).
+pub(crate) fn lit_inner_text(text: &str) -> String {
     let stripped = text.trim_start_matches(|c: char| c.is_ascii_alphabetic() || c == '#');
     let stripped = stripped.trim_end_matches('#');
     for quote in ["\"\"\"", "'''", "\"", "'"] {
