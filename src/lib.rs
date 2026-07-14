@@ -234,6 +234,12 @@ pub fn corpus_units_from(
     // still resident (variants get theirs at the `finish_variant` tail), and
     // `scan()` spills the trees to the scan-scoped pack. ----
     let gate = memory::decide(&units, config);
+    // The extraction boundary: every tree exists, nothing has spilled yet, and the
+    // gate is deciding from a MODEL of the very residency now sitting in RAM. Read
+    // it. The reading changes no decision — it makes the model auditable on every
+    // run instead of only under an external harness.
+    stats.memory_extract_rss_bytes = memory::current_rss_bytes().unwrap_or(0);
+    stats.memory_extract_peak_bytes = memory::peak_rss_bytes().unwrap_or(0);
     let digests: Vec<digest::UnitDigest> = if gate.over {
         units
             .par_iter()
@@ -967,6 +973,11 @@ pub fn scan_source(
 
     phase("assemble", &mut stats, Instant::now());
     stats.duration_ms = started.elapsed().as_millis() as u64;
+
+    // The scan is over: read the high-water mark. Emitted beside
+    // `memory_estimated_bytes` so every ordinary run shows what the model got
+    // wrong — the feedback loop whose absence let six load-bearing numbers drift.
+    stats.memory_peak_bytes = memory::peak_rss_bytes().unwrap_or(0);
 
     // Gate-2 observability (approved amendment: `memory_*` are the WP's only
     // output additions; the identity harness strips them alongside timing).

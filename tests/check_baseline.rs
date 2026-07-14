@@ -243,12 +243,23 @@ fn warm_scan_is_identical_to_cold_scan() {
     assert!(warm.stats.cache_hits > 0, "{:?}", warm.stats);
     assert_eq!(warm.stats.cache_misses, 0, "{:?}", warm.stats);
     // Identity: everything except the volatile counters (timings, hit/miss
-    // tallies) must be byte-equal.
+    // tallies, MEASURED memory) must be byte-equal.
+    //
+    // The measured `memory_*` readings are observations of the PROCESS, not scan
+    // results: peak RSS is process-wide, allocator- and scheduler-dependent, and
+    // differs run to run by construction. They are volatile in exactly the sense
+    // `duration_ms` is, and the byte-identity harness strips `stats.memory_*` for
+    // the same reason. (The other `memory_*` fields — budget, estimate, gate,
+    // spill counts — ARE deterministic, which is why this test never had to
+    // normalize them before.)
     for r in [&mut cold, &mut warm] {
         r.stats.duration_ms = 0;
         r.stats.phase_ms.clear();
         r.stats.cache_hits = 0;
         r.stats.cache_misses = 0;
+        r.stats.memory_peak_bytes = 0;
+        r.stats.memory_extract_rss_bytes = 0;
+        r.stats.memory_extract_peak_bytes = 0;
     }
     assert_eq!(
         serde_json::to_string(&cold).unwrap(),

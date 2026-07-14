@@ -217,6 +217,25 @@ pub struct Stats {
     /// Tree-pack LRU traffic during near-tier verify (hit-rate = hits/(hits+misses)).
     pub memory_lru_hits: u64,
     pub memory_lru_misses: u64,
+    /// MEASURED peak resident bytes (`VmHWM`), reported next to
+    /// `memory_estimated_bytes` so the model-vs-reality delta is visible on every
+    /// run rather than only when someone straps on an external harness. The
+    /// estimate is wrong by 0.59x-1.53x across corpora and cannot be fitted; this
+    /// is the number it was approximating. 0 on platforms that do not expose it.
+    pub memory_peak_bytes: u64,
+    /// MEASURED resident bytes at the extraction boundary — the moment every tree
+    /// exists and the gate decides. With `memory_peak_bytes` it decomposes the
+    /// peak into "extraction" versus "everything after it", which one scalar
+    /// cannot. Measured: trees are only ~31-38% of extraction's own residency, so
+    /// a tree spill alone cannot bound it — a fact no single peak number reveals.
+    pub memory_extract_rss_bytes: u64,
+    /// MEASURED high-water (`VmHWM`) AT the extraction boundary — extraction's own
+    /// PEAK, which is not the same as what it leaves behind: 20 parallel workers
+    /// hold transient parse buffers that spike above the end-of-phase residency.
+    /// Together with `memory_peak_bytes` this answers the only question that
+    /// decides whether bounding extraction can lower the peak at all: is the
+    /// process peak set DURING extraction, or after it?
+    pub memory_extract_peak_bytes: u64,
 }
 
 /// Minimal per-unit coordinates check mode needs to map baseline member

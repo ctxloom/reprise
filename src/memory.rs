@@ -136,6 +136,44 @@ pub fn trips(estimated: u64, budget: u64) -> bool {
     estimated as f64 >= TRIP_FRACTION * budget as f64
 }
 
+/// This process's peak resident set size — the high-water mark, `VmHWM`.
+///
+/// **Observation only. It does not, and must not, feed the gate decision**, which
+/// stays deterministic per (corpus, config, budget) per this module's contract.
+/// What it feeds is the REPORT: the measured peak is emitted alongside
+/// `memory_estimated_bytes` so the model-vs-reality delta is visible on every
+/// ordinary run.
+///
+/// That delta is the whole point. Until now reprise could not observe its own
+/// memory, so every measurement bolted on an external `wait4`/`ru_maxrss`
+/// harness — and a model nobody could check against reality is how a 6.8 GB
+/// dev/prod allocator skew, a 3.3x-understated index row, and a double-counted
+/// memory "hump" all survived. The estimator is wrong by 0.59x-1.53x and cannot
+/// be fitted; the number it approximates can simply be read.
+///
+/// Linux only (`/proc/self/status`): `None` elsewhere, and the stat then reports
+/// 0 rather than a fabricated figure.
+pub fn peak_rss_bytes() -> Option<u64> {
+    proc_status_bytes("VmHWM:")
+}
+
+/// This process's CURRENT resident set size (`VmRSS`) — a phase-boundary reading,
+/// so a scan can attribute its peak (extraction vs the phases after it) instead
+/// of reporting one scalar nobody can decompose.
+pub fn current_rss_bytes() -> Option<u64> {
+    proc_status_bytes("VmRSS:")
+}
+
+/// `/proc/self/status` reports these in kB; the field is absent on non-Linux.
+fn proc_status_bytes(key: &str) -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix(key))
+        .and_then(|rest| rest.split_whitespace().next()?.parse::<u64>().ok())
+        .map(|kb| kb * 1024)
+}
+
 /// The scan's byte budget: pinned `budget_bytes` when set, else
 /// `budget_fraction` of the RAM the process can actually use — which under a
 /// container memory limit is the CGROUP's limit, not the host's RAM.
@@ -269,5 +307,57 @@ mod budget_tests {
     fn a_zero_cgroup_limit_is_ignored_rather_than_starving_the_budget() {
         let host = 31 << 30;
         assert_eq!(effective_ram(host, Some(0)), host);
+    }
+}
+
+#[cfg(test)]
+mod peak_tests {
+    use super::*;
+
+    /// reprise could not observe its own memory. Every gate battery in this
+    /// project bolted on an external `wait4`/`ru_maxrss` harness *purely because
+    /// the tool cannot report its own peak* — and that missing feedback loop is
+    /// why a 6.8 GB dev/prod allocator skew, a 3.3x-understated index row and a
+    /// double-counted "hump" all survived unchallenged. Read the number.
+    #[test]
+    fn peak_rss_is_observable_and_nonzero() {
+        let peak = peak_rss_bytes().expect("Linux exposes VmHWM in /proc/self/status");
+        assert!(peak > 0, "peak RSS reported as zero");
+    }
+
+    /// Not a tautology: the peak must actually TRACK a real allocation. A stub
+    /// returning a constant, or reading the wrong field, passes the non-zero test
+    /// above and fails this one.
+    #[test]
+    fn peak_rss_rises_to_cover_a_large_allocation() {
+        let before = peak_rss_bytes().unwrap();
+        // Touch every page — an untouched Vec may never become resident.
+        let mut hog: Vec<u8> = vec![0; 256 << 20];
+        for i in (0..hog.len()).step_by(4096) {
+            hog[i] = 1;
+        }
+        let after = peak_rss_bytes().unwrap();
+        assert!(
+            after >= before + (200 << 20),
+            "peak did not track a 256 MiB resident allocation: {before} -> {after}"
+        );
+        drop(hog);
+        // And it is a HIGH-WATER mark, not current RSS: after the free, RSS
+        // collapses to a few MB while the peak must stay up at ~256 MiB. This is
+        // the assertion that kills a `VmRSS:` typo, which would pass every other
+        // check here.
+        //
+        // Deliberately NOT `later >= after`: the kernel reports
+        // `max(stored_hiwater, current_rss)` and only refreshes `stored_hiwater`
+        // at certain events, so successive reads can DIP slightly (measured: 488
+        // KiB, 0.2%) once RSS falls away. VmHWM is therefore monotone in spirit
+        // but not across arbitrary reads — and it can under-report a brief
+        // transient spike by that margin.
+        let later = peak_rss_bytes().unwrap();
+        assert!(
+            later >= before + (200 << 20),
+            "peak collapsed toward current RSS after the free ({before} -> {later}) \
+             — that is VmRSS, not the high-water mark"
+        );
     }
 }
