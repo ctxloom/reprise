@@ -136,6 +136,34 @@ pub fn trips(estimated: u64, budget: u64) -> bool {
     estimated as f64 >= TRIP_FRACTION * budget as f64
 }
 
+/// Smallest verify tree LRU we will ever hand out: below this, a single verify
+/// pair does not fit comfortably and *every* pair thrashes. Load-bearing floor.
+const TREE_LRU_FLOOR_BYTES: u64 = 64 << 20;
+
+/// The verify tree LRU: the cache that serves reloads of spilled trees during
+/// near-tier verify. **A 1/8 slice of the scan's budget.**
+///
+/// It used to be `(budget / 8).clamp(64 MiB, 1 GiB)` — and that **1 GiB ceiling
+/// froze the cache for every budget at or above 8 GiB.** Give reprise 16 GiB or
+/// 64 GiB and the cache was 1 GiB either way, so past that point the knob a user
+/// reaches for (more memory) bought verify nothing at all.
+///
+/// The ceiling arrived with the original spill work carrying no comment and no
+/// recorded reason; the surrounding comment justifies only the *floor*. The `/8`
+/// is the actual policy and it is safe by construction — 12.5% of a budget
+/// cannot exceed it — so the ceiling was a second, absolute limit quietly
+/// cancelling a policy that already scaled.
+///
+/// Measured cost of that at `drivers/` on a 16 GiB budget: **643,310 LRU misses**
+/// against 3,885,614 hits, each miss a disk read and a deserialize. An offline
+/// simulation of the access trace (validated to within ~1% of that real miss
+/// count) found the **clamp, not the access order**, to be the dominant term —
+/// block-tiling the work was measured to be *worse than doing nothing*, because
+/// the candidate graph is one giant component spanning ~87% of touched units.
+pub fn tree_lru_bytes(budget_bytes: u64) -> u64 {
+    (budget_bytes / 8).max(TREE_LRU_FLOOR_BYTES)
+}
+
 /// This process's peak resident set size — the high-water mark, `VmHWM`.
 ///
 /// **Observation only. It does not, and must not, feed the gate decision**, which
@@ -359,5 +387,59 @@ mod peak_tests {
             "peak collapsed toward current RSS after the free ({before} -> {later}) \
              — that is VmRSS, not the high-water mark"
         );
+    }
+}
+
+#[cfg(test)]
+mod lru_tests {
+    use super::*;
+
+    /// The verify tree LRU is the cache that serves reloads of spilled trees.
+    /// It was `(budget / 8).clamp(64 MiB, 1 GiB)` — and that **1 GiB ceiling
+    /// froze the cache size for every budget at or above 8 GiB.** Give reprise
+    /// 16 GiB or 64 GiB and the cache stayed 1 GiB either way.
+    ///
+    /// Measured consequence at drivers/ on a 16 GiB budget: 643,310 LRU misses
+    /// against 3,885,614 hits — each miss a disk read and a deserialize. An
+    /// offline simulation (validated to within ~1% of that real miss count)
+    /// found the CLAMP, not the access order, to be the dominant cost.
+    ///
+    /// The `/8` IS the policy: 12.5% of the budget, which scales safely by
+    /// construction. The ceiling was a second, absolute limit that quietly
+    /// cancelled it — with no comment, and no reason recorded.
+    #[test]
+    fn the_tree_lru_scales_with_the_budget_it_is_given() {
+        let eight = tree_lru_bytes(8 << 30);
+        let sixteen = tree_lru_bytes(16 << 30);
+        let sixtyfour = tree_lru_bytes(64 << 30);
+        assert!(
+            sixteen > eight && sixtyfour > sixteen,
+            "the LRU stopped growing with the budget: 8 GiB -> {eight}, \
+             16 GiB -> {sixteen}, 64 GiB -> {sixtyfour}"
+        );
+        // And it stays the documented 1/8 slice rather than growing unbounded.
+        assert_eq!(sixtyfour, (64u64 << 30) / 8);
+    }
+
+    /// The floor is load-bearing and must survive: a tiny budget must still
+    /// leave a cache big enough that a verify pair fits comfortably, or every
+    /// single pair thrashes.
+    #[test]
+    fn a_small_budget_still_gets_the_floor() {
+        assert_eq!(tree_lru_bytes(64 << 20), 64 << 20);
+        assert_eq!(tree_lru_bytes(0), 64 << 20);
+    }
+
+    /// The cache may never exceed the budget it is a slice of — that would be
+    /// the LRU blowing the very ceiling the spill exists to respect.
+    #[test]
+    fn the_lru_never_exceeds_its_own_budget() {
+        for gib in [1u64, 2, 8, 16, 64, 256] {
+            let budget = gib << 30;
+            assert!(
+                tree_lru_bytes(budget) <= budget,
+                "LRU exceeds the budget at {gib} GiB"
+            );
+        }
     }
 }

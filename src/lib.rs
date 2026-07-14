@@ -373,7 +373,7 @@ pub fn scan_source(
         // partition, handles owned by the loop) so it gets a token bound.
         // The tree decoder re-interns labels through THIS scan's interner
         // (post-interning, `NormNode` deserializes only via the wire path).
-        let tree_lru_bytes = (gate.budget_bytes / 8).clamp(64 << 20, 1 << 30);
+        let tree_lru_bytes = memory::tree_lru_bytes(gate.budget_bytes);
         let li_encode = std::sync::Arc::clone(&label_interner);
         let li_decode = std::sync::Arc::clone(&label_interner);
         Some(ScanPacks {
