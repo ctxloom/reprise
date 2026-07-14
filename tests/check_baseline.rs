@@ -258,7 +258,7 @@ fn warm_scan_is_identical_to_cold_scan() {
         r.stats.cache_hits = 0;
         r.stats.cache_misses = 0;
         r.stats.memory_peak_bytes = 0;
-        r.stats.memory_extract_rss_bytes = 0;
+        r.stats.memory_gate_rss_bytes = 0;
         r.stats.memory_extract_peak_bytes = 0;
     }
     assert_eq!(

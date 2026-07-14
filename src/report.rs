@@ -223,18 +223,18 @@ pub struct Stats {
     /// estimate is wrong by 0.59x-1.53x across corpora and cannot be fitted; this
     /// is the number it was approximating. 0 on platforms that do not expose it.
     pub memory_peak_bytes: u64,
-    /// MEASURED resident bytes at the extraction boundary — the moment every tree
-    /// exists and the gate decides. With `memory_peak_bytes` it decomposes the
-    /// peak into "extraction" versus "everything after it", which one scalar
-    /// cannot. Measured: trees are only ~31-38% of extraction's own residency, so
-    /// a tree spill alone cannot bound it — a fact no single peak number reveals.
-    pub memory_extract_rss_bytes: u64,
-    /// MEASURED high-water (`VmHWM`) AT the extraction boundary — extraction's own
-    /// PEAK, which is not the same as what it leaves behind: 20 parallel workers
-    /// hold transient parse buffers that spike above the end-of-phase residency.
-    /// Together with `memory_peak_bytes` this answers the only question that
-    /// decides whether bounding extraction can lower the peak at all: is the
-    /// process peak set DURING extraction, or after it?
+    /// MEASURED resident bytes AT THE GATE DECISION — every tree exists, nothing
+    /// has spilled, and `memory_estimated_bytes` is the model of exactly this.
+    /// Put them side by side and the estimator's error is a subtraction rather
+    /// than an argument. (It is NOT extraction's peak: the digests are built after
+    /// this point and cost GiB — conflating the two produced a wrong conclusion
+    /// once already.)
+    pub memory_gate_rss_bytes: u64,
+    /// MEASURED high-water (`VmHWM`) at the END of extraction — after the digests,
+    /// which the gate-decision reading above precedes. This is extraction's true
+    /// peak, and with `memory_peak_bytes` it decides the only question that
+    /// matters for where a memory guard belongs: is the process peak set during
+    /// extraction, or after it?
     pub memory_extract_peak_bytes: u64,
 }
 

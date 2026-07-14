@@ -238,8 +238,7 @@ pub fn corpus_units_from(
     // gate is deciding from a MODEL of the very residency now sitting in RAM. Read
     // it. The reading changes no decision — it makes the model auditable on every
     // run instead of only under an external harness.
-    stats.memory_extract_rss_bytes = memory::current_rss_bytes().unwrap_or(0);
-    stats.memory_extract_peak_bytes = memory::peak_rss_bytes().unwrap_or(0);
+    stats.memory_gate_rss_bytes = memory::current_rss_bytes().unwrap_or(0);
     let digests: Vec<digest::UnitDigest> = if gate.over {
         units
             .par_iter()
@@ -256,6 +255,12 @@ pub fn corpus_units_from(
     } else {
         Vec::new()
     };
+
+    // END of extraction — AFTER the digests. The gate-decision reading above is
+    // taken before they exist, and they cost GiB: reading extraction's peak there
+    // understated it by 2.6 GiB at drivers and inverted the conclusion about where
+    // the peak is set.
+    stats.memory_extract_peak_bytes = memory::peak_rss_bytes().unwrap_or(0);
 
     Ok(CorpusUnits {
         units,
@@ -339,6 +344,7 @@ pub fn scan_source(
             .insert(name.to_string(), (now - phase_started).as_millis() as u64);
         phase_started = now;
     };
+
     phase("extract", &mut stats, Instant::now());
 
     // ---- Gate 2 (memory architecture P2): ONE decision, at this phase
