@@ -137,16 +137,59 @@ pub fn trips(estimated: u64, budget: u64) -> bool {
 }
 
 /// The scan's byte budget: pinned `budget_bytes` when set, else
-/// `budget_fraction` of detected system RAM.
+/// `budget_fraction` of the RAM the process can actually use — which under a
+/// container memory limit is the CGROUP's limit, not the host's RAM.
 pub fn resolve_budget(cfg: &MemoryCfg) -> u64 {
     if let Some(bytes) = cfg.budget_bytes {
         return bytes;
     }
-    let sys = sysinfo::System::new_with_specifics(
+    let mut sys = sysinfo::System::new_with_specifics(
         sysinfo::RefreshKind::nothing()
             .with_memory(sysinfo::MemoryRefreshKind::nothing().with_ram()),
     );
-    (sys.total_memory() as f64 * cfg.budget_fraction) as u64
+    let ram = effective_ram(sys.total_memory(), our_cgroup_limit(&mut sys));
+    (ram as f64 * cfg.budget_fraction) as u64
+}
+
+/// This process's own cgroup memory limit, if it is in a constrained cgroup.
+///
+/// Deliberately the PROCESS accessor, not `System::cgroup_limits()`: the latter
+/// reads the ROOT cgroup (`/sys/fs/cgroup`), which on any normal host is
+/// unlimited — it answers a question nobody asked. Only
+/// `Process::cgroup_limits()` resolves `/proc/self/cgroup` to the cgroup this
+/// process actually lives in, which is the one that will OOM-kill it. (sysinfo
+/// handles v2 `memory.max` — including the `"max"` sentinel — and v1
+/// `memory.limit_in_bytes`, walking up to the effective parent limit.)
+fn our_cgroup_limit(sys: &mut sysinfo::System) -> Option<u64> {
+    let pid = sysinfo::Pid::from_u32(std::process::id());
+    sys.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[pid]),
+        true,
+        sysinfo::ProcessRefreshKind::nothing(),
+    );
+    sys.process(pid)
+        .and_then(|p| p.cgroup_limits())
+        .map(|l| l.total_memory)
+}
+
+/// The RAM this process may actually use: the tighter of the host's RAM and any
+/// cgroup memory limit.
+///
+/// The memory gate spills trees to avoid an OOM kill — and inside a container
+/// the kill comes from the CGROUP, long before the host runs out. Budgeting from
+/// host RAM there means the gate does not trip when it must: measured, a scan in
+/// a 2 GiB cgroup resolved a 15.51 GiB budget (7.75x its real ceiling). This is
+/// the containerised-CI case, which is exactly where `reprise check` runs.
+///
+/// A cgroup limit at or above host RAM carries no information (cgroup v2 spells
+/// "unlimited" as a sentinel at least that large), and a zero/garbage limit must
+/// never starve the budget to nothing — that would spill unconditionally on
+/// every scan. Both degrade to host RAM.
+fn effective_ram(host: u64, cgroup: Option<u64>) -> u64 {
+    match cgroup {
+        Some(limit) if limit > 0 && limit < host => limit,
+        _ => host,
+    }
 }
 
 /// The force override: `REPRISE_MEMORY_FORCE_GATE` env var (harness knob),
@@ -186,5 +229,45 @@ pub fn decide(units: &[Unit], cfg: &Config) -> GateDecision {
         budget_bytes,
         estimated_bytes,
         over,
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    /// The gate exists to spill trees and avoid OOM. Under a container memory
+    /// limit — Docker `--memory`, a k8s pod limit, containerised CI, which is
+    /// exactly where `reprise check` runs — the OOM comes from the CGROUP, not
+    /// from the host running out of RAM. A budget computed from the host's RAM
+    /// therefore does not trip when it must, and the runtime kills the scan.
+    ///
+    /// Measured before the fix: inside a 2 GiB cgroup, reprise resolved a
+    /// 15.51 GiB budget — 7.75x the real limit.
+    #[test]
+    fn a_cgroup_limit_below_host_ram_is_what_bounds_the_budget() {
+        let host = 31 << 30; // 31 GiB
+        let cgroup = 2 << 30; // a 2 GiB container
+        assert_eq!(effective_ram(host, Some(cgroup)), cgroup);
+    }
+
+    /// No cgroup, or an unlimited one, must leave today's behavior untouched —
+    /// and a cgroup limit ABOVE host RAM is not a licence to over-budget: the
+    /// host is still the real ceiling. cgroup v2 reports "max" for unlimited,
+    /// which sysinfo surfaces as a value at or above host RAM.
+    #[test]
+    fn an_absent_or_unlimited_cgroup_falls_back_to_host_ram() {
+        let host = 31 << 30;
+        assert_eq!(effective_ram(host, None), host);
+        assert_eq!(effective_ram(host, Some(u64::MAX)), host);
+        assert_eq!(effective_ram(host, Some(64 << 30)), host);
+    }
+
+    /// A zero/garbage limit must never yield a zero budget — that would trip the
+    /// gate on every scan, spilling unconditionally.
+    #[test]
+    fn a_zero_cgroup_limit_is_ignored_rather_than_starving_the_budget() {
+        let host = 31 << 30;
+        assert_eq!(effective_ram(host, Some(0)), host);
     }
 }
