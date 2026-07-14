@@ -39,75 +39,24 @@ pub struct VariantTag {
 /// returns, and `cache::store` runs strictly before it. That invariant is what
 /// makes the serialize shim below sound (and [`UnitWire`] always deserializes
 /// to `Resident`).
-#[derive(Debug, Clone, PartialEq)]
-pub enum TreeSlot {
-    Resident(NormNode),
-    /// Exact-content pack key (xxh3-128 of the tree's serialized bytes —
-    /// never a masked matching hash).
-    Spilled(u128),
-}
+/// A unit's canonical tree across the memory gate's two residency states — the
+/// generic [`crate::store::Slot`] at `NormNode`. The alias is the whole point:
+/// residency is not a tree-specific question, and `raw_trees` (the LARGER half of
+/// the tree mass, at 38% of extraction's peak) can now ride the same store.
+pub type TreeSlot = crate::store::Slot<NormNode>;
+
+/// A materialized tree: a borrow (resident) or a shared LRU handle (spilled).
+/// `Deref`s to `NormNode` either way, so `anti_unify`'s call sites are
+/// residency-agnostic.
+pub type TreeRef<'a> = crate::store::Ref<'a, NormNode>;
 
 impl TreeSlot {
-    /// The tree, when resident.
-    pub fn resident(&self) -> Option<&NormNode> {
-        match self {
-            TreeSlot::Resident(t) => Some(t),
-            TreeSlot::Spilled(_) => None,
-        }
-    }
-
-    /// The tree, for callers that run strictly before any spill can have
-    /// happened (extraction, `corpus_units` consumers, the inline tail) —
-    /// see the type doc for why that set is closed. Panics on a spilled slot:
-    /// reaching one here is a pipeline-ordering bug, not a recoverable state.
-    #[track_caller]
-    pub fn expect_resident(&self) -> &NormNode {
-        self.resident()
-            .expect("tree was spilled before a resident-only consumer read it")
-    }
-
-    /// Owning variant of [`Self::expect_resident`] (test helpers).
-    #[track_caller]
-    pub fn into_resident(self) -> NormNode {
-        match self {
-            TreeSlot::Resident(t) => t,
-            TreeSlot::Spilled(_) => panic!("tree was spilled; no resident tree to take"),
-        }
-    }
-
-    /// The tree, wherever it lives: borrowed when resident (under-gate — zero
-    /// new work), or materialized through the scan pack's LRU when spilled
-    /// (over-gate near-tier verify). Panics if a spilled slot meets no pack —
-    /// `scan()` creates the pack in the same branch that spills.
+    /// The tree, wherever it lives. Retained as an inherent name because 35 call
+    /// sites across seven files read trees this way; it forwards to the generic
+    /// [`crate::store::Slot::get`].
     #[track_caller]
     pub fn materialize<'a>(&'a self, pack: Option<&crate::pack::Pack<NormNode>>) -> TreeRef<'a> {
-        match self {
-            TreeSlot::Resident(t) => TreeRef::Borrowed(t),
-            TreeSlot::Spilled(key) => TreeRef::Loaded(
-                pack.expect("spilled tree but no scan pack — gate wiring bug")
-                    .load(*key),
-            ),
-        }
-    }
-}
-
-/// A materialized tree: a plain borrow (resident) or a shared handle out of
-/// the pack LRU (spilled). Derefs to `NormNode` either way, so `anti_unify`'s
-/// call sites are residency-agnostic. Holding a `Loaded` handle keeps the
-/// decoded tree alive regardless of LRU eviction (the in-flight-verify
-/// guarantee).
-pub enum TreeRef<'a> {
-    Borrowed(&'a NormNode),
-    Loaded(std::sync::Arc<NormNode>),
-}
-
-impl std::ops::Deref for TreeRef<'_> {
-    type Target = NormNode;
-    fn deref(&self) -> &NormNode {
-        match self {
-            TreeRef::Borrowed(t) => t,
-            TreeRef::Loaded(a) => a,
-        }
+        self.get(pack)
     }
 }
 

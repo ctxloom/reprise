@@ -25,6 +25,7 @@ pub mod pack;
 pub mod report;
 pub mod seq;
 pub mod source;
+pub mod store;
 pub mod stream;
 #[cfg(test)]
 pub(crate) mod test_utils;
