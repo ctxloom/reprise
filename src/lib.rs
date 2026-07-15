@@ -389,6 +389,7 @@ pub fn scan_source(
         gate,
         mut digests,
         raw_trees,
+        call_sites,
         repeats: internal_repeats,
         source_digests,
         mut stats,
@@ -493,11 +494,21 @@ pub fn scan_source(
 
     // ---- P5: best-effort inliner (spec §5.4) — variants appended, tagged ----
     if config.inline.enabled {
-        let table = inline::DefTable::build(&units, &raw_trees, config, &label_interner);
+        let table = inline::DefTable::build(&units, &call_sites, config, &label_interner);
         stats.scc_units = table.scc_unit_count();
         let expansions: Vec<inline::Expansion> = (0..plain_count)
             .into_par_iter()
-            .map(|i| inline::expand_unit(i, &raw_trees[i], &units, &table, config, &label_interner))
+            .map(|i| {
+                inline::expand_unit(
+                    i,
+                    &raw_trees[i],
+                    &raw_trees,
+                    &units,
+                    &table,
+                    config,
+                    &label_interner,
+                )
+            })
             .collect();
 
         /// Per-unit result of the tail below: `finish_variant` is a full

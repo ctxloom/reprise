@@ -91,7 +91,7 @@ fn scc_round_does_not_nest_past_max_scc_depth() {
     let (_dir, corpus) = build_corpus(&[("scc4.rs", &src)], &cfg);
     let table = DefTable::build(
         &corpus.units,
-        &corpus.raw_trees,
+        &corpus.call_sites,
         &cfg,
         &corpus.label_interner,
     );
@@ -99,6 +99,7 @@ fn scc_round_does_not_nest_past_max_scc_depth() {
     let exp = expand_unit(
         idx,
         &corpus.raw_trees[idx],
+        &corpus.raw_trees,
         &corpus.units,
         &table,
         &cfg,
@@ -137,7 +138,7 @@ fn inlined_scc_partner_does_not_recursively_splice_its_own_partners() {
     let (_dir, corpus) = build_corpus(&[("scc3.rs", &src)], &cfg);
     let table = DefTable::build(
         &corpus.units,
-        &corpus.raw_trees,
+        &corpus.call_sites,
         &cfg,
         &corpus.label_interner,
     );
@@ -145,6 +146,7 @@ fn inlined_scc_partner_does_not_recursively_splice_its_own_partners() {
     let exp = expand_unit(
         idx,
         &corpus.raw_trees[idx],
+        &corpus.raw_trees,
         &corpus.units,
         &table,
         &cfg,
@@ -193,7 +195,7 @@ fn over_budget_unit_gets_no_variant_never_a_truncated_one() {
     let (_dir_a, corpus_a) = build_corpus(&[("breadth.rs", &src)], &default_cfg);
     let table_a = DefTable::build(
         &corpus_a.units,
-        &corpus_a.raw_trees,
+        &corpus_a.call_sites,
         &default_cfg,
         &corpus_a.label_interner,
     );
@@ -201,6 +203,7 @@ fn over_budget_unit_gets_no_variant_never_a_truncated_one() {
     let exp_a = expand_unit(
         idx_a,
         &corpus_a.raw_trees[idx_a],
+        &corpus_a.raw_trees,
         &corpus_a.units,
         &table_a,
         &default_cfg,
@@ -219,7 +222,7 @@ fn over_budget_unit_gets_no_variant_never_a_truncated_one() {
     let (_dir_b, corpus_b) = build_corpus(&[("breadth.rs", &src)], &tiny_cfg);
     let table_b = DefTable::build(
         &corpus_b.units,
-        &corpus_b.raw_trees,
+        &corpus_b.call_sites,
         &tiny_cfg,
         &corpus_b.label_interner,
     );
@@ -227,6 +230,7 @@ fn over_budget_unit_gets_no_variant_never_a_truncated_one() {
     let exp_b = expand_unit(
         idx_b,
         &corpus_b.raw_trees[idx_b],
+        &corpus_b.raw_trees,
         &corpus_b.units,
         &table_b,
         &tiny_cfg,
@@ -253,7 +257,7 @@ fn budget_is_deterministic_across_runs() {
         let (_dir, corpus) = build_corpus(&[("breadth.rs", &src)], &cfg);
         let table = DefTable::build(
             &corpus.units,
-            &corpus.raw_trees,
+            &corpus.call_sites,
             &cfg,
             &corpus.label_interner,
         );
@@ -261,6 +265,7 @@ fn budget_is_deterministic_across_runs() {
         let exp = expand_unit(
             idx,
             &corpus.raw_trees[idx],
+            &corpus.raw_trees,
             &corpus.units,
             &table,
             &cfg,
@@ -290,7 +295,7 @@ fn budget_does_not_alter_emitted_variants() {
     let (_dir_a, corpus_a) = build_corpus(&[("breadth.rs", &src)], &cfg_default);
     let table_a = DefTable::build(
         &corpus_a.units,
-        &corpus_a.raw_trees,
+        &corpus_a.call_sites,
         &cfg_default,
         &corpus_a.label_interner,
     );
@@ -298,6 +303,7 @@ fn budget_does_not_alter_emitted_variants() {
     let exp_a = expand_unit(
         idx_a,
         &corpus_a.raw_trees[idx_a],
+        &corpus_a.raw_trees,
         &corpus_a.units,
         &table_a,
         &cfg_default,
@@ -309,7 +315,7 @@ fn budget_does_not_alter_emitted_variants() {
     let (_dir_b, corpus_b) = build_corpus(&[("breadth.rs", &src)], &cfg_max);
     let table_b = DefTable::build(
         &corpus_b.units,
-        &corpus_b.raw_trees,
+        &corpus_b.call_sites,
         &cfg_max,
         &corpus_b.label_interner,
     );
@@ -317,6 +323,7 @@ fn budget_does_not_alter_emitted_variants() {
     let exp_b = expand_unit(
         idx_b,
         &corpus_b.raw_trees[idx_b],
+        &corpus_b.raw_trees,
         &corpus_b.units,
         &table_b,
         &cfg_max,

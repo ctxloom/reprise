@@ -258,25 +258,28 @@ impl Shapes {
     }
 }
 
-pub struct Def<'t> {
+pub struct Def {
     pub unit_idx: usize,
     pub name: Box<str>,
     pub arity: usize,
     pub lang: Lang,
     pub file: PathBuf,
     pub params: Vec<Box<str>>,
-    /// Raw (pre-pass) body subtree, borrowed from the caller's raw trees
-    /// (M3b: cloning every body cost ~0.4s at 500k LOC for a table that
-    /// mostly resolves misses).
-    pub body: &'t NormNode,
+    /// Root body's immediate child count (WP-D: from the projection, not a
+    /// borrowed tree) — always `Some` in the projection for an admitted `Def`
+    /// (`DefTable::build` only admits a unit when its body field resolved),
+    /// unwrapped here. `try_expr_inline`'s `single` check reads this instead
+    /// of `def.body.children.len()`.
+    pub body_child_count: u32,
     /// Raw body token count — the `max_callee_tokens` basis (D18: measured on
     /// raw, because post-fold unit counts under-report the spliced mass).
+    /// WP-D: read from the projection instead of computed from a borrowed body.
     pub body_tokens: u32,
 }
 
 /// Repo-wide definition table plus the syntactic call graph's SCCs (Tarjan).
-pub struct DefTable<'t> {
-    pub defs: Vec<Def<'t>>,
+pub struct DefTable {
+    pub defs: Vec<Def>,
     /// (lang, arity) → name → defs; nested so lookups borrow the name
     /// (M3b: a Box<str> allocation per resolve dominated the inline phase
     /// at 500k LOC).
@@ -292,28 +295,35 @@ enum Resolution {
     Miss,
 }
 
-impl<'t> DefTable<'t> {
-    /// Build from raw trees (index-aligned with `units`). Deterministic:
+impl DefTable {
+    /// Build from the per-unit metadata projection (WP-D: no raw tree is
+    /// walked or borrowed here at all — `call_sites` already carries every
+    /// call site's (name, arity, span) and each unit's params/body shape,
+    /// computed once at extraction). Index-aligned with `units`. Deterministic:
     /// `units` arrive in sorted file order, and candidate lists keep that
     /// order (spec §5.4 determinism requirement).
     pub fn build(
         units: &[Unit],
-        raw_trees: &'t [NormNode],
+        call_sites: &[UnitCallSites],
         cfg: &Config,
         li: &LabelInterner,
-    ) -> DefTable<'t> {
+    ) -> DefTable {
+        let _ = li; // no longer needed to build the table (WP-D: calls are pre-collected)
         use rayon::prelude::*;
         // Parallel with order preserved (indexed collect): determinism holds.
-        let defs: Vec<Def<'t>> = units
+        let defs: Vec<Def> = units
             .par_iter()
             .enumerate()
             .filter_map(|(i, unit)| {
                 if unit.name == "<anon>" {
                     return None;
                 }
-                let shapes = Shapes::for_lang(unit.lang, cfg);
-                let params = shapes.params(&raw_trees[i])?;
-                let body = child_field(&raw_trees[i], "body")?;
+                let cs = &call_sites[i];
+                // Mirrors the old `shapes.params(&raw_trees[i])?; child_field(&raw_trees[i],
+                // "body")?;` admission: both must resolve, or this unit is never a
+                // resolution TARGET.
+                let params = cs.params.clone()?;
+                let body_child_count = cs.body_child_count?;
                 Some(Def {
                     unit_idx: i,
                     name: unit.name.as_str().into(),
@@ -321,8 +331,8 @@ impl<'t> DefTable<'t> {
                     lang: unit.lang,
                     file: unit.file.clone(),
                     params,
-                    body_tokens: body.token_count(),
-                    body,
+                    body_child_count,
+                    body_tokens: cs.body_tokens,
                 })
             })
             .collect();
@@ -346,23 +356,17 @@ impl<'t> DefTable<'t> {
         };
         // Syntactic call graph → Tarjan SCCs (spec §5.4). Parallel per def
         // (order-preserving collect keeps the §5.4 determinism requirement).
-        // Intern the synthetic `keyword_argument` tag ONCE per scan (rule 5) and
-        // hand the id to every per-node `call_parts` — never resolve per node.
-        let kw_arg = li.intern("keyword_argument");
+        // WP-D: no tree walk here at all — `call_sites[def.unit_idx].calls` was
+        // collected once at extraction, by `collect_call_sites` (this pass used
+        // to walk `def.body` here directly via the now-deleted `collect_calls`).
         let adj: Vec<Vec<usize>> = table
             .defs
             .par_iter()
             .map(|def| {
-                let mut calls = Vec::new();
-                collect_calls(
-                    def.body,
-                    Shapes::for_lang(def.lang, cfg),
-                    &mut calls,
-                    kw_arg,
-                );
-                let mut edges: Vec<usize> = calls
+                let mut edges: Vec<usize> = call_sites[def.unit_idx]
+                    .calls
                     .iter()
-                    .filter_map(|(name, arity)| {
+                    .filter_map(|(name, arity, _span)| {
                         match table.resolve(def.lang, name, *arity, &def.file, cfg) {
                             Resolution::Hit(d) => Some(d),
                             _ => None,
@@ -430,15 +434,6 @@ impl<'t> DefTable<'t> {
     }
 }
 
-fn collect_calls(node: &NormNode, shapes: Shapes, out: &mut Vec<(Box<str>, usize)>, kw_arg: LSym) {
-    if let Some((name, args)) = shapes.call_parts(node, kw_arg) {
-        out.push((name, args.len()));
-    }
-    for child in &node.children {
-        collect_calls(child, shapes, out, kw_arg);
-    }
-}
-
 /// Extraction-time projection of one unit's raw tree (WP-D, raw-trees
 /// elimination): everything `DefTable::build`'s adjacency pass and
 /// `expand_unit`'s pre-walk resolvability check read, with ZERO raw-tree bytes
@@ -472,8 +467,9 @@ pub struct UnitCallSites {
     /// D18 basis (`max_callee_tokens`); moved from "computed in DefTable::build
     /// from a borrowed body" to "computed once at extraction."
     pub body_tokens: u32,
-    /// Every positionally-mappable call site anywhere in the body subtree (same
-    /// reach as `collect_calls`): callee name, arg count, byte span. A call node
+    /// Every positionally-mappable call site anywhere in the body subtree
+    /// (same reach as [`collect_call_sites`]): callee name, arg count, byte
+    /// span. A call node
     /// that `Shapes::call_parts` would reject (method call, kw-arg,
     /// non-identifier callee) is OMITTED — it can never resolve either way, so
     /// it carries no information the pre-walk decision needs.
@@ -484,10 +480,11 @@ pub struct UnitCallSites {
     pub params: Option<Vec<Box<str>>>,
 }
 
-/// Like [`collect_calls`], but span-carrying (WP-D): `resolve_policy`'s
-/// ambiguity tracking (`ctx.ambiguous_sites.insert(node.span)`) needs a span per
-/// call site to build the projection-based precheck's oracle-equivalent
-/// `ambiguous_sites` set.
+/// Collects every call site in a subtree as `(name, arity, span)` (WP-D): the
+/// span is needed because `resolve_policy`'s ambiguity tracking
+/// (`ctx.ambiguous_sites.insert(node.span)`) must be reproducible from the
+/// projection alone, so the projection-based precheck can build the same
+/// `ambiguous_sites` set the tree-walking oracle does.
 pub(crate) fn collect_call_sites(
     node: &NormNode,
     shapes: Shapes,
@@ -602,7 +599,12 @@ impl Expansion {
 }
 
 struct Ctx<'a> {
-    table: &'a DefTable<'a>,
+    table: &'a DefTable,
+    /// WP-D transitional scaffold (step 2 only, deleted in step 4 when the
+    /// raw-tree memo replaces it): `splice_body` needs a callee's body
+    /// subtree, and `Def` no longer carries one — index-aligned with `units`,
+    /// same slice `expand_unit`'s `raw` parameter is drawn from.
+    raw_trees: &'a [NormNode],
     cfg: &'a Config,
     shapes: Shapes,
     lang: Lang,
@@ -643,6 +645,10 @@ struct Ctx<'a> {
 pub fn expand_unit(
     unit_idx: usize,
     raw: &NormNode,
+    // WP-D transitional scaffold (step 2 only; see `Ctx::raw_trees`) — deleted
+    // in step 4 when `splice_body` fetches a callee's body through the memo
+    // instead.
+    raw_trees: &[NormNode],
     units: &[Unit],
     table: &DefTable,
     cfg: &Config,
@@ -666,6 +672,7 @@ pub fn expand_unit(
     };
     let mut ctx = Ctx {
         table,
+        raw_trees,
         cfg,
         shapes,
         lang,
@@ -726,7 +733,7 @@ pub fn expand_unit(
 /// Read-only descent proving whether `node`'s subtree contains at least one call
 /// `resolve_policy` would accept — i.e. whether the real `walk` below could
 /// possibly splice anything. Visits every node (same reach as `walk`, mirrors
-/// `collect_calls`'s traversal), so when no call resolves the search exhausts the
+/// `collect_call_sites`'s traversal), so when no call resolves the search exhausts the
 /// whole tree and `ctx.ambiguous_sites` comes out complete — the zero-clone path
 /// above reports `ambiguity_skips` straight from it. When a call DOES resolve, the
 /// search returns early without visiting the rest; the caller then commits to the
@@ -814,7 +821,7 @@ fn try_expr_inline(node: NormNode, ctx: &mut Ctx) -> NormNode {
         return node;
     };
     let def = &ctx.table.defs[def_idx];
-    let single = def.body.children.len() == 1;
+    let single = def.body_child_count == 1;
     if !single && !ctx.has_expr_block {
         return node; // D17: no synthetic expression block
     }
@@ -995,7 +1002,16 @@ fn splice_body(def_idx: usize, args: Vec<NormNode>, ctx: &mut Ctx) -> Vec<NormNo
         .map(|p| p.as_ref())
         .zip(args.iter())
         .collect();
-    let body = substitute(def.body.clone(), &map, ctx.shapes, *EMPTY_KIND);
+    // WP-D transitional scaffold (step 2 only; see `Ctx::raw_trees`'s doc
+    // comment) — `Def` no longer carries a borrowed body, so re-derive it from
+    // the still-resident raw trees. `expect`: a `Def` is only ever admitted by
+    // `DefTable::build` when its body field resolved (`UnitCallSites::
+    // body_child_count` was `Some`), so this always finds one.
+    let raw_body = child_field(&ctx.raw_trees[def.unit_idx], "body").expect(
+        "a Def always has a body field — DefTable::build only admits units where \
+         the projection's body_child_count resolved",
+    );
+    let body = substitute(raw_body.clone(), &map, ctx.shapes, *EMPTY_KIND);
     // Charge the budget after substitution (so duplicated argument subtrees are
     // counted) but before recursing, so a nested splice's own budget check sees
     // this splice's cost. Overshoot note: the check in `resolve_policy` runs
