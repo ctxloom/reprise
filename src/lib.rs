@@ -400,53 +400,58 @@ impl Drop for PackDirCleanup {
     }
 }
 
-/// Full-repo scan (spec §2 `reprise scan`) over the live checkout.
-pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
-    scan_source(&source::FsSource::new(root), config)
+/// The bundle [`corpus_units_streaming`] returns: the resident-out
+/// [`CorpusUnits`] (untouched — see that fn's doc) plus the scan-scoped pack
+/// lifetime `scan_source` used to build inline, now built here instead.
+struct StreamingExtraction {
+    corpus: CorpusUnits,
+    packs: Option<ScanPacks>,
+    /// Fed straight into `scan_source`'s own `PackDirCleanup` — unchanged,
+    /// still `scan_source`'s job: the cleanup guard stays where it always
+    /// was so the rest of `scan_source` (inline variant spilling, near-tier,
+    /// sequence tier) keeps the SAME "drop on every exit" coverage it has
+    /// today.
+    pack_dir_owned: Option<std::path::PathBuf>,
+    /// Plain units spilled in the pass below (spill moment 1, P3) —
+    /// `scan_source` seeds its own `spilled_trees` counter with this and
+    /// keeps adding variants (spill moment 2) exactly as today.
+    spilled_trees: usize,
 }
 
-/// [`scan`] over an arbitrary [`ContentSource`](source::ContentSource). `check`
-/// scans a git tree through this — the index for the prospective commit, the base
-/// ref for base state — so it never materialises a checkout to read.
-pub fn scan_source(
+/// Streaming (wave-based) extraction, Step 2a (session `woozy-uncut-comic`,
+/// `streaming-extraction.plan.md`) — CORRECTED per INVARIANT 0: the original
+/// "relocate the pack + spill into `corpus_units_from`" was wrong, because
+/// `corpus_units_from` is `pub` and two committed tests
+/// (`tests/memory_gate.rs:218`, `tests/digest_oracle.rs:101-121`) plus one
+/// production consumer (`reprise-mcp::find_similar_json`, which calls
+/// `corpus_units` against the REAL gate with no pack wired in) all depend on
+/// it returning RESIDENT trees, always. So this wrapper is `scan`-private
+/// instead: it calls the UNTOUCHED public `corpus_units_from` first — same
+/// resident-out contract, same byte-for-byte extraction — then, over the
+/// gate only, creates the scan-scoped pack and runs the SAME post-extraction
+/// spill pass `scan_source` used to inline (verbatim: same order, same
+/// per-unit body), before returning. `scan_source` calls this instead of
+/// inlining pack creation + the spill pass itself; only the OWNING function
+/// changed, not the code or its order — byte-identical output by
+/// construction. `corpus_units_from`'s public contract, and every non-`scan`
+/// caller of it, are unaffected — this function does not exist on that path.
+fn corpus_units_streaming(
     source: &dyn source::ContentSource,
     config: &Config,
-) -> anyhow::Result<ScanReport> {
+) -> anyhow::Result<StreamingExtraction> {
     let root = source.root();
-    let started = Instant::now();
-    let CorpusUnits {
-        mut units,
-        gate,
-        mut digests,
-        call_sites,
-        raw_tree_files,
-        unit_file_idx,
-        repeats: internal_repeats,
-        source_digests,
-        mut stats,
-        label_interner,
-    } = corpus_units_from(source, config)?;
-    let plain_count = units.len();
+    let mut corpus = corpus_units_from(source, config)?;
 
-    let mut phase_started = started;
-    let mut phase = |name: &str, stats: &mut report::Stats, now: Instant| {
-        stats
-            .phase_ms
-            .insert(name.to_string(), (now - phase_started).as_millis() as u64);
-        phase_started = now;
-    };
-
-    phase("extract", &mut stats, Instant::now());
-
-    // ---- Gate 2 (memory architecture P2): ONE decision, at this phase
-    // boundary, from exact post-extraction counts. Under the gate nothing
-    // below changes (trees resident, zero new work). Over it, trees and
-    // sequence streams spill to the scan-scoped content-addressed pack (P3);
-    // near-tier verify materializes pairs through the pack LRU and the
-    // sequence tier bulk-loads per language partition. Either way the OUTPUT
-    // is byte-identical — the gate changes performance, never output. ----
+    // ---- Gate 2 (memory architecture P2) was already decided inside
+    // `corpus_units_from`, at the extraction phase boundary. Under the gate
+    // nothing below runs (trees stay resident, zero new work). Over it,
+    // trees and sequence streams spill to the scan-scoped content-addressed
+    // pack (P3); near-tier verify materializes pairs through the pack LRU
+    // and the sequence tier bulk-loads per language partition. Either way
+    // the OUTPUT is byte-identical — the gate changes performance, never
+    // output. ----
     let mut pack_dir_owned: Option<std::path::PathBuf> = None;
-    let packs = if gate.over {
+    let packs = if corpus.gate.over {
         // The pack's backing directory (the tmpfs-ENOSPC fix): scan-root-
         // relative by default, `[memory] pack_dir` override outranks it, an
         // unwritable root falls back to the process temp dir with a named
@@ -464,9 +469,9 @@ pub fn scan_source(
         // partition, handles owned by the loop) so it gets a token bound.
         // The tree decoder re-interns labels through THIS scan's interner
         // (post-interning, `NormNode` deserializes only via the wire path).
-        let tree_lru_bytes = memory::tree_lru_bytes(gate.budget_bytes);
-        let li_encode = std::sync::Arc::clone(&label_interner);
-        let li_decode = std::sync::Arc::clone(&label_interner);
+        let tree_lru_bytes = memory::tree_lru_bytes(corpus.gate.budget_bytes);
+        let li_encode = std::sync::Arc::clone(&corpus.label_interner);
+        let li_decode = std::sync::Arc::clone(&corpus.label_interner);
         Some(ScanPacks {
             trees: pack::Pack::with_codec(
                 tree_lru_bytes,
@@ -492,18 +497,26 @@ pub fn scan_source(
     } else {
         None
     };
-    // Declared once `pack_dir_owned` is settled; drops (and best-effort
-    // removes the directory) on every exit from `scan()` below, success or
-    // error.
-    let _pack_dir_cleanup = PackDirCleanup(pack_dir_owned);
+    // Guards ONLY the spill loop below — mirrors exactly the protection
+    // window `scan_source`'s own `_pack_dir_cleanup` gave this same loop
+    // today (constructed right before it, so a spill failure or panic here
+    // cleans the directory up). Defused on success (`.take()` below) so the
+    // directory survives to be handed back to `scan_source`, which re-wraps
+    // it in its own `PackDirCleanup` for the rest of the scan — same net
+    // coverage as today, just split across the wrapper boundary. Pack
+    // CREATION above stays exactly as unprotected as it is today (a
+    // pre-existing gap — `pack_dir_owned` is set before `Pack::with_codec`/
+    // `Pack::new` run but no guard exists yet to catch their `?` — unrelated
+    // to this move, not this step's job to close).
+    let mut spill_cleanup = PackDirCleanup(pack_dir_owned.clone());
     let mut spilled_trees = 0usize;
     if let Some(p) = &packs {
         // Spill moment 1 (P3): one sequential pass over the already-
-        // materialized plain units. (Variants spill at creation, below.) A
-        // store failure (e.g. the pack's volume fills) aborts the scan
-        // cleanly through `?` — never a panic, never a poisoned mutex (see
-        // `pack::PackStoreError`).
-        for (u, d) in units.iter_mut().zip(digests.iter_mut()) {
+        // materialized plain units. (Variants spill at creation, in
+        // `scan_source`'s inline block.) A store failure (e.g. the pack's
+        // volume fills) aborts the scan cleanly through `?` — never a
+        // panic, never a poisoned mutex (see `pack::PackStoreError`).
+        for (u, d) in corpus.units.iter_mut().zip(corpus.digests.iter_mut()) {
             if let unit::TreeSlot::Resident(t) = &u.tree {
                 let key = p
                     .trees
@@ -521,6 +534,69 @@ pub fn scan_source(
             }
         }
     }
+    spill_cleanup.0.take();
+
+    Ok(StreamingExtraction {
+        corpus,
+        packs,
+        pack_dir_owned,
+        spilled_trees,
+    })
+}
+
+/// Full-repo scan (spec §2 `reprise scan`) over the live checkout.
+pub fn scan(root: &Path, config: &Config) -> anyhow::Result<ScanReport> {
+    scan_source(&source::FsSource::new(root), config)
+}
+
+/// [`scan`] over an arbitrary [`ContentSource`](source::ContentSource). `check`
+/// scans a git tree through this — the index for the prospective commit, the base
+/// ref for base state — so it never materialises a checkout to read.
+pub fn scan_source(
+    source: &dyn source::ContentSource,
+    config: &Config,
+) -> anyhow::Result<ScanReport> {
+    let root = source.root();
+    let started = Instant::now();
+    let StreamingExtraction {
+        corpus:
+            CorpusUnits {
+                mut units,
+                gate,
+                mut digests,
+                call_sites,
+                raw_tree_files,
+                unit_file_idx,
+                repeats: internal_repeats,
+                source_digests,
+                mut stats,
+                label_interner,
+            },
+        packs,
+        pack_dir_owned,
+        mut spilled_trees,
+    } = corpus_units_streaming(source, config)?;
+    let plain_count = units.len();
+
+    let mut phase_started = started;
+    let mut phase = |name: &str, stats: &mut report::Stats, now: Instant| {
+        stats
+            .phase_ms
+            .insert(name.to_string(), (now - phase_started).as_millis() as u64);
+        phase_started = now;
+    };
+
+    phase("extract", &mut stats, Instant::now());
+
+    // Step 2a (session `woozy-uncut-comic`): pack creation + the post-
+    // extraction spill pass now live in `corpus_units_streaming` (scan-
+    // private — `corpus_units_from` stays resident-out, INVARIANT 0). This
+    // guard is the only piece that stays here: declared once `pack_dir_owned`
+    // is settled, it drops (and best-effort removes the directory) on every
+    // exit from `scan()` below — success, an early `?` return, or a panic —
+    // covering the REST of the scan (inline variant spilling, near-tier,
+    // sequence tier) exactly as it always has.
+    let _pack_dir_cleanup = PackDirCleanup(pack_dir_owned);
 
     // ---- P5: best-effort inliner (spec §5.4) — variants appended, tagged ----
     if config.inline.enabled {
