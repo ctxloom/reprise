@@ -82,6 +82,15 @@ fn strip_volatile(report: &mut reprise::ScanReport) {
     report.stats.memory_peak_bytes = 0;
     report.stats.memory_gate_rss_bytes = 0;
     report.stats.memory_extract_peak_bytes = 0;
+    // WP-D: the memo's hit/miss split depends on which rayon worker touches a
+    // given file first — order-dependent under parallel `expand_unit`, so it
+    // varies run to run exactly like `memory_lru_hits`/`memory_lru_misses`
+    // (also stripped by convention: `src/report.rs`'s own doc comment notes
+    // the byte-identity harness strips every `memory_*` field for this same
+    // reason). Only the SUM is invariant (every touched file is fetched
+    // exactly once per residency-window); the split is timing, not output.
+    report.stats.raw_tree_memo_hits = 0;
+    report.stats.raw_tree_memo_misses = 0;
 }
 
 #[test]
