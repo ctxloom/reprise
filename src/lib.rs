@@ -45,18 +45,17 @@ use std::path::Path;
 use std::time::Instant;
 
 /// A walked-and-extracted corpus: every [`Unit`] under `root` (respecting `Config`'s
-/// walk excludes), the parallel pre-normalization `raw_trees` the inliner needs
-/// (index-aligned with the leading *plain* units — `units[..raw_trees.len()]` — since
-/// this accessor covers only extraction; inline-expanded variants are `scan()`'s own
-/// later phase and carry no raw tree), each file's [`unit::InternalRepeat`] findings,
-/// a per-file content digest (xxh3-128 of the bytes read at extraction time, keyed by
-/// the same `PathBuf` a `Unit::file` carries) for consumers that need to re-read a
-/// file's text later and detect whether it changed on disk in the meantime, and the
-/// subset of [`report::Stats`] this phase fills (`files_scanned`,
-/// `files_skipped_generated`, `files_unreadable`, `suppressed_units`,
-/// `cache_hits`/`cache_misses`, `units_indexed`, `parse_degraded_units`, `test_units`,
-/// `total_lines`) — every other `Stats` field is left at its `Default` for the caller
-/// to fill in as it goes.
+/// walk excludes), the per-unit `call_sites` metadata projection and `raw_tree_files`/
+/// `unit_file_idx` coordinates the inliner's raw-tree memo (`rawmemo::RawTreeMemo`)
+/// rehydrates from (WP-D: raw trees are no longer corpus-wide resident — see below),
+/// each file's [`unit::InternalRepeat`] findings, a per-file content digest (xxh3-128
+/// of the bytes read at extraction time, keyed by the same `PathBuf` a `Unit::file`
+/// carries) for consumers that need to re-read a file's text later and detect whether
+/// it changed on disk in the meantime, and the subset of [`report::Stats`] this phase
+/// fills (`files_scanned`, `files_skipped_generated`, `files_unreadable`,
+/// `suppressed_units`, `cache_hits`/`cache_misses`, `units_indexed`,
+/// `parse_degraded_units`, `test_units`, `total_lines`) — every other `Stats` field is
+/// left at its `Default` for the caller to fill in as it goes.
 ///
 /// Full source text is intentionally NOT retained here (it used to be, keyed the same
 /// way) — the only two production consumers (`scan`'s sequence-tier line-span
@@ -65,6 +64,16 @@ use std::time::Instant;
 /// on-demand re-reads for the rare files that actually surface in a sequence-tier
 /// finding; `source_digests` lets that re-read detect a mid-scan edit instead of
 /// silently rendering against stale-vs-fresh mismatched content.
+///
+/// WP-D (raw-trees elimination, session `woozy-uncut-comic`): this struct used to
+/// carry a corpus-wide resident `raw_trees: Vec<NormNode>` — the LARGER half of the
+/// tree mass, 38% of extraction's peak. It is gone: the inliner's resolvability
+/// precheck and adjacency (SCC) pass read `call_sites` (a per-unit metadata
+/// projection, no tree bytes) instead of a raw tree, and the raw tree itself is
+/// fetched only at splice time, lazily, through a budget-bounded read-through memo
+/// (`rawmemo::RawTreeMemo`) built from `raw_tree_files`/`unit_file_idx` — a scan-scoped
+/// object `scan_source` constructs right before the inline phase, not carried on this
+/// struct (its lifetime needs `source`/`source_digests` borrows this struct doesn't own).
 pub struct CorpusUnits {
     pub units: Vec<Unit>,
     /// Gate 2 (memory architecture P2), decided here — a phase boundary, from
@@ -80,12 +89,11 @@ pub struct CorpusUnits {
     /// exactly when a gate is over). NOT part of the D19 cache (a pure recompute
     /// from the tree; P4 freezes the cache format).
     pub digests: Vec<digest::UnitDigest>,
-    pub raw_trees: Vec<tree::NormNode>,
-    /// WP-D (raw-trees elimination): per-unit metadata projection of `raw_trees`
-    /// — index-aligned with `units`/`raw_trees`. The inliner's resolvability
-    /// precheck and adjacency (SCC) pass read this instead of a raw tree; the
-    /// raw tree itself is fetched only at splice time, through the memo built
-    /// from `raw_tree_files`/`unit_file_idx` below.
+    /// WP-D (raw-trees elimination): per-unit metadata projection of what used to
+    /// be a corpus-wide resident raw tree — index-aligned with `units`. The
+    /// inliner's resolvability precheck and adjacency (SCC) pass read this
+    /// instead of a raw tree; the raw tree itself is fetched only at splice
+    /// time, through the memo built from `raw_tree_files`/`unit_file_idx` below.
     pub call_sites: Vec<inline::UnitCallSites>,
     /// One entry per FILE (not per unit) — the raw-tree memo's rehydration
     /// coordinates (WP-D).
@@ -95,7 +103,7 @@ pub struct CorpusUnits {
     pub repeats: Vec<unit::InternalRepeat>,
     pub source_digests: HashMap<std::path::PathBuf, u128>,
     pub stats: report::Stats,
-    /// The per-scan label interner used to build every `Unit`/`raw_trees` tree above
+    /// The per-scan label interner used to build every `Unit` tree above
     /// (interning WP, session `stark-mixed-front`). `scan()`'s later inline phase
     /// (§5.4) reuses this SAME instance for variant trees, so a variant's identifiers
     /// dedupe against the rest of the scan instead of paying for a second table.
@@ -208,16 +216,14 @@ pub fn corpus_units_from(
         .collect();
 
     let mut units: Vec<Unit> = Vec::new();
-    let mut raw_trees: Vec<tree::NormNode> = Vec::new();
     let mut repeats = Vec::new();
     let mut source_digests: HashMap<std::path::PathBuf, u128> = HashMap::new();
     let mut stats = report::Stats::default();
     // WP-D (raw-trees elimination): the metadata projection + retained memo
-    // coordinates, built ADDITIVELY alongside the still-resident `raw_trees`
-    // (step 1 of the staged elimination — production still reads `raw_trees`
-    // below; `call_sites`/`raw_tree_files`/`unit_file_idx` are unused by the
-    // pipeline until later steps repoint it). `kw_arg` interned ONCE per scan
-    // (rule 5), exactly as `DefTable::build` does today.
+    // coordinates — the ONLY things extraction keeps from each file's raw
+    // trees; `extracted.raw_trees` itself drops at the end of each loop
+    // iteration below, never accumulated corpus-wide. `kw_arg` interned ONCE
+    // per scan (rule 5), exactly as `DefTable::build` used to.
     let kw_arg = label_interner.intern("keyword_argument");
     let mut call_sites: Vec<inline::UnitCallSites> = Vec::new();
     let mut raw_tree_files: Vec<rawmemo::RawFileKey> = Vec::new();
@@ -260,9 +266,11 @@ pub fn corpus_units_from(
                 });
 
                 units.append(&mut extracted.units);
-                raw_trees.append(&mut extracted.raw_trees);
                 repeats.append(&mut extracted.repeats);
                 source_digests.insert(path, digest);
+                // `extracted.raw_trees` drops here — its only durable trace is
+                // `call_sites` above and, on disk, the D19 cache blob the memo
+                // rehydrates from later.
             }
             FileOutcome::SkippedGenerated => stats.files_skipped_generated += 1,
             FileOutcome::Unreadable => stats.files_unreadable += 1,
@@ -275,7 +283,6 @@ pub fn corpus_units_from(
     // corpus-wide Vecs accumulated via repeated `.append()` above — a fixed-size,
     // zero-risk win independent of the digest/re-read redesign above.
     units.shrink_to_fit();
-    raw_trees.shrink_to_fit();
     repeats.shrink_to_fit();
     call_sites.shrink_to_fit();
     raw_tree_files.shrink_to_fit();
@@ -322,7 +329,6 @@ pub fn corpus_units_from(
         units,
         gate,
         digests,
-        raw_trees,
         call_sites,
         raw_tree_files,
         unit_file_idx,
@@ -388,13 +394,13 @@ pub fn scan_source(
         mut units,
         gate,
         mut digests,
-        raw_trees,
         call_sites,
+        raw_tree_files,
+        unit_file_idx,
         repeats: internal_repeats,
         source_digests,
         mut stats,
         label_interner,
-        ..
     } = corpus_units_from(source, config)?;
     let plain_count = units.len();
 
@@ -494,6 +500,32 @@ pub fn scan_source(
 
     // ---- P5: best-effort inliner (spec §5.4) — variants appended, tagged ----
     if config.inline.enabled {
+        // WP-D (raw-trees elimination): a budget-bounded read-through memo over
+        // the D19 cache replaces the corpus-wide resident `raw_trees` Vec (38%
+        // of extraction's peak). Scoped to this inline block — same lifetime
+        // the old Vec had, dropped at the block's end — and reading through
+        // `source` (never `std::fs` directly), so `check`'s `GitSource` never
+        // touches a checkout that may not exist. `cache_root` mirrors
+        // `corpus_units_from`'s own resolution (`src/lib.rs`'s extraction
+        // closure) exactly, so a cache-on memo hits the SAME blobs extraction
+        // wrote. Budget `None` (unbounded) for now — wired to the pressure-
+        // aware floor in a later step (`memory::raw_tree_memo_bytes(&gate)`).
+        let cache_root = config
+            .cache
+            .shared_root
+            .as_deref()
+            .unwrap_or(root)
+            .to_path_buf();
+        let memo = rawmemo::RawTreeMemo::new(
+            &raw_tree_files,
+            &unit_file_idx,
+            source,
+            &source_digests,
+            cache_root,
+            config,
+            std::sync::Arc::clone(&label_interner),
+            None,
+        );
         let table = inline::DefTable::build(&units, &call_sites, config, &label_interner);
         stats.scc_units = table.scc_unit_count();
         let expansions: Vec<inline::Expansion> = (0..plain_count)
@@ -501,13 +533,12 @@ pub fn scan_source(
             .map(|i| {
                 inline::expand_unit(
                     i,
-                    &raw_trees[i],
-                    &raw_trees,
                     &call_sites,
                     &units,
                     &table,
                     config,
                     &label_interner,
+                    &memo,
                 )
             })
             .collect();
@@ -647,7 +678,8 @@ pub fn scan_source(
         },
         "digests exist (index-aligned) exactly when the gate is over"
     );
-    drop(raw_trees);
+    // WP-D: no `raw_trees` to drop — the memo (scoped to the `if config.inline
+    // .enabled` block above) already went out of scope with it.
     phase("inline", &mut stats, Instant::now());
 
     // ---- exact tier (P7 bucketing; plain) + inline-assisted exact matches ----
@@ -1200,12 +1232,12 @@ mod tests {
         assert!(index.is_empty());
     }
 
-    // ---- WP-D step 1 (raw-trees elimination, session `woozy-uncut-comic`):
-    // `call_sites` must exactly reproduce direct reads off the still-resident
-    // `raw_trees` it will eventually replace. Additive at this step — nothing
-    // downstream reads `call_sites` yet, so a failure here is a pure
-    // wiring/indexing bug in `corpus_units_from`'s new per-file loop, not a
-    // change in scan output. ----
+    // ---- WP-D (raw-trees elimination, session `woozy-uncut-comic`):
+    // `call_sites` must exactly reproduce direct reads off a unit's raw tree,
+    // fetched here through the SAME raw-tree memo `scan_source` builds
+    // (`CorpusUnits` carries no corpus-wide resident raw trees itself — see
+    // its doc comment) — a failure here is a pure wiring/indexing bug in
+    // `corpus_units_from`'s per-file loop, not a change in scan output. ----
 
     /// Real-world corpus (`benches/wild`): every language, every unit shape
     /// the wild corpus carries.
@@ -1216,11 +1248,23 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("benches/wild");
         let corpus = corpus_units(&root, &cfg).expect("wild corpus scans");
         assert!(!corpus.units.is_empty(), "wild corpus produced no units");
-        assert_eq!(corpus.units.len(), corpus.raw_trees.len());
         assert_eq!(corpus.units.len(), corpus.call_sites.len());
+        assert_eq!(corpus.units.len(), corpus.unit_file_idx.len());
         let kw_arg = corpus.label_interner.intern("keyword_argument");
+        let fs_source = source::FsSource::new(&root);
+        let memo = rawmemo::RawTreeMemo::new(
+            &corpus.raw_tree_files,
+            &corpus.unit_file_idx,
+            &fs_source,
+            &corpus.source_digests,
+            root.clone(),
+            &cfg,
+            std::sync::Arc::clone(&corpus.label_interner),
+            None,
+        );
         for (i, unit) in corpus.units.iter().enumerate() {
-            let tree = &corpus.raw_trees[i];
+            let tree = memo.unit(i);
+            let tree = &tree;
             let shapes = inline::Shapes::for_lang(unit.lang, &cfg);
             let body = lang::child_field(tree, "body");
             let expected_body_child_count = body.map(|b| b.children.len() as u32);

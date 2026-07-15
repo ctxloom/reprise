@@ -16,6 +16,7 @@ use crate::config::Config;
 use crate::intern::{Field, Kind, LSym, LabelInterner};
 use crate::ir::kind;
 use crate::lang::{Lang, LanguageProfile, child_field};
+use crate::rawmemo::RawTreeMemo;
 use crate::tree::{Label, NormNode};
 use crate::unit::Unit;
 use std::collections::{HashMap, HashSet};
@@ -600,11 +601,11 @@ impl Expansion {
 
 struct Ctx<'a> {
     table: &'a DefTable,
-    /// WP-D transitional scaffold (step 2 only, deleted in step 4 when the
-    /// raw-tree memo replaces it): `splice_body` needs a callee's body
-    /// subtree, and `Def` no longer carries one — index-aligned with `units`,
-    /// same slice `expand_unit`'s `raw` parameter is drawn from.
-    raw_trees: &'a [NormNode],
+    /// WP-D: the raw-tree memo — `splice_body` fetches a callee's body
+    /// through it (`Def` carries no borrowed body), and `expand_unit` fetches
+    /// its own unit's tree through it too, lazily, only once the
+    /// projection-based precheck confirms a splice is possible.
+    memo: &'a RawTreeMemo<'a>,
     cfg: &'a Config,
     shapes: Shapes,
     lang: Lang,
@@ -642,21 +643,18 @@ struct Ctx<'a> {
 }
 
 /// Fully-inline-per-policy expansion of one unit's raw tree (spec §5.4).
-// WP-D transitional: `raw_trees` (step 2's scaffold) drops out in step 4 when
-// the memo replaces it, bringing this back under clippy's default arg count.
-#[allow(clippy::too_many_arguments)]
+/// WP-D: no raw tree is passed in — `memo.unit(unit_idx)` fetches THIS unit's
+/// tree internally, lazily, only after the projection-based precheck below
+/// confirms a splice is possible (mirrors the M3c skip this WP inherits: ~55%
+/// of units inline zero calls and would pay for a fetch never used).
 pub fn expand_unit(
     unit_idx: usize,
-    raw: &NormNode,
-    // WP-D transitional scaffold (step 2 only; see `Ctx::raw_trees`) — deleted
-    // in step 4 when `splice_body` fetches a callee's body through the memo
-    // instead.
-    raw_trees: &[NormNode],
     call_sites: &[UnitCallSites],
     units: &[Unit],
     table: &DefTable,
     cfg: &Config,
     li: &LabelInterner,
+    memo: &RawTreeMemo,
 ) -> Expansion {
     let lang = units[unit_idx].lang;
     let shapes = Shapes::for_lang(lang, cfg);
@@ -682,7 +680,7 @@ pub fn expand_unit(
     };
     let mut ctx = Ctx {
         table,
-        raw_trees,
+        memo,
         cfg,
         shapes,
         lang,
@@ -711,7 +709,7 @@ pub fn expand_unit(
     // (previously a read-only tree descent, `any_resolvable_call`, still kept
     // below as the differential-test oracle): if it proves no call resolves,
     // the real `walk` below is guaranteed to splice nothing, so both the
-    // precheck AND the clone it guards are skipped outright.
+    // precheck AND the memo fetch it guards are skipped outright.
     if !any_resolvable_call_projected(unit_idx, call_sites, &mut ctx) {
         // Mirrors `resolve_given`'s policy, so a budget of 0 refuses every call
         // here and no call ever "resolves" — the unit would exit through this
@@ -724,7 +722,12 @@ pub fn expand_unit(
         }
         return Expansion::skipped(ctx.ambiguous_sites.len() as u32);
     }
-    let tree = walk(raw.clone(), &mut ctx);
+    // Fetched exactly here — the ONE memo lookup this unit ever pays, and
+    // only now that a splice is guaranteed possible. Already an owned clone
+    // out of the memo's cached file (`RawTreeMemo::unit`), so no `.clone()`
+    // here (unlike the old resident-`raw_trees[i]` borrow).
+    let raw = memo.unit(unit_idx);
+    let tree = walk(raw, &mut ctx);
     // Policy `skip` (design doc §4): over the aggregate expansion-node budget, the
     // unit gets NO variant at all — never a truncated one. This is what keeps
     // `max_expansion_nodes` out of the byte-identity surface: it only ever selects
@@ -1059,12 +1062,14 @@ fn splice_body(def_idx: usize, args: Vec<NormNode>, ctx: &mut Ctx) -> Vec<NormNo
         .map(|p| p.as_ref())
         .zip(args.iter())
         .collect();
-    // WP-D transitional scaffold (step 2 only; see `Ctx::raw_trees`'s doc
-    // comment) — `Def` no longer carries a borrowed body, so re-derive it from
-    // the still-resident raw trees. `expect`: a `Def` is only ever admitted by
-    // `DefTable::build` when its body field resolved (`UnitCallSites::
-    // body_child_count` was `Some`), so this always finds one.
-    let raw_body = child_field(&ctx.raw_trees[def.unit_idx], "body").expect(
+    // WP-D: `Def` no longer carries a borrowed body — fetch the callee's whole
+    // unit tree through the memo (one lookup, LRU-cached across every caller
+    // that splices this same callee) and pull its body field out. `expect`: a
+    // `Def` is only ever admitted by `DefTable::build` when its body field
+    // resolved (`UnitCallSites::body_child_count` was `Some`), so this always
+    // finds one.
+    let callee_tree = ctx.memo.unit(def.unit_idx);
+    let raw_body = child_field(&callee_tree, "body").expect(
         "a Def always has a body field — DefTable::build only admits units where \
          the projection's body_child_count resolved",
     );
@@ -1163,6 +1168,7 @@ mod wp_d_precheck_tests {
 
     use super::*;
     use crate::config::Config;
+    use crate::source::{ContentSource, FsSource};
 
     /// Builds the SAME `Ctx` `expand_unit` would for `unit_idx`, so the test
     /// exercises the precheck under realistic state (SCC partners, root name,
@@ -1174,7 +1180,7 @@ mod wp_d_precheck_tests {
         table: &'a DefTable,
         cfg: &'a Config,
         li: &LabelInterner,
-        raw_trees: &'a [NormNode],
+        memo: &'a RawTreeMemo<'a>,
     ) -> Ctx<'a> {
         let lang = units[unit_idx].lang;
         let shapes = Shapes::for_lang(lang, cfg);
@@ -1186,7 +1192,7 @@ mod wp_d_precheck_tests {
         };
         Ctx {
             table,
-            raw_trees,
+            memo,
             cfg,
             shapes,
             lang,
@@ -1208,9 +1214,30 @@ mod wp_d_precheck_tests {
         }
     }
 
+    /// Builds the SAME memo `scan_source` would (unbounded — this test is
+    /// about the PRECHECK's correctness, not the memo's eviction behavior;
+    /// that's `inline_expansion_resident_vs_memo_is_byte_identical`, step 4's
+    /// other mandatory test).
+    fn build_memo<'a>(
+        corpus: &'a crate::CorpusUnits,
+        source: &'a dyn ContentSource,
+        cfg: &'a Config,
+    ) -> RawTreeMemo<'a> {
+        RawTreeMemo::new(
+            &corpus.raw_tree_files,
+            &corpus.unit_file_idx,
+            source,
+            &corpus.source_digests,
+            source.root().to_path_buf(),
+            cfg,
+            std::sync::Arc::clone(&corpus.label_interner),
+            None,
+        )
+    }
+
     fn assert_precheck_matches_oracle(
         units: &[Unit],
-        raw_trees: &[NormNode],
+        memo: &RawTreeMemo,
         call_sites: &[UnitCallSites],
         table: &DefTable,
         cfg: &Config,
@@ -1218,10 +1245,11 @@ mod wp_d_precheck_tests {
         label: &str,
     ) {
         for i in 0..units.len() {
-            let mut ctx_a = fresh_ctx(i, units, table, cfg, li, raw_trees);
-            let oracle = any_resolvable_call(&raw_trees[i], &mut ctx_a);
+            let raw = memo.unit(i);
+            let mut ctx_a = fresh_ctx(i, units, table, cfg, li, memo);
+            let oracle = any_resolvable_call(&raw, &mut ctx_a);
 
-            let mut ctx_b = fresh_ctx(i, units, table, cfg, li, raw_trees);
+            let mut ctx_b = fresh_ctx(i, units, table, cfg, li, memo);
             let projected = any_resolvable_call_projected(i, call_sites, &mut ctx_b);
 
             assert_eq!(
@@ -1257,9 +1285,11 @@ mod wp_d_precheck_tests {
             &cfg,
             &corpus.label_interner,
         );
+        let source = FsSource::new(&root);
+        let memo = build_memo(&corpus, &source, &cfg);
         assert_precheck_matches_oracle(
             &corpus.units,
-            &corpus.raw_trees,
+            &memo,
             &corpus.call_sites,
             &table,
             &cfg,
@@ -1286,9 +1316,11 @@ mod wp_d_precheck_tests {
             &cfg,
             &corpus.label_interner,
         );
+        let source = FsSource::new(&root);
+        let memo = build_memo(&corpus, &source, &cfg);
         assert_precheck_matches_oracle(
             &corpus.units,
-            &corpus.raw_trees,
+            &memo,
             &corpus.call_sites,
             &table,
             &cfg,
@@ -1337,14 +1369,196 @@ def ambiguous_target(a, b):
             &cfg,
             &corpus.label_interner,
         );
+        let source = FsSource::new(dir.path());
+        let memo = build_memo(&corpus, &source, &cfg);
         assert_precheck_matches_oracle(
             &corpus.units,
-            &corpus.raw_trees,
+            &memo,
             &corpus.call_sites,
             &table,
             &cfg,
             &corpus.label_interner,
             "synthetic fixture",
+        );
+    }
+}
+
+#[cfg(test)]
+mod wp_d_memo_tests {
+    //! WP-D step 4's mandatory differential test. By this step there is no
+    //! more resident `raw_trees` code path to compare against (deleted this
+    //! step — `expand_unit`/`splice_body` fetch exclusively through the
+    //! memo). An unbounded-budget memo plays the "resident" role instead: it
+    //! fetches and decodes each touched file's trees exactly once and never
+    //! evicts them for the rest of the phase — the SAME "under budget, zero
+    //! new work" behavior the old resident `Vec` gave for free. Comparing it
+    //! against a forced-tiny-budget memo (near-constant eviction/rehydrate)
+    //! proves residency/timing never leaks into the SPLICED OUTPUT — only
+    //! into how many times a file's trees get re-decoded (`store.rs`'s own
+    //! module-doc invariant: "byte-identity constrains the PATHS, not the
+    //! TIMING"), made concrete for this WP.
+    //!
+    //! The full-pipeline resident-vs-memo comparison lives OUTSIDE `cargo
+    //! test`: the landing report diffs a release build's SARIF+stats output
+    //! against the pre-WP-D commit on fs/net (external Linux-checkout
+    //! corpora, unavailable in CI) — the strongest form of this claim, since
+    //! it runs the ACTUAL pre-WP-D resident code end to end, not a stand-in.
+
+    use super::*;
+    use crate::config::Config;
+    use crate::source::{ContentSource, FsSource};
+
+    fn build_memo_with_budget<'a>(
+        corpus: &'a crate::CorpusUnits,
+        source: &'a dyn ContentSource,
+        cfg: &'a Config,
+        budget: Option<u64>,
+    ) -> RawTreeMemo<'a> {
+        RawTreeMemo::new(
+            &corpus.raw_tree_files,
+            &corpus.unit_file_idx,
+            source,
+            &corpus.source_digests,
+            source.root().to_path_buf(),
+            cfg,
+            std::sync::Arc::clone(&corpus.label_interner),
+            budget,
+        )
+    }
+
+    fn expansions_for(
+        units: &[Unit],
+        call_sites: &[UnitCallSites],
+        table: &DefTable,
+        cfg: &Config,
+        li: &LabelInterner,
+        memo: &RawTreeMemo,
+    ) -> Vec<Expansion> {
+        (0..units.len())
+            .map(|i| expand_unit(i, call_sites, units, table, cfg, li, memo))
+            .collect()
+    }
+
+    fn assert_expansions_equal(a: &[Expansion], b: &[Expansion], units: &[Unit], label: &str) {
+        assert_eq!(a.len(), b.len(), "{label}: expansion count diverged");
+        for i in 0..a.len() {
+            let (ea, eb) = (&a[i], &b[i]);
+            let name = &units[i].name;
+            assert_eq!(ea.tree, eb.tree, "{label}: unit {i} ({name}) tree diverged");
+            assert_eq!(
+                ea.chain, eb.chain,
+                "{label}: unit {i} ({name}) chain diverged"
+            );
+            assert_eq!(
+                ea.expanded_units, eb.expanded_units,
+                "{label}: unit {i} ({name}) expanded_units diverged"
+            );
+            assert_eq!(ea.scc, eb.scc, "{label}: unit {i} ({name}) scc diverged");
+            assert_eq!(
+                ea.calls_inlined, eb.calls_inlined,
+                "{label}: unit {i} ({name}) calls_inlined diverged"
+            );
+            assert_eq!(
+                ea.ambiguity_skips, eb.ambiguity_skips,
+                "{label}: unit {i} ({name}) ambiguity_skips diverged"
+            );
+            assert_eq!(
+                ea.budget_skipped, eb.budget_skipped,
+                "{label}: unit {i} ({name}) budget_skipped diverged"
+            );
+        }
+    }
+
+    /// `benches/wild`'s pairs are one clone-type demonstration each, not
+    /// caller/callee shapes the inliner resolves anything against — a real
+    /// splice needs a genuine multi-file corpus with matching plain
+    /// top-level calls. This builds one where every caller lives in ITS OWN
+    /// file and splices a callee out of one SHARED file: an unbounded memo
+    /// loads the shared file once and reuses it via LRU hits for every
+    /// caller after the first; a tiny budget evicts it (each caller's OWN
+    /// file fetch, which always runs first, evicts whatever the memo was
+    /// last holding) so nearly every splice re-rehydrates it — real
+    /// cross-file eviction/rehydrate traffic, not just a same-file no-op.
+    fn multi_file_inlining_fixture() -> Vec<(String, String)> {
+        let mut files = Vec::new();
+        let mut shared = String::new();
+        for i in 0..8 {
+            shared.push_str(&format!(
+                "fn helper_{i}(x: i64) -> i64 {{\n    let v = x + {i};\n    v * 2 - 1\n}}\n\n"
+            ));
+            files.push((
+                format!("caller_{i}.rs"),
+                format!(
+                    "fn caller_{i}(x: i64) -> i64 {{\n    let a = helper_{i}(x);\n    a + helper_{i}(a)\n}}\n"
+                ),
+            ));
+        }
+        files.push(("shared.rs".to_string(), shared));
+        files
+    }
+
+    #[test]
+    fn inline_expansion_resident_vs_memo_is_byte_identical_multi_file_fixture() {
+        let mut cfg = Config::default();
+        cfg.cache.enabled = false; // don't litter fixture dirs with .reprise/
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (name, src) in multi_file_inlining_fixture() {
+            std::fs::write(dir.path().join(&name), src).unwrap();
+        }
+        let root = dir.path().to_path_buf();
+        let corpus = crate::corpus_units(&root, &cfg).expect("fixture scans");
+        assert!(!corpus.units.is_empty());
+        assert_eq!(
+            corpus.raw_tree_files.len(),
+            9,
+            "fixture sanity: 8 caller files + 1 shared helper file"
+        );
+        let table = DefTable::build(
+            &corpus.units,
+            &corpus.call_sites,
+            &cfg,
+            &corpus.label_interner,
+        );
+        let source = FsSource::new(&root);
+
+        // "Resident" stand-in: fetch once per touched file, never evict.
+        let unbounded = build_memo_with_budget(&corpus, &source, &cfg, None);
+        let exp_unbounded = expansions_for(
+            &corpus.units,
+            &corpus.call_sites,
+            &table,
+            &cfg,
+            &corpus.label_interner,
+            &unbounded,
+        );
+
+        // A 1-byte budget forces eviction after nearly every insert (the
+        // anti-thrash floor keeps exactly one entry, never zero) — so most
+        // touches take the rehydrate path instead of an LRU hit.
+        let tiny = build_memo_with_budget(&corpus, &source, &cfg, Some(1));
+        let exp_tiny = expansions_for(
+            &corpus.units,
+            &corpus.call_sites,
+            &table,
+            &cfg,
+            &corpus.label_interner,
+            &tiny,
+        );
+
+        assert_expansions_equal(
+            &exp_unbounded,
+            &exp_tiny,
+            &corpus.units,
+            "multi-file inlining fixture",
+        );
+        // Sanity: the tiny budget actually forced real eviction/rehydrate
+        // traffic — otherwise this test would pass trivially without ever
+        // touching the rehydrate path the differential is meant to exercise.
+        assert!(
+            tiny.misses() > unbounded.misses(),
+            "tiny budget must force more rehydrates than unbounded: tiny={} unbounded={}",
+            tiny.misses(),
+            unbounded.misses()
         );
     }
 }

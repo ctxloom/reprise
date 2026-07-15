@@ -13,6 +13,8 @@
 
 use reprise::config::Config;
 use reprise::inline::{DefTable, expand_unit};
+use reprise::rawmemo::RawTreeMemo;
+use reprise::source::FsSource;
 use reprise::{CorpusUnits, corpus_units};
 use std::fs;
 use tempfile::TempDir;
@@ -25,6 +27,27 @@ fn build_corpus(files: &[(&str, &str)], cfg: &Config) -> (TempDir, CorpusUnits) 
     }
     let corpus = corpus_units(dir.path(), cfg).unwrap();
     (dir, corpus)
+}
+
+/// WP-D: `expand_unit` fetches raw trees through the memo, not a resident
+/// `Vec` — every low-level test below builds one over the SAME `FsSource`
+/// `corpus_units` used, unbounded (these tests are about the walk's
+/// bookkeeping, not the memo's eviction behavior).
+fn build_memo<'a>(
+    corpus: &'a CorpusUnits,
+    cfg: &'a Config,
+    source: &'a dyn reprise::source::ContentSource,
+) -> RawTreeMemo<'a> {
+    RawTreeMemo::new(
+        &corpus.raw_tree_files,
+        &corpus.unit_file_idx,
+        source,
+        &corpus.source_digests,
+        source.root().to_path_buf(),
+        cfg,
+        std::sync::Arc::clone(&corpus.label_interner),
+        None,
+    )
 }
 
 fn unit_idx(corpus: &CorpusUnits, name: &str) -> usize {
@@ -96,15 +119,16 @@ fn scc_round_does_not_nest_past_max_scc_depth() {
         &corpus.label_interner,
     );
     let idx = unit_idx(&corpus, "p0");
+    let source = FsSource::new(_dir.path());
+    let memo = build_memo(&corpus, &cfg, &source);
     let exp = expand_unit(
         idx,
-        &corpus.raw_trees[idx],
-        &corpus.raw_trees,
         &corpus.call_sites,
         &corpus.units,
         &table,
         &cfg,
         &corpus.label_interner,
+        &memo,
     );
 
     assert!(exp.scc, "p0 must be recognized as an SCC member");
@@ -144,15 +168,16 @@ fn inlined_scc_partner_does_not_recursively_splice_its_own_partners() {
         &corpus.label_interner,
     );
     let idx = unit_idx(&corpus, "q0");
+    let source = FsSource::new(_dir.path());
+    let memo = build_memo(&corpus, &cfg, &source);
     let exp = expand_unit(
         idx,
-        &corpus.raw_trees[idx],
-        &corpus.raw_trees,
         &corpus.call_sites,
         &corpus.units,
         &table,
         &cfg,
         &corpus.label_interner,
+        &memo,
     );
 
     assert!(
@@ -202,15 +227,16 @@ fn over_budget_unit_gets_no_variant_never_a_truncated_one() {
         &corpus_a.label_interner,
     );
     let idx_a = unit_idx(&corpus_a, "root");
+    let source = FsSource::new(_dir_a.path());
+    let memo = build_memo(&corpus_a, &default_cfg, &source);
     let exp_a = expand_unit(
         idx_a,
-        &corpus_a.raw_trees[idx_a],
-        &corpus_a.raw_trees,
         &corpus_a.call_sites,
         &corpus_a.units,
         &table_a,
         &default_cfg,
         &corpus_a.label_interner,
+        &memo,
     );
     assert!(
         exp_a.tree.is_some() && exp_a.calls_inlined > 0,
@@ -230,15 +256,16 @@ fn over_budget_unit_gets_no_variant_never_a_truncated_one() {
         &corpus_b.label_interner,
     );
     let idx_b = unit_idx(&corpus_b, "root");
+    let source = FsSource::new(_dir_b.path());
+    let memo = build_memo(&corpus_b, &tiny_cfg, &source);
     let exp_b = expand_unit(
         idx_b,
-        &corpus_b.raw_trees[idx_b],
-        &corpus_b.raw_trees,
         &corpus_b.call_sites,
         &corpus_b.units,
         &table_b,
         &tiny_cfg,
         &corpus_b.label_interner,
+        &memo,
     );
     assert!(
         exp_b.tree.is_none(),
@@ -266,15 +293,16 @@ fn budget_is_deterministic_across_runs() {
             &corpus.label_interner,
         );
         let idx = unit_idx(&corpus, "root");
+        let source = FsSource::new(_dir.path());
+        let memo = build_memo(&corpus, &cfg, &source);
         let exp = expand_unit(
             idx,
-            &corpus.raw_trees[idx],
-            &corpus.raw_trees,
             &corpus.call_sites,
             &corpus.units,
             &table,
             &cfg,
             &corpus.label_interner,
+            &memo,
         );
         (exp.tree.is_some(), exp.calls_inlined)
     };
@@ -305,15 +333,16 @@ fn budget_does_not_alter_emitted_variants() {
         &corpus_a.label_interner,
     );
     let idx_a = unit_idx(&corpus_a, "root");
+    let source = FsSource::new(_dir_a.path());
+    let memo = build_memo(&corpus_a, &cfg_default, &source);
     let exp_a = expand_unit(
         idx_a,
-        &corpus_a.raw_trees[idx_a],
-        &corpus_a.raw_trees,
         &corpus_a.call_sites,
         &corpus_a.units,
         &table_a,
         &cfg_default,
         &corpus_a.label_interner,
+        &memo,
     );
 
     let mut cfg_max = Config::default();
@@ -326,15 +355,16 @@ fn budget_does_not_alter_emitted_variants() {
         &corpus_b.label_interner,
     );
     let idx_b = unit_idx(&corpus_b, "root");
+    let source = FsSource::new(_dir_b.path());
+    let memo = build_memo(&corpus_b, &cfg_max, &source);
     let exp_b = expand_unit(
         idx_b,
-        &corpus_b.raw_trees[idx_b],
-        &corpus_b.raw_trees,
         &corpus_b.call_sites,
         &corpus_b.units,
         &table_b,
         &cfg_max,
         &corpus_b.label_interner,
+        &memo,
     );
 
     let tree_a = exp_a
