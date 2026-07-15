@@ -642,6 +642,9 @@ struct Ctx<'a> {
 }
 
 /// Fully-inline-per-policy expansion of one unit's raw tree (spec §5.4).
+// WP-D transitional: `raw_trees` (step 2's scaffold) drops out in step 4 when
+// the memo replaces it, bringing this back under clippy's default arg count.
+#[allow(clippy::too_many_arguments)]
 pub fn expand_unit(
     unit_idx: usize,
     raw: &NormNode,
@@ -649,6 +652,7 @@ pub fn expand_unit(
     // in step 4 when `splice_body` fetches a callee's body through the memo
     // instead.
     raw_trees: &[NormNode],
+    call_sites: &[UnitCallSites],
     units: &[Unit],
     table: &DefTable,
     cfg: &Config,
@@ -660,8 +664,14 @@ pub fn expand_unit(
     // wrapper around one call) get no inline variant: expanding one folds the
     // helper back in, so freshly-extracted helpers' wrappers would re-match
     // each other — reprise flagging its own recommended fix (user feedback,
-    // D37). Real reimplemented-helper cases have surrounding code.
-    if crate::lang::child_field(raw, "body").is_some_and(|b| b.children.len() <= 1) {
+    // D37). Real reimplemented-helper cases have surrounding code. WP-D:
+    // projection-based — `None` (no "body" field at all, e.g. every Kotlin
+    // unit) must NOT trigger this, only `Some(n) if n <= 1` — see
+    // `UnitCallSites::body_child_count`'s doc comment.
+    if call_sites[unit_idx]
+        .body_child_count
+        .is_some_and(|n| n <= 1)
+    {
         return Expansion::skipped(0);
     }
     let scc_partners: HashSet<usize> = match table.def_of_unit.get(&unit_idx) {
@@ -695,17 +705,20 @@ pub fn expand_unit(
     // M3c: `raw.clone()` used to run unconditionally here, even though ~55% of
     // units inline zero calls and produce no variant (`lib.rs` discards `tree`
     // whenever `calls_inlined == 0` — the exact anti-pattern `DefTable::Def.body`
-    // was already fixed for, above). `any_resolvable_call` is a read-only descent
-    // that decides this without owning (or copying) a single node: if it proves no
-    // call in the tree resolves, the real `walk` below is guaranteed to splice
-    // nothing, so the clone is skipped outright.
-    if !any_resolvable_call(raw, &mut ctx) {
-        // `any_resolvable_call` runs the same `resolve_policy`, so a budget of 0
-        // refuses every call here and no call ever "resolves" — the unit would exit
-        // through this cheap path. That is still a BUDGET skip, not a benign one, and
-        // must report itself as such. (For any budget ≥ 1 this cannot trigger: no
-        // splice has happened yet during the read-only descent, so `spliced_nodes` is
-        // still 0 and the check `B <= 0` is false.)
+    // was already fixed for, above). WP-D: the precheck is now projection-based
+    // (`any_resolvable_call_projected`) — it decides this over
+    // `call_sites[unit_idx].calls` without touching a single tree node at all
+    // (previously a read-only tree descent, `any_resolvable_call`, still kept
+    // below as the differential-test oracle): if it proves no call resolves,
+    // the real `walk` below is guaranteed to splice nothing, so both the
+    // precheck AND the clone it guards are skipped outright.
+    if !any_resolvable_call_projected(unit_idx, call_sites, &mut ctx) {
+        // Mirrors `resolve_given`'s policy, so a budget of 0 refuses every call
+        // here and no call ever "resolves" — the unit would exit through this
+        // cheap path. That is still a BUDGET skip, not a benign one, and must
+        // report itself as such. (For any budget ≥ 1 this cannot trigger: no
+        // splice has happened yet during the read-only precheck, so
+        // `spliced_nodes` is still 0 and the check `B <= 0` is false.)
         if ctx.over_budget {
             return Expansion::budget_skipped(ctx.ambiguous_sites.len() as u32);
         }
@@ -730,6 +743,29 @@ pub fn expand_unit(
     }
 }
 
+/// Projection-based precheck (WP-D): decides the SAME boolean as
+/// `any_resolvable_call` (below, kept as this function's differential-test
+/// oracle — see `inline_pushdown_precheck_matches_tree_walk` in the test
+/// module) purely over `call_sites[unit_idx].calls`, touching zero raw-tree
+/// bytes. Shares `resolve_given` with `resolve_policy` (the real walk's
+/// per-call decision), so the two can never independently drift on the
+/// POLICY itself — only (if at all) on whether `collect_call_sites`'s
+/// traversal reach matches `any_resolvable_call`'s, which is exactly what the
+/// differential test checks. Same early-exit-leaves-a-harmless-partial-
+/// `ambiguous_sites` argument as `any_resolvable_call` applies here too: the
+/// real `walk`, run only when this returns `true`, independently re-derives
+/// the complete set from its own full traversal.
+fn any_resolvable_call_projected(
+    unit_idx: usize,
+    call_sites: &[UnitCallSites],
+    ctx: &mut Ctx,
+) -> bool {
+    call_sites[unit_idx]
+        .calls
+        .iter()
+        .any(|&(ref name, arity, span)| resolve_given(name, arity, span, ctx).is_some())
+}
+
 /// Read-only descent proving whether `node`'s subtree contains at least one call
 /// `resolve_policy` would accept — i.e. whether the real `walk` below could
 /// possibly splice anything. Visits every node (same reach as `walk`, mirrors
@@ -741,6 +777,13 @@ pub fn expand_unit(
 /// (and every other `ctx` field) from its own complete traversal, so the partial
 /// set left behind by an early exit is a harmless subset (`HashSet` insertion is
 /// idempotent) — no reset needed between the two.
+///
+/// WP-D: no longer called by production (`expand_unit` now calls
+/// `any_resolvable_call_projected`) — kept ONLY as the differential-test
+/// oracle until `inline_expansion_resident_vs_memo_is_byte_identical` (step 4)
+/// has run green, per the plan's own discipline (don't delete the oracle
+/// before the test that needs it exists). Deleted in step 7.
+#[cfg_attr(not(test), allow(dead_code))]
 fn any_resolvable_call(node: &NormNode, ctx: &mut Ctx) -> bool {
     resolve_policy(node, ctx).is_some() || node.children.iter().any(|c| any_resolvable_call(c, ctx))
 }
@@ -928,22 +971,26 @@ fn de_return_node(node: &mut NormNode) {
     }
 }
 
-/// Resolve a call node against the table and the §5.4 policy knobs. Counts
-/// ambiguity skips; enforces the self-recursion and cycle guards, the aggregate
-/// expansion budget, depth, and the callee size cap — the last two relaxed for an
-/// SCC partner only within `max_scc_depth` (see the bypass site below).
-fn resolve_policy(node: &NormNode, ctx: &mut Ctx) -> Option<(usize, Vec<NormNode>)> {
-    let (name, args) = ctx.shapes.call_parts(node, ctx.kw_arg_sym)?;
-    if name == ctx.root_name {
+/// The tree-free half of `resolve_policy` (WP-D): every §5.4 policy knob over
+/// a call's already-extracted `(name, arity, span)` plus `Ctx`'s own scalar
+/// state — no `NormNode` in sight. This is the escalation-#1 sufficiency
+/// argument made real: `resolve_policy` (below) and the projection-based
+/// `any_resolvable_call_projected` both call THIS, so the decision itself
+/// cannot drift between the tree-walking and projection-based paths — only
+/// (if at all) the reach of the calls fed into it could, which is exactly
+/// what `collect_call_sites` vs `any_resolvable_call`'s traversal proves
+/// equal (differential test). Counts ambiguity skips; enforces the
+/// self-recursion and cycle guards, the aggregate expansion budget, depth,
+/// and the callee size cap — the last two relaxed for an SCC partner only
+/// within `max_scc_depth` (see the bypass site below).
+fn resolve_given(name: &str, arity: usize, span: (u32, u32), ctx: &mut Ctx) -> Option<usize> {
+    if name == ctx.root_name.as_ref() {
         return None; // never inline direct self-recursion (Rev 5 owns it)
     }
-    let def_idx = match ctx
-        .table
-        .resolve(ctx.lang, &name, args.len(), ctx.file, ctx.cfg)
-    {
+    let def_idx = match ctx.table.resolve(ctx.lang, name, arity, ctx.file, ctx.cfg) {
         Resolution::Hit(d) => d,
         Resolution::Ambiguous => {
-            ctx.ambiguous_sites.insert(node.span);
+            ctx.ambiguous_sites.insert(span);
             return None;
         }
         Resolution::Miss => return None,
@@ -988,6 +1035,16 @@ fn resolve_policy(node: &NormNode, ctx: &mut Ctx) -> Option<(usize, Vec<NormNode
             return None;
         }
     }
+    Some(def_idx)
+}
+
+/// Resolve a call node against the table and the §5.4 policy knobs, extracting
+/// its positional arg subtrees (needed only at splice time — the tree-free
+/// decision itself is `resolve_given`, shared with the projection-based
+/// precheck).
+fn resolve_policy(node: &NormNode, ctx: &mut Ctx) -> Option<(usize, Vec<NormNode>)> {
+    let (name, args) = ctx.shapes.call_parts(node, ctx.kw_arg_sym)?;
+    let def_idx = resolve_given(&name, args.len(), node.span, ctx)?;
     Some((def_idx, args.into_iter().cloned().collect()))
 }
 
@@ -1094,4 +1151,200 @@ fn substitute(
         .map(|c| substitute(c, map, shapes, kind))
         .collect();
     node
+}
+
+#[cfg(test)]
+mod wp_d_precheck_tests {
+    //! WP-D (raw-trees elimination) step 3's mandatory, red-first differential
+    //! test: `any_resolvable_call_projected` must decide EXACTLY what
+    //! `any_resolvable_call` (the tree-walking oracle) decides — same bool,
+    //! same `ambiguous_sites` — for every unit, or the memo (which relies on
+    //! the precheck needing no raw tree) is unsound (escalation #1).
+
+    use super::*;
+    use crate::config::Config;
+
+    /// Builds the SAME `Ctx` `expand_unit` would for `unit_idx`, so the test
+    /// exercises the precheck under realistic state (SCC partners, root name,
+    /// budget) rather than a stubbed one — the exact scalar state
+    /// `resolve_given` reads besides the call's own `(name, arity, span)`.
+    fn fresh_ctx<'a>(
+        unit_idx: usize,
+        units: &'a [Unit],
+        table: &'a DefTable,
+        cfg: &'a Config,
+        li: &LabelInterner,
+        raw_trees: &'a [NormNode],
+    ) -> Ctx<'a> {
+        let lang = units[unit_idx].lang;
+        let shapes = Shapes::for_lang(lang, cfg);
+        let scc_partners: HashSet<usize> = match table.def_of_unit.get(&unit_idx) {
+            Some(&d) if table.scc_sizes[table.scc_of[d]] >= 2 => (0..table.defs.len())
+                .filter(|&e| e != d && table.scc_of[e] == table.scc_of[d])
+                .collect(),
+            _ => HashSet::new(),
+        };
+        Ctx {
+            table,
+            raw_trees,
+            cfg,
+            shapes,
+            lang,
+            file: &units[unit_idx].file,
+            unit_idx,
+            root_name: units[unit_idx].name.as_str().into(),
+            scc_partners,
+            has_expr_block: shapes.make_expr_block((0, 0), Vec::new()).is_some(),
+            stack: Vec::new(),
+            chain: Vec::new(),
+            expanded_units: Vec::new(),
+            scc_hit: false,
+            calls_inlined: 0,
+            ambiguous_sites: HashSet::new(),
+            scc_splices: 0,
+            spliced_nodes: 0,
+            over_budget: false,
+            kw_arg_sym: li.intern("keyword_argument"),
+        }
+    }
+
+    fn assert_precheck_matches_oracle(
+        units: &[Unit],
+        raw_trees: &[NormNode],
+        call_sites: &[UnitCallSites],
+        table: &DefTable,
+        cfg: &Config,
+        li: &LabelInterner,
+        label: &str,
+    ) {
+        for i in 0..units.len() {
+            let mut ctx_a = fresh_ctx(i, units, table, cfg, li, raw_trees);
+            let oracle = any_resolvable_call(&raw_trees[i], &mut ctx_a);
+
+            let mut ctx_b = fresh_ctx(i, units, table, cfg, li, raw_trees);
+            let projected = any_resolvable_call_projected(i, call_sites, &mut ctx_b);
+
+            assert_eq!(
+                oracle, projected,
+                "{label}: unit {i} ({}) — bool diverged: oracle={oracle} projected={projected}",
+                units[i].name
+            );
+            assert_eq!(
+                ctx_a.ambiguous_sites, ctx_b.ambiguous_sites,
+                "{label}: unit {i} ({}) — ambiguous_sites diverged",
+                units[i].name
+            );
+            // over_budget is set by resolve_given identically on both paths —
+            // part of the same "no divergence anywhere in the decision" claim.
+            assert_eq!(
+                ctx_a.over_budget, ctx_b.over_budget,
+                "{label}: unit {i} ({}) — over_budget diverged",
+                units[i].name
+            );
+        }
+    }
+
+    #[test]
+    fn inline_pushdown_precheck_matches_tree_walk_wild_corpus() {
+        let mut cfg = Config::default();
+        cfg.cache.enabled = false; // don't litter fixture dirs with .reprise/
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("benches/wild");
+        let corpus = crate::corpus_units(&root, &cfg).expect("wild corpus scans");
+        assert!(!corpus.units.is_empty());
+        let table = DefTable::build(
+            &corpus.units,
+            &corpus.call_sites,
+            &cfg,
+            &corpus.label_interner,
+        );
+        assert_precheck_matches_oracle(
+            &corpus.units,
+            &corpus.raw_trees,
+            &corpus.call_sites,
+            &table,
+            &cfg,
+            &corpus.label_interner,
+            "benches/wild",
+        );
+    }
+
+    /// A tighter budget/depth than the wild corpus is likely to trip on its
+    /// own — exercises `resolve_given`'s budget/depth/SCC-bypass branches,
+    /// which the default-config wild-corpus pass may not reach at all.
+    #[test]
+    fn inline_pushdown_precheck_matches_tree_walk_tight_budget() {
+        let mut cfg = Config::default();
+        cfg.cache.enabled = false;
+        cfg.inline.max_expansion_nodes = 5;
+        cfg.inline.max_depth = 1;
+        cfg.inline.max_callee_tokens = 20;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("benches/wild");
+        let corpus = crate::corpus_units(&root, &cfg).expect("wild corpus scans");
+        let table = DefTable::build(
+            &corpus.units,
+            &corpus.call_sites,
+            &cfg,
+            &corpus.label_interner,
+        );
+        assert_precheck_matches_oracle(
+            &corpus.units,
+            &corpus.raw_trees,
+            &corpus.call_sites,
+            &table,
+            &cfg,
+            &corpus.label_interner,
+            "benches/wild (tight budget)",
+        );
+    }
+
+    /// Method calls, keyword-arg calls, and nested calls — the exact shapes
+    /// `Shapes::call_parts` filters, which is where `collect_call_sites`'s
+    /// reach could plausibly diverge from `any_resolvable_call`'s tree walk
+    /// if the filter were ever re-spelled instead of shared.
+    #[test]
+    fn inline_pushdown_precheck_matches_tree_walk_synthetic_fixture() {
+        let mut cfg = Config::default();
+        cfg.cache.enabled = false;
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("fixture.py"),
+            r#"
+def helper(a, b):
+    return a + b
+
+def obj_method_call(x):
+    return x.method(1, 2)
+
+def kwarg_call(x):
+    return helper(a=x, b=1)
+
+def nested(x):
+    return helper(helper(x, 1), 2)
+
+def ambiguous_target(a):
+    return a
+
+def ambiguous_target(a, b):
+    return a + b
+"#,
+        )
+        .unwrap();
+        let corpus = crate::corpus_units(dir.path(), &cfg).expect("fixture scans");
+        cfg.inline.max_candidates = 0; // force every same-arity multi-def name ambiguous
+        let table = DefTable::build(
+            &corpus.units,
+            &corpus.call_sites,
+            &cfg,
+            &corpus.label_interner,
+        );
+        assert_precheck_matches_oracle(
+            &corpus.units,
+            &corpus.raw_trees,
+            &corpus.call_sites,
+            &table,
+            &cfg,
+            &corpus.label_interner,
+            "synthetic fixture",
+        );
+    }
 }

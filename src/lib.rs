@@ -503,6 +503,7 @@ pub fn scan_source(
                     i,
                     &raw_trees[i],
                     &raw_trees,
+                    &call_sites,
                     &units,
                     &table,
                     config,
