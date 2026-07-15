@@ -89,8 +89,8 @@ fn strip_volatile(report: &mut reprise::ScanReport) {
     // the byte-identity harness strips every `memory_*` field for this same
     // reason). Only the SUM is invariant (every touched file is fetched
     // exactly once per residency-window); the split is timing, not output.
-    report.stats.raw_tree_memo_hits = 0;
-    report.stats.raw_tree_memo_misses = 0;
+    report.stats.memory_raw_tree_memo_hits = 0;
+    report.stats.memory_raw_tree_memo_misses = 0;
 }
 
 #[test]

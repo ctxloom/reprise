@@ -65,8 +65,8 @@ fn strip_volatile(report: &mut reprise::ScanReport) {
     report.stats.memory_pack_bytes = 0;
     report.stats.memory_lru_hits = 0;
     report.stats.memory_lru_misses = 0;
-    report.stats.raw_tree_memo_hits = 0;
-    report.stats.raw_tree_memo_misses = 0;
+    report.stats.memory_raw_tree_memo_hits = 0;
+    report.stats.memory_raw_tree_memo_misses = 0;
 }
 
 #[test]
@@ -127,7 +127,7 @@ fn raw_tree_memo_stats_are_populated_when_inlining_runs() {
     cfg.cache.enabled = false;
     let report = reprise::scan(root, &cfg).expect("scan");
     assert!(
-        report.stats.raw_tree_memo_misses > 0,
+        report.stats.memory_raw_tree_memo_misses > 0,
         "the memo must have rehydrated at least one file's raw trees: {:?}",
         report.stats
     );
@@ -144,6 +144,6 @@ fn raw_tree_memo_stats_are_zero_when_inlining_is_disabled() {
     cfg.cache.enabled = false;
     cfg.inline.enabled = false;
     let report = reprise::scan(root, &cfg).expect("scan");
-    assert_eq!(report.stats.raw_tree_memo_hits, 0);
-    assert_eq!(report.stats.raw_tree_memo_misses, 0);
+    assert_eq!(report.stats.memory_raw_tree_memo_hits, 0);
+    assert_eq!(report.stats.memory_raw_tree_memo_misses, 0);
 }

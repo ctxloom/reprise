@@ -673,8 +673,8 @@ pub fn scan_source(
         // WP-D observability: the memo's LRU traffic, read before it drops
         // with this block — instrumented so its residency is auditable on
         // every run (mirrors `memory_lru_hits`/`memory_lru_misses` below).
-        stats.raw_tree_memo_hits = memo.hits();
-        stats.raw_tree_memo_misses = memo.misses();
+        stats.memory_raw_tree_memo_hits = memo.hits();
+        stats.memory_raw_tree_memo_misses = memo.misses();
     }
     debug_assert!(
         if gate.over {

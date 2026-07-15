@@ -243,8 +243,8 @@ pub struct Stats {
     /// the memo's residency is auditable on every run, not just when someone
     /// straps on an external harness (CLAUDE.md: "instrument so the next person
     /// cannot repeat this").
-    pub raw_tree_memo_hits: u64,
-    pub raw_tree_memo_misses: u64,
+    pub memory_raw_tree_memo_hits: u64,
+    pub memory_raw_tree_memo_misses: u64,
 }
 
 /// Minimal per-unit coordinates check mode needs to map baseline member
