@@ -236,6 +236,15 @@ pub struct Stats {
     /// matters for where a memory guard belongs: is the process peak set during
     /// extraction, or after it?
     pub memory_extract_peak_bytes: u64,
+    /// WP-D (raw-trees elimination): the raw-tree memo's LRU traffic during the
+    /// inline phase (hit-rate = hits/(hits+misses)) — mirrors `memory_lru_hits`/
+    /// `memory_lru_misses`'s observability for the near-tier verify pack LRU.
+    /// 0/0 when inlining is disabled (the memo is never built). Instrumented so
+    /// the memo's residency is auditable on every run, not just when someone
+    /// straps on an external harness (CLAUDE.md: "instrument so the next person
+    /// cannot repeat this").
+    pub raw_tree_memo_hits: u64,
+    pub raw_tree_memo_misses: u64,
 }
 
 /// Minimal per-unit coordinates check mode needs to map baseline member

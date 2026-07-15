@@ -508,8 +508,9 @@ pub fn scan_source(
         // touches a checkout that may not exist. `cache_root` mirrors
         // `corpus_units_from`'s own resolution (`src/lib.rs`'s extraction
         // closure) exactly, so a cache-on memo hits the SAME blobs extraction
-        // wrote. Budget `None` (unbounded) for now — wired to the pressure-
-        // aware floor in a later step (`memory::raw_tree_memo_bytes(&gate)`).
+        // wrote. Budget reuses the ALREADY-COMPUTED `gate` (Gate 2's own "ONE
+        // decision" invariant) — unbounded under it (P2: the common case pays
+        // nothing beyond the projection), the measured flat floor over it.
         let cache_root = config
             .cache
             .shared_root
@@ -524,7 +525,7 @@ pub fn scan_source(
             cache_root,
             config,
             std::sync::Arc::clone(&label_interner),
-            None,
+            memory::raw_tree_memo_bytes(&gate),
         );
         let table = inline::DefTable::build(&units, &call_sites, config, &label_interner);
         stats.scc_units = table.scc_unit_count();
@@ -669,6 +670,11 @@ pub fn scan_source(
         // downstream tier.
         units.shrink_to_fit();
         digests.shrink_to_fit();
+        // WP-D observability: the memo's LRU traffic, read before it drops
+        // with this block — instrumented so its residency is auditable on
+        // every run (mirrors `memory_lru_hits`/`memory_lru_misses` below).
+        stats.raw_tree_memo_hits = memo.hits();
+        stats.raw_tree_memo_misses = memo.misses();
     }
     debug_assert!(
         if gate.over {

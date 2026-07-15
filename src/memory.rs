@@ -164,6 +164,27 @@ pub fn tree_lru_bytes(budget_bytes: u64) -> u64 {
     (budget_bytes / 8).max(TREE_LRU_FLOOR_BYTES)
 }
 
+/// Floor for the raw-tree memo's bounded LRU (WP-D, raw-trees elimination,
+/// session `woozy-uncut-comic`). MEASURED (`raw-trees-elimination.md` §3,
+/// inherited from that design doc — not independently re-derived by this WP):
+/// the miss curve is FLAT in LRU size — 32 MiB and 256 MiB land within 2 MiB
+/// of the same peak on both fs and net (34.1 MiB vs 208.7 MiB "peak" at those
+/// two budgets — giving it MORE than the flat point bought nothing). This is
+/// a flat floor, not a fraction of `gate.budget_bytes`: unlike the verify-tree
+/// LRU ([`tree_lru_bytes`]), scaling this with a bigger scan budget was
+/// measured to add nothing, because splice locality (not budget) is what sets
+/// the miss rate.
+pub const RAW_TREE_MEMO_BYTES: u64 = 32 << 20;
+
+/// The raw-tree memo's budget: unbounded under the gate (P2 — the common
+/// case, budget stays under the estimate, pays nothing beyond the
+/// projection), the measured flat floor over it. One flag, reused from the
+/// SAME [`GateDecision`] `corpus_units_from` already computed — never a
+/// second gate decision.
+pub fn raw_tree_memo_bytes(gate: &GateDecision) -> Option<u64> {
+    gate.over.then_some(RAW_TREE_MEMO_BYTES)
+}
+
 /// This process's peak resident set size — the high-water mark, `VmHWM`.
 ///
 /// **Observation only. It does not, and must not, feed the gate decision**, which
