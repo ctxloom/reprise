@@ -238,6 +238,11 @@ pub fn rep_substrate(
             _ => offsets.push((h, vec![o], vec![d])),
         }
     }
+    offsets.shrink_to_fit();
+    for (_, offs, deps) in &mut offsets {
+        offs.shrink_to_fit();
+        deps.shrink_to_fit();
+    }
     offsets
 }
 
