@@ -605,6 +605,9 @@ impl Retriever for Landmark {
                 // re-sorting every occurrence. Do not remove.
                 lms.sort_unstable();
                 lms.dedup();
+                // dedup shrinks len, never capacity; these per-unit lists stay
+                // resident through the whole join, so the slack is real peak.
+                lms.shrink_to_fit();
                 lms
             })
             .collect();
@@ -842,6 +845,9 @@ fn shared_count_pairs_partitioned(
             _ => counts.push(((pair.0 as usize, pair.1 as usize), 1)),
         }
     }
+    // Push-grown to a doubling capacity; it is returned and held resident as the
+    // landmark index, so trim the slack before it outlives this function.
+    counts.shrink_to_fit();
     counts
 }
 
