@@ -22,6 +22,7 @@ pub mod matchtree;
 pub mod memory;
 pub mod normalize;
 pub mod pack;
+pub mod rawmemo;
 pub mod report;
 pub mod seq;
 pub mod source;
@@ -80,6 +81,17 @@ pub struct CorpusUnits {
     /// from the tree; P4 freezes the cache format).
     pub digests: Vec<digest::UnitDigest>,
     pub raw_trees: Vec<tree::NormNode>,
+    /// WP-D (raw-trees elimination): per-unit metadata projection of `raw_trees`
+    /// — index-aligned with `units`/`raw_trees`. The inliner's resolvability
+    /// precheck and adjacency (SCC) pass read this instead of a raw tree; the
+    /// raw tree itself is fetched only at splice time, through the memo built
+    /// from `raw_tree_files`/`unit_file_idx` below.
+    pub call_sites: Vec<inline::UnitCallSites>,
+    /// One entry per FILE (not per unit) — the raw-tree memo's rehydration
+    /// coordinates (WP-D).
+    pub raw_tree_files: Vec<rawmemo::RawFileKey>,
+    /// Per unit, which `raw_tree_files` entry it belongs to (WP-D).
+    pub unit_file_idx: Vec<u32>,
     pub repeats: Vec<unit::InternalRepeat>,
     pub source_digests: HashMap<std::path::PathBuf, u128>,
     pub stats: report::Stats,
@@ -142,11 +154,13 @@ pub fn corpus_units_from(
     }
 
     enum FileOutcome {
-        /// (extraction, content digest, line count, cache hit) — the digest and line
-        /// count are cheap-to-compute-now facts derived from the source text while
-        /// it's in hand for parsing; the text itself is not retained (see
-        /// `CorpusUnits` doc comment).
-        Units(unit::FileUnits, u128, usize, bool),
+        /// (extraction, content digest, line count, cache hit, D19 cache key,
+        /// language) — the digest and line count are cheap-to-compute-now facts
+        /// derived from the source text while it's in hand for parsing; the text
+        /// itself is not retained (see `CorpusUnits` doc comment). The cache key
+        /// is the SAME `u128` `cache::key(...)` already computes below — retained
+        /// for the raw-tree memo (WP-D) instead of thrown away.
+        Units(unit::FileUnits, u128, usize, bool, u128, lang::Lang),
         SkippedGenerated,
         Unreadable,
     }
@@ -170,7 +184,9 @@ pub fn corpus_units_from(
                     let digest = xxhash_rust::xxh3::xxh3_128(src.as_bytes());
                     let line_count = src.lines().count();
                     match cached {
-                        Some(extracted) => FileOutcome::Units(extracted, digest, line_count, true),
+                        Some(extracted) => {
+                            FileOutcome::Units(extracted, digest, line_count, true, key, *lang)
+                        }
                         None => {
                             let extracted = unit::extract_file_units_keep_raw(
                                 path,
@@ -182,7 +198,7 @@ pub fn corpus_units_from(
                             if config.cache.enabled {
                                 cache::store(cache_root, key, &extracted, &label_interner);
                             }
-                            FileOutcome::Units(extracted, digest, line_count, false)
+                            FileOutcome::Units(extracted, digest, line_count, false, key, *lang)
                         }
                     }
                 }
@@ -196,9 +212,19 @@ pub fn corpus_units_from(
     let mut repeats = Vec::new();
     let mut source_digests: HashMap<std::path::PathBuf, u128> = HashMap::new();
     let mut stats = report::Stats::default();
+    // WP-D (raw-trees elimination): the metadata projection + retained memo
+    // coordinates, built ADDITIVELY alongside the still-resident `raw_trees`
+    // (step 1 of the staged elimination — production still reads `raw_trees`
+    // below; `call_sites`/`raw_tree_files`/`unit_file_idx` are unused by the
+    // pipeline until later steps repoint it). `kw_arg` interned ONCE per scan
+    // (rule 5), exactly as `DefTable::build` does today.
+    let kw_arg = label_interner.intern("keyword_argument");
+    let mut call_sites: Vec<inline::UnitCallSites> = Vec::new();
+    let mut raw_tree_files: Vec<rawmemo::RawFileKey> = Vec::new();
+    let mut unit_file_idx: Vec<u32> = Vec::new();
     for (path, outcome) in outcomes {
         match outcome {
-            FileOutcome::Units(mut extracted, digest, line_count, cache_hit) => {
+            FileOutcome::Units(mut extracted, digest, line_count, cache_hit, cache_key, lang) => {
                 stats.files_scanned += 1;
                 stats.suppressed_units += extracted.suppressed;
                 stats.total_lines += line_count;
@@ -207,6 +233,32 @@ pub fn corpus_units_from(
                 } else {
                     stats.cache_misses += 1;
                 }
+
+                let file_idx = raw_tree_files.len() as u32;
+                let unit_start = units.len() as u32;
+                for (unit, tree) in extracted.units.iter().zip(&extracted.raw_trees) {
+                    let shapes = inline::Shapes::for_lang(unit.lang, config);
+                    let body = crate::lang::child_field(tree, "body");
+                    let mut calls = Vec::new();
+                    if let Some(b) = body {
+                        inline::collect_call_sites(b, shapes, &mut calls, kw_arg);
+                    }
+                    call_sites.push(inline::UnitCallSites {
+                        body_child_count: body.map(|b| b.children.len() as u32),
+                        body_tokens: body.map_or(0, |b| b.token_count()),
+                        calls,
+                        params: shapes.params(tree),
+                    });
+                    unit_file_idx.push(file_idx);
+                }
+                raw_tree_files.push(rawmemo::RawFileKey {
+                    file: path.clone(),
+                    lang,
+                    cache_key,
+                    unit_start,
+                    unit_count: extracted.units.len() as u32,
+                });
+
                 units.append(&mut extracted.units);
                 raw_trees.append(&mut extracted.raw_trees);
                 repeats.append(&mut extracted.repeats);
@@ -225,6 +277,9 @@ pub fn corpus_units_from(
     units.shrink_to_fit();
     raw_trees.shrink_to_fit();
     repeats.shrink_to_fit();
+    call_sites.shrink_to_fit();
+    raw_tree_files.shrink_to_fit();
+    unit_file_idx.shrink_to_fit();
 
     // ---- Gate 2 (memory architecture P2): ONE decision, at this phase
     // boundary, from exact post-extraction counts. Under the gate the fused
@@ -268,6 +323,9 @@ pub fn corpus_units_from(
         gate,
         digests,
         raw_trees,
+        call_sites,
+        raw_tree_files,
+        unit_file_idx,
         repeats,
         source_digests,
         stats,
@@ -335,6 +393,7 @@ pub fn scan_source(
         source_digests,
         mut stats,
         label_interner,
+        ..
     } = corpus_units_from(source, config)?;
     let plain_count = units.len();
 
@@ -1127,5 +1186,152 @@ mod tests {
         let units = vec![mk_unit("a.rs", "n", true)];
         let index = test_unit_key_index(&units, true);
         assert!(index.is_empty());
+    }
+
+    // ---- WP-D step 1 (raw-trees elimination, session `woozy-uncut-comic`):
+    // `call_sites` must exactly reproduce direct reads off the still-resident
+    // `raw_trees` it will eventually replace. Additive at this step — nothing
+    // downstream reads `call_sites` yet, so a failure here is a pure
+    // wiring/indexing bug in `corpus_units_from`'s new per-file loop, not a
+    // change in scan output. ----
+
+    /// Real-world corpus (`benches/wild`): every language, every unit shape
+    /// the wild corpus carries.
+    #[test]
+    fn call_sites_projection_matches_direct_raw_tree_reads_wild_corpus() {
+        let mut cfg = Config::default();
+        cfg.cache.enabled = false; // don't litter fixture dirs with .reprise/
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("benches/wild");
+        let corpus = corpus_units(&root, &cfg).expect("wild corpus scans");
+        assert!(!corpus.units.is_empty(), "wild corpus produced no units");
+        assert_eq!(corpus.units.len(), corpus.raw_trees.len());
+        assert_eq!(corpus.units.len(), corpus.call_sites.len());
+        let kw_arg = corpus.label_interner.intern("keyword_argument");
+        for (i, unit) in corpus.units.iter().enumerate() {
+            let tree = &corpus.raw_trees[i];
+            let shapes = inline::Shapes::for_lang(unit.lang, &cfg);
+            let body = lang::child_field(tree, "body");
+            let expected_body_child_count = body.map(|b| b.children.len() as u32);
+            let expected_body_tokens = body.map_or(0, |b| b.token_count());
+            let expected_params = shapes.params(tree);
+            let mut expected_calls = Vec::new();
+            if let Some(b) = body {
+                inline::collect_call_sites(b, shapes, &mut expected_calls, kw_arg);
+            }
+            let cs = &corpus.call_sites[i];
+            assert_eq!(
+                cs.body_child_count, expected_body_child_count,
+                "unit {i} ({} {:?})",
+                unit.name, unit.lang
+            );
+            assert_eq!(
+                cs.body_tokens, expected_body_tokens,
+                "unit {i} ({} {:?})",
+                unit.name, unit.lang
+            );
+            assert_eq!(
+                cs.params, expected_params,
+                "unit {i} ({} {:?})",
+                unit.name, unit.lang
+            );
+            assert_eq!(
+                cs.calls, expected_calls,
+                "unit {i} ({} {:?})",
+                unit.name, unit.lang
+            );
+        }
+    }
+
+    /// Synthetic fixture exercising the `calls` filter directly: a plain call
+    /// (captured), a method call (excluded — not a plain-identifier callee), a
+    /// keyword-arg call (excluded), and nested calls (both captured).
+    #[test]
+    fn call_sites_projection_excludes_method_and_kwarg_calls() {
+        let cfg = Config::default();
+        let src = r#"
+def helper(a, b):
+    return a + b
+
+def obj_method_call(x):
+    return x.method(1, 2)
+
+def kwarg_call(x):
+    return helper(a=x, b=1)
+
+def nested(x):
+    return helper(helper(x, 1), 2)
+"#;
+        let label_interner = crate::intern::LabelInterner::new();
+        let fu = unit::extract_file_units_keep_raw(
+            Path::new("fixture.py"),
+            src,
+            lang::Lang::Python,
+            &cfg,
+            &label_interner,
+        );
+        assert_eq!(fu.units.len(), 4, "fixture sanity: 4 top-level defs");
+        let kw_arg = label_interner.intern("keyword_argument");
+        for (i, unit) in fu.units.iter().enumerate() {
+            let tree = &fu.raw_trees[i];
+            let shapes = inline::Shapes::for_lang(unit.lang, &cfg);
+            let body = lang::child_field(tree, "body");
+            let mut calls = Vec::new();
+            if let Some(b) = body {
+                inline::collect_call_sites(b, shapes, &mut calls, kw_arg);
+            }
+            match unit.name.as_str() {
+                "helper" => assert!(calls.is_empty(), "no calls in helper: {calls:?}"),
+                "obj_method_call" => assert!(
+                    calls.is_empty(),
+                    "a method call has no plain-identifier callee: {calls:?}"
+                ),
+                "kwarg_call" => assert!(
+                    calls.is_empty(),
+                    "a keyword-arg call is not positionally mappable: {calls:?}"
+                ),
+                "nested" => assert_eq!(
+                    calls.len(),
+                    2,
+                    "both nested calls to helper must be captured: {calls:?}"
+                ),
+                other => panic!("unexpected fixture unit {other}"),
+            }
+        }
+    }
+
+    /// A Kotlin unit's root has NO "body" FIELD at all (the grammar locates the
+    /// body by node kind, not by field — `src/lang/kotlin.rs`'s own doc
+    /// comment) — never `Some(empty)`. `body_child_count` must come out `None`,
+    /// not `Some(0)`, or `expand_unit`'s thin-delegation check
+    /// (`Some(n) if n <= 1`) would flip from "never fires" (today, since
+    /// `child_field(..).is_some_and(..)` is false on `None`) to "always fires"
+    /// for every Kotlin unit — silently disabling the inliner for the language.
+    #[test]
+    fn call_sites_projection_kotlin_body_child_count_is_none_not_zero() {
+        let cfg = Config::default();
+        let src = "fun add(a: Int, b: Int): Int {\n    return a + b\n}\n";
+        let label_interner = crate::intern::LabelInterner::new();
+        let fu = unit::extract_file_units_keep_raw(
+            Path::new("fixture.kt"),
+            src,
+            lang::Lang::Kotlin,
+            &cfg,
+            &label_interner,
+        );
+        assert_eq!(fu.units.len(), 1, "fixture sanity: one top-level fun");
+        let tree = &fu.raw_trees[0];
+        assert!(
+            lang::child_field(tree, "body").is_none(),
+            "Kotlin grammar has no \"body\" field — this must stay None"
+        );
+        // Mirrors corpus_units_from's own projection-building line.
+        let body = lang::child_field(tree, "body");
+        let body_child_count = body.map(|b| b.children.len() as u32);
+        assert_eq!(
+            body_child_count, None,
+            "collapsing this to a bare 0 would make expand_unit's \
+             `body_child_count <= 1` check ALWAYS true for Kotlin, disabling \
+             its inliner outright"
+        );
     }
 }

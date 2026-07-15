@@ -76,7 +76,7 @@ impl Shapes {
         }
     }
 
-    fn params(&self, root: &NormNode) -> Option<Vec<Box<str>>> {
+    pub(crate) fn params(&self, root: &NormNode) -> Option<Vec<Box<str>>> {
         match self {
             Shapes::Historical(p) => p.inline_params(root),
             // The unit's `Var@param` children carry the simple `Raw` names; a
@@ -436,6 +436,69 @@ fn collect_calls(node: &NormNode, shapes: Shapes, out: &mut Vec<(Box<str>, usize
     }
     for child in &node.children {
         collect_calls(child, shapes, out, kw_arg);
+    }
+}
+
+/// Extraction-time projection of one unit's raw tree (WP-D, raw-trees
+/// elimination): everything `DefTable::build`'s adjacency pass and
+/// `expand_unit`'s pre-walk resolvability check read, with ZERO raw-tree bytes
+/// retained. Built once per unit, at extraction (`corpus_units_from`), from the
+/// SAME `Shapes` methods the inliner already uses — never re-spelled.
+/// Index-aligned with `units`/`raw_trees` (one entry per unit, same alignment
+/// `raw_trees` had — including non-plain/anon units, which `DefTable::build`
+/// still filters by name exactly as before).
+#[derive(Debug, Clone)]
+pub struct UnitCallSites {
+    /// Root body's immediate child count — `None` when this unit's root has NO
+    /// "body" field at all (NOT the same as a body with 0 children): measured
+    /// against the real grammars, Kotlin's tree-sitter grammar has no `body`
+    /// FIELD whatsoever (the body is a same-kind child, located structurally —
+    /// `src/lang/kotlin.rs`'s own doc comment), so `child_field(unit, "body")`
+    /// is `None` for EVERY Kotlin unit; historical-mode (non-default) Go can
+    /// also produce a body-less declaration (an assembly-linked/`go:linkname`
+    /// func) since, unlike the IR path, the historical `normalize::convert`
+    /// does not synthesize a placeholder body. Collapsing this to a bare `u32`
+    /// (0 for both "no field" and "empty body") would flip `expand_unit`'s
+    /// `is_some_and(|b| b.children.len() <= 1)` thin-delegation check from
+    /// "never fires" to "always fires" for every Kotlin unit — silently
+    /// disabling the inliner for that language. Two independent readers:
+    /// `expand_unit`'s thin-delegation fast skip (`Some(n) if n <= 1` → no
+    /// variant, D37) when THIS unit is a caller, and `try_expr_inline`'s
+    /// `single` check (`def.body.children.len() == 1`, i.e. `Some(1)` here)
+    /// when THIS unit is spliced as a callee — always `Some` in that reader,
+    /// since `DefTable::build` only admits a unit as a `Def` when its body
+    /// field resolved.
+    pub body_child_count: Option<u32>,
+    /// D18 basis (`max_callee_tokens`); moved from "computed in DefTable::build
+    /// from a borrowed body" to "computed once at extraction."
+    pub body_tokens: u32,
+    /// Every positionally-mappable call site anywhere in the body subtree (same
+    /// reach as `collect_calls`): callee name, arg count, byte span. A call node
+    /// that `Shapes::call_parts` would reject (method call, kw-arg,
+    /// non-identifier callee) is OMITTED — it can never resolve either way, so
+    /// it carries no information the pre-walk decision needs.
+    pub calls: Vec<(Box<str>, usize, (u32, u32))>,
+    /// `Shapes::params(&unit_tree)` — `None` when this unit cannot be a
+    /// resolution TARGET (non-simple params). `DefTable::build` only admits a
+    /// unit into `defs` when this is `Some`.
+    pub params: Option<Vec<Box<str>>>,
+}
+
+/// Like [`collect_calls`], but span-carrying (WP-D): `resolve_policy`'s
+/// ambiguity tracking (`ctx.ambiguous_sites.insert(node.span)`) needs a span per
+/// call site to build the projection-based precheck's oracle-equivalent
+/// `ambiguous_sites` set.
+pub(crate) fn collect_call_sites(
+    node: &NormNode,
+    shapes: Shapes,
+    out: &mut Vec<(Box<str>, usize, (u32, u32))>,
+    kw_arg: LSym,
+) {
+    if let Some((name, args)) = shapes.call_parts(node, kw_arg) {
+        out.push((name, args.len(), node.span));
+    }
+    for child in &node.children {
+        collect_call_sites(child, shapes, out, kw_arg);
     }
 }
 
