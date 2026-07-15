@@ -173,47 +173,20 @@ pub fn corpus_units_from(
         Unreadable,
     }
 
-    let outcomes: Vec<(std::path::PathBuf, FileOutcome)> = files
-        .par_iter()
-        .map(|(path, lang)| {
-            let outcome = match source.read(path) {
-                None => FileOutcome::Unreadable,
-                Some(src) if walk::is_generated(&src, config) => FileOutcome::SkippedGenerated,
-                Some(src) => {
-                    // D8/D19 version-keyed per-file cache: a hit is
-                    // byte-identical to a cold extraction by contract.
-                    let key = cache::key(&baseline::relative_file(path, root), &src, config);
-                    let cache_root = config.cache.shared_root.as_deref().unwrap_or(root);
-                    let cached = config
-                        .cache
-                        .enabled
-                        .then(|| cache::load(cache_root, key, path, &label_interner))
-                        .flatten();
-                    let digest = xxhash_rust::xxh3::xxh3_128(src.as_bytes());
-                    let line_count = src.lines().count();
-                    match cached {
-                        Some(extracted) => {
-                            FileOutcome::Units(extracted, digest, line_count, true, key, *lang)
-                        }
-                        None => {
-                            let extracted = unit::extract_file_units_keep_raw(
-                                path,
-                                &src,
-                                *lang,
-                                config,
-                                &label_interner,
-                            );
-                            if config.cache.enabled {
-                                cache::store(cache_root, key, &extracted, &label_interner);
-                            }
-                            FileOutcome::Units(extracted, digest, line_count, false, key, *lang)
-                        }
-                    }
-                }
-            };
-            (path.clone(), outcome)
-        })
-        .collect();
+    // Streaming (wave-based) extraction, Step 1 (session `woozy-uncut-comic`,
+    // `streaming-extraction.plan.md`): bound the `outcomes` collect-transient
+    // to one wave of files rather than the whole corpus. Waves are
+    // CONTIGUOUS, in-file-order chunks of `files` — `units`, `call_sites`,
+    // `raw_tree_files`, `unit_file_idx`, `source_digests`, and `stats`
+    // accumulate in exactly the order they would under a single collect, so
+    // this is byte-identical to before by construction; only the transient's
+    // peak size changes. `0` (or a value >= `files.len()`) reproduces
+    // today's single-wave behavior exactly.
+    let wave_files = if config.memory.extract_wave_files == 0 {
+        files.len().max(1)
+    } else {
+        config.memory.extract_wave_files
+    };
 
     let mut units: Vec<Unit> = Vec::new();
     let mut repeats = Vec::new();
@@ -228,52 +201,103 @@ pub fn corpus_units_from(
     let mut call_sites: Vec<inline::UnitCallSites> = Vec::new();
     let mut raw_tree_files: Vec<rawmemo::RawFileKey> = Vec::new();
     let mut unit_file_idx: Vec<u32> = Vec::new();
-    for (path, outcome) in outcomes {
-        match outcome {
-            FileOutcome::Units(mut extracted, digest, line_count, cache_hit, cache_key, lang) => {
-                stats.files_scanned += 1;
-                stats.suppressed_units += extracted.suppressed;
-                stats.total_lines += line_count;
-                if cache_hit {
-                    stats.cache_hits += 1;
-                } else {
-                    stats.cache_misses += 1;
-                }
-
-                let file_idx = raw_tree_files.len() as u32;
-                let unit_start = units.len() as u32;
-                for (unit, tree) in extracted.units.iter().zip(&extracted.raw_trees) {
-                    let shapes = inline::Shapes::for_lang(unit.lang, config);
-                    let body = crate::lang::child_field(tree, "body");
-                    let mut calls = Vec::new();
-                    if let Some(b) = body {
-                        inline::collect_call_sites(b, shapes, &mut calls, kw_arg);
+    for wave in files.chunks(wave_files) {
+        let outcomes: Vec<(std::path::PathBuf, FileOutcome)> = wave
+            .par_iter()
+            .map(|(path, lang)| {
+                let outcome = match source.read(path) {
+                    None => FileOutcome::Unreadable,
+                    Some(src) if walk::is_generated(&src, config) => FileOutcome::SkippedGenerated,
+                    Some(src) => {
+                        // D8/D19 version-keyed per-file cache: a hit is
+                        // byte-identical to a cold extraction by contract.
+                        let key = cache::key(&baseline::relative_file(path, root), &src, config);
+                        let cache_root = config.cache.shared_root.as_deref().unwrap_or(root);
+                        let cached = config
+                            .cache
+                            .enabled
+                            .then(|| cache::load(cache_root, key, path, &label_interner))
+                            .flatten();
+                        let digest = xxhash_rust::xxh3::xxh3_128(src.as_bytes());
+                        let line_count = src.lines().count();
+                        match cached {
+                            Some(extracted) => {
+                                FileOutcome::Units(extracted, digest, line_count, true, key, *lang)
+                            }
+                            None => {
+                                let extracted = unit::extract_file_units_keep_raw(
+                                    path,
+                                    &src,
+                                    *lang,
+                                    config,
+                                    &label_interner,
+                                );
+                                if config.cache.enabled {
+                                    cache::store(cache_root, key, &extracted, &label_interner);
+                                }
+                                FileOutcome::Units(extracted, digest, line_count, false, key, *lang)
+                            }
+                        }
                     }
-                    call_sites.push(inline::UnitCallSites {
-                        body_child_count: body.map(|b| b.children.len() as u32),
-                        body_tokens: body.map_or(0, |b| b.token_count()),
-                        calls,
-                        params: shapes.params(tree),
-                    });
-                    unit_file_idx.push(file_idx);
-                }
-                raw_tree_files.push(rawmemo::RawFileKey {
-                    file: path.clone(),
-                    lang,
-                    cache_key,
-                    unit_start,
-                    unit_count: extracted.units.len() as u32,
-                });
+                };
+                (path.clone(), outcome)
+            })
+            .collect();
 
-                units.append(&mut extracted.units);
-                repeats.append(&mut extracted.repeats);
-                source_digests.insert(path, digest);
-                // `extracted.raw_trees` drops here — its only durable trace is
-                // `call_sites` above and, on disk, the D19 cache blob the memo
-                // rehydrates from later.
+        for (path, outcome) in outcomes {
+            match outcome {
+                FileOutcome::Units(
+                    mut extracted,
+                    digest,
+                    line_count,
+                    cache_hit,
+                    cache_key,
+                    lang,
+                ) => {
+                    stats.files_scanned += 1;
+                    stats.suppressed_units += extracted.suppressed;
+                    stats.total_lines += line_count;
+                    if cache_hit {
+                        stats.cache_hits += 1;
+                    } else {
+                        stats.cache_misses += 1;
+                    }
+
+                    let file_idx = raw_tree_files.len() as u32;
+                    let unit_start = units.len() as u32;
+                    for (unit, tree) in extracted.units.iter().zip(&extracted.raw_trees) {
+                        let shapes = inline::Shapes::for_lang(unit.lang, config);
+                        let body = crate::lang::child_field(tree, "body");
+                        let mut calls = Vec::new();
+                        if let Some(b) = body {
+                            inline::collect_call_sites(b, shapes, &mut calls, kw_arg);
+                        }
+                        call_sites.push(inline::UnitCallSites {
+                            body_child_count: body.map(|b| b.children.len() as u32),
+                            body_tokens: body.map_or(0, |b| b.token_count()),
+                            calls,
+                            params: shapes.params(tree),
+                        });
+                        unit_file_idx.push(file_idx);
+                    }
+                    raw_tree_files.push(rawmemo::RawFileKey {
+                        file: path.clone(),
+                        lang,
+                        cache_key,
+                        unit_start,
+                        unit_count: extracted.units.len() as u32,
+                    });
+
+                    units.append(&mut extracted.units);
+                    repeats.append(&mut extracted.repeats);
+                    source_digests.insert(path, digest);
+                    // `extracted.raw_trees` drops here — its only durable trace is
+                    // `call_sites` above and, on disk, the D19 cache blob the memo
+                    // rehydrates from later.
+                }
+                FileOutcome::SkippedGenerated => stats.files_skipped_generated += 1,
+                FileOutcome::Unreadable => stats.files_unreadable += 1,
             }
-            FileOutcome::SkippedGenerated => stats.files_skipped_generated += 1,
-            FileOutcome::Unreadable => stats.files_unreadable += 1,
         }
     }
     stats.units_indexed = units.len();

@@ -40,6 +40,16 @@ pub struct MemoryCfg {
     /// onto tmpfs still occupies RAM (defeating the point of spilling) and
     /// can exhaust a small tmpfs outright (ENOSPC) on large scans.
     pub pack_dir: Option<std::path::PathBuf>,
+    /// Extraction wave size, in files (streaming-extraction plan, session
+    /// `woozy-uncut-comic`, Step 1): `corpus_units_from` processes `files` in
+    /// contiguous, in-order chunks of this size rather than one whole-corpus
+    /// `par_iter().collect()`, bounding how many files' parse trees are
+    /// simultaneously resident in the extraction transient. Output-neutral —
+    /// a memory/perf knob only; waves are drained in file order, so no
+    /// downstream ordering or content changes. `0` means "one wave" (today's
+    /// behavior before this knob existed), also useful as the byte-identity
+    /// control.
+    pub extract_wave_files: usize,
 }
 
 impl Default for MemoryCfg {
@@ -49,6 +59,7 @@ impl Default for MemoryCfg {
             budget_bytes: None,
             force_gate: "auto".into(),
             pack_dir: None,
+            extract_wave_files: 2048,
         }
     }
 }
