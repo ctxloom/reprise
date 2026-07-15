@@ -282,7 +282,12 @@ fn effective_ram(host: u64, cgroup: Option<u64>) -> u64 {
 /// The force override: `REPRISE_MEMORY_FORCE_GATE` env var (harness knob),
 /// then `memory.force_gate` config. `Some(true)` = spill, `Some(false)` =
 /// resident, `None` = decide on the estimate.
-fn force_override(cfg: &Config) -> Option<bool> {
+///
+/// `pub(crate)`: Step 2b's per-wave `ScanSpill` (`src/lib.rs`) reads this
+/// once, up front, so its pressure flip can honor `force_gate = always` /
+/// `never` exactly like `decide` does below, instead of re-parsing the same
+/// env var / config key a second way.
+pub(crate) fn force_override(cfg: &Config) -> Option<bool> {
     let parse = |v: &str| match v {
         "always" => Some(true),
         "never" => Some(false),

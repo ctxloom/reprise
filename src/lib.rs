@@ -128,9 +128,44 @@ pub fn corpus_units(root: &Path, config: &Config) -> anyhow::Result<CorpusUnits>
 /// Unit identity is source-independent: paths are `source.root()`-relative and
 /// the D19 cache key is content-addressed, so a file whose staged bytes equal its
 /// on-disk bytes is a cache HIT across the two sources rather than a re-extraction.
+///
+/// Step 2b (session `woozy-uncut-comic`, `streaming-extraction.plan.md`,
+/// INVARIANT 0): a thin wrapper over [`extract_corpus`] with `sink: None` —
+/// it NEVER spills, trees come back resident, always, byte-identical to
+/// before this step. `scan()`'s budget-responsive spilling lives entirely in
+/// the `scan`-private `corpus_units_streaming`, which calls `extract_corpus`
+/// with `sink: Some(&mut ScanSpill)` instead.
 pub fn corpus_units_from(
     source: &dyn source::ContentSource,
     config: &Config,
+) -> anyhow::Result<CorpusUnits> {
+    extract_corpus(source, config, None)
+}
+
+/// The wave-loop + drain + post-loop gate/digest work shared by the
+/// resident-out public path (`sink: None`, [`corpus_units_from`]) and the
+/// `scan`-private streaming path (`sink: Some(&mut ScanSpill)`,
+/// [`corpus_units_streaming`]) — Step 2b (session `woozy-uncut-comic`,
+/// `streaming-extraction.plan.md`).
+///
+/// `sink: None` reproduces yesterday's `corpus_units_from` byte-for-byte: no
+/// spill ever happens during the wave loop, and the post-loop over-gate
+/// digest pass (unchanged) computes every digest at once, from resident
+/// trees, exactly as before this step. `sink: Some` streams instead: after
+/// each wave's drain, [`ScanSpill::after_wave`] runs the plan's Concrete
+/// Some-path algorithm — spill (and digest) this wave's units if spilling has
+/// already engaged, or check whether it should engage now (retroactively
+/// spilling every unit accumulated so far, on the flip) — so resident tree
+/// mass tracks the budget instead of the corpus. Either way `gate.over` ends
+/// up meaning the same thing downstream ("spill mode"): the `None` path takes
+/// it straight from `memory::decide`; the `Some` path overrides it with
+/// whether spilling ever engaged (E4/E5, pre-resolved) — the gate's P2
+/// contract ("changes performance, never output") is what makes that
+/// override byte-identity-safe.
+fn extract_corpus(
+    source: &dyn source::ContentSource,
+    config: &Config,
+    mut sink: Option<&mut ScanSpill>,
 ) -> anyhow::Result<CorpusUnits> {
     let root = source.root();
     let files = source.files(config)?;
@@ -201,7 +236,15 @@ pub fn corpus_units_from(
     let mut call_sites: Vec<inline::UnitCallSites> = Vec::new();
     let mut raw_tree_files: Vec<rawmemo::RawFileKey> = Vec::new();
     let mut unit_file_idx: Vec<u32> = Vec::new();
+    // Step 2b: index-aligned with `units`, populated two different ways
+    // depending on `sink`. `sink: None` leaves this empty through the whole
+    // loop and fills it (or not) in ONE post-loop pass, exactly as before
+    // this step. `sink: Some` fills it INCREMENTALLY, per wave, inside the
+    // loop below (see `ScanSpill::after_wave`), and the post-loop code then
+    // leaves it untouched.
+    let mut digests: Vec<digest::UnitDigest> = Vec::new();
     for wave in files.chunks(wave_files) {
+        let wave_start = units.len();
         let outcomes: Vec<(std::path::PathBuf, FileOutcome)> = wave
             .par_iter()
             .map(|(path, lang)| {
@@ -299,6 +342,20 @@ pub fn corpus_units_from(
                 FileOutcome::Unreadable => stats.files_unreadable += 1,
             }
         }
+
+        // Step 2b: the pressure flip, checked AFTER this wave's drain (per
+        // the plan: wave size bounds the flip granularity — one wave cannot
+        // overshoot a sane budget between checks). `sink: None` (the public
+        // path) never reaches this — INVARIANT 0.
+        if let Some(spill) = sink.as_mut() {
+            spill.after_wave(
+                wave_start,
+                &mut units,
+                &mut digests,
+                config,
+                &label_interner,
+            )?;
+        }
     }
     stats.units_indexed = units.len();
     stats.parse_degraded_units = units.iter().filter(|u| u.parse_degraded).count();
@@ -320,28 +377,38 @@ pub fn corpus_units_from(
     // parallel pass computes every plain unit's digest while the trees are
     // still resident (variants get theirs at the `finish_variant` tail), and
     // `scan()` spills the trees to the scan-scoped pack. ----
-    let gate = memory::decide(&units, config);
+    let mut gate = memory::decide(&units, config);
     // The extraction boundary: every tree exists, nothing has spilled yet, and the
     // gate is deciding from a MODEL of the very residency now sitting in RAM. Read
     // it. The reading changes no decision — it makes the model auditable on every
     // run instead of only under an external harness.
     stats.memory_gate_rss_bytes = memory::current_rss_bytes().unwrap_or(0);
-    let digests: Vec<digest::UnitDigest> = if gate.over {
-        units
-            .par_iter()
-            .map(|u| {
-                digest::compute(
-                    u.tree.expect_resident(),
-                    u.lang,
-                    config,
-                    u.variant.is_none(),
-                    &label_interner,
-                )
-            })
-            .collect()
+    if let Some(spill) = sink.as_mut() {
+        // Step 2b, E4/E5 (pre-resolved): the `Some` path's gate means "did
+        // spilling ever engage" — pressure-driven, not the estimate `decide`
+        // computed above. `budget_bytes`/`estimated_bytes` still come from
+        // `decide` (the reported model, unchanged); only `over` differs.
+        // `digests` was already built incrementally in the wave loop above
+        // (empty iff spilling never engaged) — nothing left to do here.
+        gate.over = spill.spilling;
     } else {
-        Vec::new()
-    };
+        digests = if gate.over {
+            units
+                .par_iter()
+                .map(|u| {
+                    digest::compute(
+                        u.tree.expect_resident(),
+                        u.lang,
+                        config,
+                        u.variant.is_none(),
+                        &label_interner,
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+    }
 
     // END of extraction — AFTER the digests. The gate-decision reading above is
     // taken before they exist, and they cost GiB: reading extraction's peak there
@@ -400,68 +467,163 @@ impl Drop for PackDirCleanup {
     }
 }
 
-/// The bundle [`corpus_units_streaming`] returns: the resident-out
-/// [`CorpusUnits`] (untouched — see that fn's doc) plus the scan-scoped pack
-/// lifetime `scan_source` used to build inline, now built here instead.
-struct StreamingExtraction {
-    corpus: CorpusUnits,
+/// Step 2b's per-wave spill controller (session `woozy-uncut-comic`,
+/// `streaming-extraction.plan.md`) — owned by [`corpus_units_streaming`],
+/// threaded through [`extract_corpus`] as `sink: Some(&mut ScanSpill)`.
+/// `scan`-private: `extract_corpus`'s `sink: None` path (`corpus_units_from`)
+/// never constructs one — INVARIANT 0.
+///
+/// The pack is LAZY: `packs` starts `None` and is built on the FIRST spill
+/// ([`Self::create_pack_lazily`]), not up front — `auto` on a corpus that
+/// never trips must pay nothing for a pack it never uses. `spilling` starts
+/// `false` and is pinned there forever under `force_gate = never`; under
+/// `force_gate = always` the very first [`Self::after_wave`] call engages it
+/// (the plan's "spill from wave 0"); under `auto` it flips the first time
+/// `current_rss_bytes()` clears `TRIP_FRACTION * budget_bytes` after a wave's
+/// drain.
+struct ScanSpill {
+    root: std::path::PathBuf,
+    pack_dir_override: Option<std::path::PathBuf>,
+    /// `resolve_budget(&config.memory)` — pure config/RAM, independent of
+    /// unit counts, so it is available (and identical to what the post-loop
+    /// `memory::decide` will separately compute) at every per-wave check.
+    budget_bytes: u64,
+    /// `REPRISE_MEMORY_FORCE_GATE` / `[memory] force_gate`, parsed once.
+    force: Option<bool>,
     packs: Option<ScanPacks>,
-    /// Fed straight into `scan_source`'s own `PackDirCleanup` — unchanged,
-    /// still `scan_source`'s job: the cleanup guard stays where it always
-    /// was so the rest of `scan_source` (inline variant spilling, near-tier,
-    /// sequence tier) keeps the SAME "drop on every exit" coverage it has
-    /// today.
     pack_dir_owned: Option<std::path::PathBuf>,
-    /// Plain units spilled in the pass below (spill moment 1, P3) —
-    /// `scan_source` seeds its own `spilled_trees` counter with this and
-    /// keeps adding variants (spill moment 2) exactly as today.
+    spilling: bool,
     spilled_trees: usize,
 }
 
-/// Streaming (wave-based) extraction, Step 2a (session `woozy-uncut-comic`,
-/// `streaming-extraction.plan.md`) — CORRECTED per INVARIANT 0: the original
-/// "relocate the pack + spill into `corpus_units_from`" was wrong, because
-/// `corpus_units_from` is `pub` and two committed tests
-/// (`tests/memory_gate.rs:218`, `tests/digest_oracle.rs:101-121`) plus one
-/// production consumer (`reprise-mcp::find_similar_json`, which calls
-/// `corpus_units` against the REAL gate with no pack wired in) all depend on
-/// it returning RESIDENT trees, always. So this wrapper is `scan`-private
-/// instead: it calls the UNTOUCHED public `corpus_units_from` first — same
-/// resident-out contract, same byte-for-byte extraction — then, over the
-/// gate only, creates the scan-scoped pack and runs the SAME post-extraction
-/// spill pass `scan_source` used to inline (verbatim: same order, same
-/// per-unit body), before returning. `scan_source` calls this instead of
-/// inlining pack creation + the spill pass itself; only the OWNING function
-/// changed, not the code or its order — byte-identical output by
-/// construction. `corpus_units_from`'s public contract, and every non-`scan`
-/// caller of it, are unaffected — this function does not exist on that path.
-fn corpus_units_streaming(
-    source: &dyn source::ContentSource,
-    config: &Config,
-) -> anyhow::Result<StreamingExtraction> {
-    let root = source.root();
-    let mut corpus = corpus_units_from(source, config)?;
+impl ScanSpill {
+    fn new(source: &dyn source::ContentSource, config: &Config) -> Self {
+        ScanSpill {
+            root: source.root().to_path_buf(),
+            pack_dir_override: config.memory.pack_dir.clone(),
+            budget_bytes: memory::resolve_budget(&config.memory),
+            force: memory::force_override(config),
+            packs: None,
+            pack_dir_owned: None,
+            spilling: false,
+            spilled_trees: 0,
+        }
+    }
 
-    // ---- Gate 2 (memory architecture P2) was already decided inside
-    // `corpus_units_from`, at the extraction phase boundary. Under the gate
-    // nothing below runs (trees stay resident, zero new work). Over it,
-    // trees and sequence streams spill to the scan-scoped content-addressed
-    // pack (P3); near-tier verify materializes pairs through the pack LRU
-    // and the sequence tier bulk-loads per language partition. Either way
-    // the OUTPUT is byte-identical — the gate changes performance, never
-    // output. ----
-    let mut pack_dir_owned: Option<std::path::PathBuf> = None;
-    let packs = if corpus.gate.over {
+    /// The plan's Concrete Some-path algorithm, run once per wave, strictly
+    /// after that wave's drain. `wave_start` is `units.len()` as it stood
+    /// BEFORE this wave's drain ran — `units[wave_start..]` is exactly this
+    /// wave's newly-appended units.
+    fn after_wave(
+        &mut self,
+        wave_start: usize,
+        units: &mut [Unit],
+        digests: &mut Vec<digest::UnitDigest>,
+        config: &Config,
+        li: &std::sync::Arc<crate::intern::LabelInterner>,
+    ) -> anyhow::Result<()> {
+        if self.spilling {
+            // Already engaged: stream just this wave.
+            self.spill_range(wave_start, units.len(), units, digests, config, li)
+        } else if self.should_engage() {
+            // The flip: lazily create the pack, then RETROACTIVELY spill
+            // every unit accumulated so far (0..end, not wave_start..end —
+            // this wave's units included) while it is still resident.
+            self.create_pack_lazily(li)?;
+            self.spill_range(0, units.len(), units, digests, config, li)?;
+            self.spilling = true;
+            Ok(())
+        } else {
+            // Stay resident, no digests — today's under-gate path.
+            Ok(())
+        }
+    }
+
+    /// `force = always` engages unconditionally (from the very first
+    /// `after_wave` call — "spill from wave 0"); `force = never` never
+    /// engages, full stop, regardless of measured pressure; `auto` (`force =
+    /// None`) is the reactive guard `src/store.rs` describes: spill once RSS
+    /// clears the same `TRIP_FRACTION` hysteresis point the estimate-based
+    /// gate uses (`memory::trips`, reused rather than re-implemented).
+    fn should_engage(&self) -> bool {
+        match self.force {
+            Some(forced) => forced,
+            None => memory::current_rss_bytes()
+                .map(|rss| memory::trips(rss, self.budget_bytes))
+                .unwrap_or(false),
+        }
+    }
+
+    /// Spill — and, for each unit, compute-then-spill its digest —
+    /// `units[start..end]`. The one mechanism both branches of `after_wave`
+    /// use, over a plain contiguous unit range (incremental:
+    /// `wave_start..end`; retroactive: `0..end`). Mirrors Step 2a's
+    /// post-extraction spill pass verbatim, per unit, just interleaved with
+    /// `digest::compute` instead of running after a separate whole-corpus
+    /// digest pass — `digest::compute` is pure, so the values are identical
+    /// either way.
+    fn spill_range(
+        &mut self,
+        start: usize,
+        end: usize,
+        units: &mut [Unit],
+        digests: &mut Vec<digest::UnitDigest>,
+        config: &Config,
+        li: &std::sync::Arc<crate::intern::LabelInterner>,
+    ) -> anyhow::Result<()> {
+        let packs = self
+            .packs
+            .as_ref()
+            .expect("spill_range called before the pack exists — wiring bug");
+        for u in &mut units[start..end] {
+            let mut d = digest::compute(
+                u.tree.expect_resident(),
+                u.lang,
+                config,
+                u.variant.is_none(),
+                li,
+            );
+            if let unit::TreeSlot::Resident(t) = &u.tree {
+                let key = packs
+                    .trees
+                    .store(t)
+                    .map_err(|e| anyhow::anyhow!("spilling a plain unit's tree: {e}"))?;
+                u.tree = unit::TreeSlot::Spilled(key);
+            }
+            if let digest::SeqSlot::Resident(s) = &d.seq_tokens {
+                let key = packs
+                    .seqs
+                    .store(s)
+                    .map_err(|e| anyhow::anyhow!("spilling a plain unit's token stream: {e}"))?;
+                d.seq_tokens = digest::SeqSlot::Spilled(key);
+            }
+            digests.push(d);
+            self.spilled_trees += 1;
+        }
+        Ok(())
+    }
+
+    /// Created on the FIRST spill only (the flip, or wave 0 under
+    /// `force_gate = always`) — verbatim the pack-creation code Step 2a ran
+    /// unconditionally over the gate, just moved behind a guard so `auto` on
+    /// a scan that never trips builds no pack at all.
+    fn create_pack_lazily(
+        &mut self,
+        li: &std::sync::Arc<crate::intern::LabelInterner>,
+    ) -> anyhow::Result<()> {
+        if self.packs.is_some() {
+            return Ok(());
+        }
         // The pack's backing directory (the tmpfs-ENOSPC fix): scan-root-
         // relative by default, `[memory] pack_dir` override outranks it, an
         // unwritable root falls back to the process temp dir with a named
         // warning (never silence — a pack MUST have somewhere to write).
-        let resolved = pack::resolve_pack_dir(root, config.memory.pack_dir.as_deref());
+        let resolved = pack::resolve_pack_dir(&self.root, self.pack_dir_override.as_deref());
         if let Some(warning) = &resolved.warning {
             eprintln!("warning: {warning}");
         }
         if resolved.owned {
-            pack_dir_owned = Some(resolved.dir.clone());
+            self.pack_dir_owned = Some(resolved.dir.clone());
         }
         let pack_dir = resolved.dir;
         // Tree LRU: a budget-derived slice, floored so verify pairs fit
@@ -469,10 +631,10 @@ fn corpus_units_streaming(
         // partition, handles owned by the loop) so it gets a token bound.
         // The tree decoder re-interns labels through THIS scan's interner
         // (post-interning, `NormNode` deserializes only via the wire path).
-        let tree_lru_bytes = memory::tree_lru_bytes(corpus.gate.budget_bytes);
-        let li_encode = std::sync::Arc::clone(&corpus.label_interner);
-        let li_decode = std::sync::Arc::clone(&corpus.label_interner);
-        Some(ScanPacks {
+        let tree_lru_bytes = memory::tree_lru_bytes(self.budget_bytes);
+        let li_encode = std::sync::Arc::clone(li);
+        let li_decode = std::sync::Arc::clone(li);
+        self.packs = Some(ScanPacks {
             trees: pack::Pack::with_codec(
                 tree_lru_bytes,
                 16,
@@ -493,54 +655,58 @@ fn corpus_units_streaming(
             seqs: pack::Pack::new(1 << 20, 4, &pack_dir).map_err(|e| {
                 anyhow::anyhow!("creating scan seq pack under {}: {e}", pack_dir.display())
             })?,
-        })
-    } else {
-        None
-    };
-    // Guards ONLY the spill loop below — mirrors exactly the protection
-    // window `scan_source`'s own `_pack_dir_cleanup` gave this same loop
-    // today (constructed right before it, so a spill failure or panic here
-    // cleans the directory up). Defused on success (`.take()` below) so the
-    // directory survives to be handed back to `scan_source`, which re-wraps
-    // it in its own `PackDirCleanup` for the rest of the scan — same net
-    // coverage as today, just split across the wrapper boundary. Pack
-    // CREATION above stays exactly as unprotected as it is today (a
-    // pre-existing gap — `pack_dir_owned` is set before `Pack::with_codec`/
-    // `Pack::new` run but no guard exists yet to catch their `?` — unrelated
-    // to this move, not this step's job to close).
-    let mut spill_cleanup = PackDirCleanup(pack_dir_owned.clone());
-    let mut spilled_trees = 0usize;
-    if let Some(p) = &packs {
-        // Spill moment 1 (P3): one sequential pass over the already-
-        // materialized plain units. (Variants spill at creation, in
-        // `scan_source`'s inline block.) A store failure (e.g. the pack's
-        // volume fills) aborts the scan cleanly through `?` — never a
-        // panic, never a poisoned mutex (see `pack::PackStoreError`).
-        for (u, d) in corpus.units.iter_mut().zip(corpus.digests.iter_mut()) {
-            if let unit::TreeSlot::Resident(t) = &u.tree {
-                let key = p
-                    .trees
-                    .store(t)
-                    .map_err(|e| anyhow::anyhow!("spilling a plain unit's tree: {e}"))?;
-                u.tree = unit::TreeSlot::Spilled(key);
-                spilled_trees += 1;
-            }
-            if let digest::SeqSlot::Resident(s) = &d.seq_tokens {
-                let key = p
-                    .seqs
-                    .store(s)
-                    .map_err(|e| anyhow::anyhow!("spilling a plain unit's token stream: {e}"))?;
-                d.seq_tokens = digest::SeqSlot::Spilled(key);
-            }
-        }
+        });
+        Ok(())
     }
-    spill_cleanup.0.take();
+}
 
+/// The bundle [`corpus_units_streaming`] returns: the resident-out
+/// [`CorpusUnits`] (untouched — see that fn's doc) plus the scan-scoped pack
+/// lifetime `scan_source` used to build inline, now built here instead.
+struct StreamingExtraction {
+    corpus: CorpusUnits,
+    packs: Option<ScanPacks>,
+    /// Fed straight into `scan_source`'s own `PackDirCleanup` — unchanged,
+    /// still `scan_source`'s job: the cleanup guard stays where it always
+    /// was so the rest of `scan_source` (inline variant spilling, near-tier,
+    /// sequence tier) keeps the SAME "drop on every exit" coverage it has
+    /// today.
+    pack_dir_owned: Option<std::path::PathBuf>,
+    /// Plain units spilled DURING extraction (Step 2b: per-wave, via
+    /// [`ScanSpill`] — spill moment 1, P3) — `scan_source` seeds its own
+    /// `spilled_trees` counter with this and keeps adding variants (spill
+    /// moment 2) exactly as today.
+    spilled_trees: usize,
+}
+
+/// Streaming (wave-based) extraction, Step 2b (session `woozy-uncut-comic`,
+/// `streaming-extraction.plan.md`) — the budget-responsive fix. `scan`-private
+/// per INVARIANT 0: `corpus_units_from` must return resident trees, always
+/// (`tests/memory_gate.rs:218`, `tests/digest_oracle.rs:101-121`,
+/// `reprise-mcp::find_similar_json`'s unforced-gate call with no pack wired
+/// in) — so THIS is where `scan()`'s spilling lives, built on top of the
+/// untouched public `extract_corpus(.., sink: None)` path.
+///
+/// Builds a fresh [`ScanSpill`] (pack lazy, `spilling` false) and runs
+/// [`extract_corpus`] with `sink: Some(&mut spill)`: the per-wave pressure
+/// flip (or `force_gate`) decides WHEN trees spill, but the trees and
+/// sequence streams that end up spilled, and the digests computed for them,
+/// are byte-identical to what the old post-extraction pass produced — same
+/// `digest::compute` call, same pack, same content-addressing; only the
+/// TIMING moved earlier, per-wave, DURING extraction instead of after it
+/// (the actual fix: resident tree mass no longer scales with the whole
+/// corpus).
+fn corpus_units_streaming(
+    source: &dyn source::ContentSource,
+    config: &Config,
+) -> anyhow::Result<StreamingExtraction> {
+    let mut spill = ScanSpill::new(source, config);
+    let corpus = extract_corpus(source, config, Some(&mut spill))?;
     Ok(StreamingExtraction {
         corpus,
-        packs,
-        pack_dir_owned,
-        spilled_trees,
+        packs: spill.packs,
+        pack_dir_owned: spill.pack_dir_owned,
+        spilled_trees: spill.spilled_trees,
     })
 }
 
