@@ -557,8 +557,8 @@ pub struct Expansion {
     /// or a real walk that resolved and inlined nothing). The raw-tree clone
     /// this requires is expensive (M3c: ~55% of units inline zero calls and
     /// produce no variant, so `lib.rs` discards `tree` unread whenever
-    /// `calls_inlined == 0` — see `any_resolvable_call`, which proves that case
-    /// cheaply, read-only, before paying for the clone).
+    /// `calls_inlined == 0` — see `any_resolvable_call_projected`, which proves
+    /// that case cheaply, over the projection, before paying for the memo fetch).
     pub tree: Option<NormNode>,
     /// Callee names expanded (deduped, expansion order) — the inline chain.
     pub chain: Vec<String>,
@@ -703,13 +703,12 @@ pub fn expand_unit(
     // M3c: `raw.clone()` used to run unconditionally here, even though ~55% of
     // units inline zero calls and produce no variant (`lib.rs` discards `tree`
     // whenever `calls_inlined == 0` — the exact anti-pattern `DefTable::Def.body`
-    // was already fixed for, above). WP-D: the precheck is now projection-based
+    // was already fixed for, above). WP-D: the precheck is projection-based
     // (`any_resolvable_call_projected`) — it decides this over
-    // `call_sites[unit_idx].calls` without touching a single tree node at all
-    // (previously a read-only tree descent, `any_resolvable_call`, still kept
-    // below as the differential-test oracle): if it proves no call resolves,
-    // the real `walk` below is guaranteed to splice nothing, so both the
-    // precheck AND the memo fetch it guards are skipped outright.
+    // `call_sites[unit_idx].calls` without touching a single tree node at all:
+    // if it proves no call resolves, the real `walk` below is guaranteed to
+    // splice nothing, so both the precheck AND the memo fetch it guards are
+    // skipped outright.
     if !any_resolvable_call_projected(unit_idx, call_sites, &mut ctx) {
         // Mirrors `resolve_given`'s policy, so a budget of 0 refuses every call
         // here and no call ever "resolves" — the unit would exit through this
@@ -746,18 +745,23 @@ pub fn expand_unit(
     }
 }
 
-/// Projection-based precheck (WP-D): decides the SAME boolean as
-/// `any_resolvable_call` (below, kept as this function's differential-test
-/// oracle — see `inline_pushdown_precheck_matches_tree_walk` in the test
-/// module) purely over `call_sites[unit_idx].calls`, touching zero raw-tree
-/// bytes. Shares `resolve_given` with `resolve_policy` (the real walk's
-/// per-call decision), so the two can never independently drift on the
-/// POLICY itself — only (if at all) on whether `collect_call_sites`'s
-/// traversal reach matches `any_resolvable_call`'s, which is exactly what the
-/// differential test checks. Same early-exit-leaves-a-harmless-partial-
-/// `ambiguous_sites` argument as `any_resolvable_call` applies here too: the
-/// real `walk`, run only when this returns `true`, independently re-derives
-/// the complete set from its own full traversal.
+/// Projection-based precheck (WP-D, raw-trees elimination): decides whether
+/// `call_sites[unit_idx]` contains at least one call `resolve_given` would
+/// accept — i.e. whether the real `walk` could possibly splice anything —
+/// purely over the projection, touching zero raw-tree bytes. Shares
+/// `resolve_given` with `resolve_policy` (the real walk's per-call decision),
+/// so the two can never independently drift on the POLICY itself. Proven
+/// equivalent to a from-scratch tree walk (the pre-WP-D `any_resolvable_call`,
+/// since deleted) by `inline_pushdown_precheck_matches_tree_walk_*`
+/// (differential tests, now removed alongside their oracle — see WP-D's
+/// landing notes) and by full-corpus byte-identity on fs/net against the
+/// pre-WP-D baseline commit.
+///
+/// Same early-exit-leaves-a-harmless-partial-`ambiguous_sites` shape the old
+/// tree-walking oracle had: on the first call that resolves, this returns
+/// `true` without checking the rest, leaving `ctx.ambiguous_sites` partial;
+/// the real `walk`, run only when this returns `true`, independently
+/// re-derives the complete set from its own full traversal.
 fn any_resolvable_call_projected(
     unit_idx: usize,
     call_sites: &[UnitCallSites],
@@ -767,28 +771,6 @@ fn any_resolvable_call_projected(
         .calls
         .iter()
         .any(|&(ref name, arity, span)| resolve_given(name, arity, span, ctx).is_some())
-}
-
-/// Read-only descent proving whether `node`'s subtree contains at least one call
-/// `resolve_policy` would accept — i.e. whether the real `walk` below could
-/// possibly splice anything. Visits every node (same reach as `walk`, mirrors
-/// `collect_call_sites`'s traversal), so when no call resolves the search exhausts the
-/// whole tree and `ctx.ambiguous_sites` comes out complete — the zero-clone path
-/// above reports `ambiguity_skips` straight from it. When a call DOES resolve, the
-/// search returns early without visiting the rest; the caller then commits to the
-/// clone + real `walk`, which independently re-derives the full `ambiguous_sites`
-/// (and every other `ctx` field) from its own complete traversal, so the partial
-/// set left behind by an early exit is a harmless subset (`HashSet` insertion is
-/// idempotent) — no reset needed between the two.
-///
-/// WP-D: no longer called by production (`expand_unit` now calls
-/// `any_resolvable_call_projected`) — kept ONLY as the differential-test
-/// oracle until `inline_expansion_resident_vs_memo_is_byte_identical` (step 4)
-/// has run green, per the plan's own discipline (don't delete the oracle
-/// before the test that needs it exists). Deleted in step 7.
-#[cfg_attr(not(test), allow(dead_code))]
-fn any_resolvable_call(node: &NormNode, ctx: &mut Ctx) -> bool {
-    resolve_policy(node, ctx).is_some() || node.children.iter().any(|c| any_resolvable_call(c, ctx))
 }
 
 fn walk(mut node: NormNode, ctx: &mut Ctx) -> NormNode {
@@ -979,10 +961,8 @@ fn de_return_node(node: &mut NormNode) {
 /// state — no `NormNode` in sight. This is the escalation-#1 sufficiency
 /// argument made real: `resolve_policy` (below) and the projection-based
 /// `any_resolvable_call_projected` both call THIS, so the decision itself
-/// cannot drift between the tree-walking and projection-based paths — only
-/// (if at all) the reach of the calls fed into it could, which is exactly
-/// what `collect_call_sites` vs `any_resolvable_call`'s traversal proves
-/// equal (differential test). Counts ambiguity skips; enforces the
+/// cannot drift between the splice-time and precheck-time paths. Counts
+/// ambiguity skips; enforces the
 /// self-recursion and cycle guards, the aggregate expansion budget, depth,
 /// and the callee size cap — the last two relaxed for an SCC partner only
 /// within `max_scc_depth` (see the bypass site below).
@@ -1157,232 +1137,6 @@ fn substitute(
         .collect();
     node
 }
-
-#[cfg(test)]
-mod wp_d_precheck_tests {
-    //! WP-D (raw-trees elimination) step 3's mandatory, red-first differential
-    //! test: `any_resolvable_call_projected` must decide EXACTLY what
-    //! `any_resolvable_call` (the tree-walking oracle) decides — same bool,
-    //! same `ambiguous_sites` — for every unit, or the memo (which relies on
-    //! the precheck needing no raw tree) is unsound (escalation #1).
-
-    use super::*;
-    use crate::config::Config;
-    use crate::source::{ContentSource, FsSource};
-
-    /// Builds the SAME `Ctx` `expand_unit` would for `unit_idx`, so the test
-    /// exercises the precheck under realistic state (SCC partners, root name,
-    /// budget) rather than a stubbed one — the exact scalar state
-    /// `resolve_given` reads besides the call's own `(name, arity, span)`.
-    fn fresh_ctx<'a>(
-        unit_idx: usize,
-        units: &'a [Unit],
-        table: &'a DefTable,
-        cfg: &'a Config,
-        li: &LabelInterner,
-        memo: &'a RawTreeMemo<'a>,
-    ) -> Ctx<'a> {
-        let lang = units[unit_idx].lang;
-        let shapes = Shapes::for_lang(lang, cfg);
-        let scc_partners: HashSet<usize> = match table.def_of_unit.get(&unit_idx) {
-            Some(&d) if table.scc_sizes[table.scc_of[d]] >= 2 => (0..table.defs.len())
-                .filter(|&e| e != d && table.scc_of[e] == table.scc_of[d])
-                .collect(),
-            _ => HashSet::new(),
-        };
-        Ctx {
-            table,
-            memo,
-            cfg,
-            shapes,
-            lang,
-            file: &units[unit_idx].file,
-            unit_idx,
-            root_name: units[unit_idx].name.as_str().into(),
-            scc_partners,
-            has_expr_block: shapes.make_expr_block((0, 0), Vec::new()).is_some(),
-            stack: Vec::new(),
-            chain: Vec::new(),
-            expanded_units: Vec::new(),
-            scc_hit: false,
-            calls_inlined: 0,
-            ambiguous_sites: HashSet::new(),
-            scc_splices: 0,
-            spliced_nodes: 0,
-            over_budget: false,
-            kw_arg_sym: li.intern("keyword_argument"),
-        }
-    }
-
-    /// Builds the SAME memo `scan_source` would (unbounded — this test is
-    /// about the PRECHECK's correctness, not the memo's eviction behavior;
-    /// that's `inline_expansion_resident_vs_memo_is_byte_identical`, step 4's
-    /// other mandatory test).
-    fn build_memo<'a>(
-        corpus: &'a crate::CorpusUnits,
-        source: &'a dyn ContentSource,
-        cfg: &'a Config,
-    ) -> RawTreeMemo<'a> {
-        RawTreeMemo::new(
-            &corpus.raw_tree_files,
-            &corpus.unit_file_idx,
-            source,
-            &corpus.source_digests,
-            source.root().to_path_buf(),
-            cfg,
-            std::sync::Arc::clone(&corpus.label_interner),
-            None,
-        )
-    }
-
-    fn assert_precheck_matches_oracle(
-        units: &[Unit],
-        memo: &RawTreeMemo,
-        call_sites: &[UnitCallSites],
-        table: &DefTable,
-        cfg: &Config,
-        li: &LabelInterner,
-        label: &str,
-    ) {
-        for i in 0..units.len() {
-            let raw = memo.unit(i);
-            let mut ctx_a = fresh_ctx(i, units, table, cfg, li, memo);
-            let oracle = any_resolvable_call(&raw, &mut ctx_a);
-
-            let mut ctx_b = fresh_ctx(i, units, table, cfg, li, memo);
-            let projected = any_resolvable_call_projected(i, call_sites, &mut ctx_b);
-
-            assert_eq!(
-                oracle, projected,
-                "{label}: unit {i} ({}) — bool diverged: oracle={oracle} projected={projected}",
-                units[i].name
-            );
-            assert_eq!(
-                ctx_a.ambiguous_sites, ctx_b.ambiguous_sites,
-                "{label}: unit {i} ({}) — ambiguous_sites diverged",
-                units[i].name
-            );
-            // over_budget is set by resolve_given identically on both paths —
-            // part of the same "no divergence anywhere in the decision" claim.
-            assert_eq!(
-                ctx_a.over_budget, ctx_b.over_budget,
-                "{label}: unit {i} ({}) — over_budget diverged",
-                units[i].name
-            );
-        }
-    }
-
-    #[test]
-    fn inline_pushdown_precheck_matches_tree_walk_wild_corpus() {
-        let mut cfg = Config::default();
-        cfg.cache.enabled = false; // don't litter fixture dirs with .reprise/
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("benches/wild");
-        let corpus = crate::corpus_units(&root, &cfg).expect("wild corpus scans");
-        assert!(!corpus.units.is_empty());
-        let table = DefTable::build(
-            &corpus.units,
-            &corpus.call_sites,
-            &cfg,
-            &corpus.label_interner,
-        );
-        let source = FsSource::new(&root);
-        let memo = build_memo(&corpus, &source, &cfg);
-        assert_precheck_matches_oracle(
-            &corpus.units,
-            &memo,
-            &corpus.call_sites,
-            &table,
-            &cfg,
-            &corpus.label_interner,
-            "benches/wild",
-        );
-    }
-
-    /// A tighter budget/depth than the wild corpus is likely to trip on its
-    /// own — exercises `resolve_given`'s budget/depth/SCC-bypass branches,
-    /// which the default-config wild-corpus pass may not reach at all.
-    #[test]
-    fn inline_pushdown_precheck_matches_tree_walk_tight_budget() {
-        let mut cfg = Config::default();
-        cfg.cache.enabled = false;
-        cfg.inline.max_expansion_nodes = 5;
-        cfg.inline.max_depth = 1;
-        cfg.inline.max_callee_tokens = 20;
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("benches/wild");
-        let corpus = crate::corpus_units(&root, &cfg).expect("wild corpus scans");
-        let table = DefTable::build(
-            &corpus.units,
-            &corpus.call_sites,
-            &cfg,
-            &corpus.label_interner,
-        );
-        let source = FsSource::new(&root);
-        let memo = build_memo(&corpus, &source, &cfg);
-        assert_precheck_matches_oracle(
-            &corpus.units,
-            &memo,
-            &corpus.call_sites,
-            &table,
-            &cfg,
-            &corpus.label_interner,
-            "benches/wild (tight budget)",
-        );
-    }
-
-    /// Method calls, keyword-arg calls, and nested calls — the exact shapes
-    /// `Shapes::call_parts` filters, which is where `collect_call_sites`'s
-    /// reach could plausibly diverge from `any_resolvable_call`'s tree walk
-    /// if the filter were ever re-spelled instead of shared.
-    #[test]
-    fn inline_pushdown_precheck_matches_tree_walk_synthetic_fixture() {
-        let mut cfg = Config::default();
-        cfg.cache.enabled = false;
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(
-            dir.path().join("fixture.py"),
-            r#"
-def helper(a, b):
-    return a + b
-
-def obj_method_call(x):
-    return x.method(1, 2)
-
-def kwarg_call(x):
-    return helper(a=x, b=1)
-
-def nested(x):
-    return helper(helper(x, 1), 2)
-
-def ambiguous_target(a):
-    return a
-
-def ambiguous_target(a, b):
-    return a + b
-"#,
-        )
-        .unwrap();
-        let corpus = crate::corpus_units(dir.path(), &cfg).expect("fixture scans");
-        cfg.inline.max_candidates = 0; // force every same-arity multi-def name ambiguous
-        let table = DefTable::build(
-            &corpus.units,
-            &corpus.call_sites,
-            &cfg,
-            &corpus.label_interner,
-        );
-        let source = FsSource::new(dir.path());
-        let memo = build_memo(&corpus, &source, &cfg);
-        assert_precheck_matches_oracle(
-            &corpus.units,
-            &memo,
-            &corpus.call_sites,
-            &table,
-            &cfg,
-            &corpus.label_interner,
-            "synthetic fixture",
-        );
-    }
-}
-
 #[cfg(test)]
 mod wp_d_memo_tests {
     //! WP-D step 4's mandatory differential test. By this step there is no
