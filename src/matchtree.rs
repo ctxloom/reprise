@@ -99,7 +99,7 @@ pub struct RepData<'d> {
     /// the per-candidate HashMap probes dominated 500k-LOC scans). Offsets feed
     /// the Shazam offset-delta diagonal; depths feed the H-tree-verify depth-delta
     /// criterion (§0.5) — both derived from the one shared-subtree evidence pass.
-    offsets: std::borrow::Cow<'d, [SubtreeOffsetsEntry]>,
+    offsets: std::borrow::Cow<'d, SubtreeOffsets>,
 }
 
 impl<'d> RepData<'d> {
@@ -110,7 +110,7 @@ impl<'d> RepData<'d> {
     /// Hash → (pre-order offsets, tree depths) inventory, sorted by hash, the two
     /// parallel per hash. The verify substrate; also the source a retriever derives
     /// rare peaks / an ordered subtree stream from.
-    pub fn offsets(&self) -> &[(u128, Vec<u32>, Vec<u16>)] {
+    pub fn offsets(&self) -> &SubtreeOffsets {
         &self.offsets
     }
 }
@@ -201,12 +201,65 @@ pub fn build_reps<'d>(
     }
 }
 
-/// One shared-subtree entry: (hash, pre-order offsets, tree depths).
-pub type SubtreeOffsetsEntry = (u128, Vec<u32>, Vec<u16>);
+/// Subtree hash → (pre-order offsets, tree depths) inventory, sorted by hash — the
+/// verify-substrate half of a rep (see [`RepData::offsets`]). CSR (compressed sparse
+/// row) layout: one entry per DISTINCT hash in `hashes`, its occurrences' offsets and
+/// depths living in the concatenated `offs`/`depths` arrays at
+/// `offs[row_starts[i]..row_starts[i+1]]` / `depths[row_starts[i]..row_starts[i+1]]`.
+/// Chosen because 88-89% of hashes are singletons (measured, `digest-bounding.md`):
+/// the old `Vec<(u128, Vec<u32>, Vec<u16>)>` paid a 64-byte tuple + two heap Vec
+/// allocations for as little as 6 bytes of payload per entry; this layout pays ~20
+/// bytes (16 B hash + 4 B row-start) per entry and four heap allocations per UNIT
+/// (not per entry).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SubtreeOffsets {
+    /// Distinct hashes, strictly ascending, deduplicated — one per row. Same content
+    /// and order as the old Vec's first tuple element, walked in order.
+    hashes: Vec<u128>,
+    /// CSR row boundaries: `len() == hashes.len() + 1`, `row_starts[0] == 0`,
+    /// strictly increasing (every hash has >= 1 occurrence by construction — a hash
+    /// is only ever pushed into `hashes` when its first occurrence is seen),
+    /// `row_starts[hashes.len()] == offs.len() == depths.len()`.
+    row_starts: Vec<u32>,
+    /// Occurrence offsets, concatenated in `hashes` order; within one hash's run,
+    /// ascending (preserves the old per-entry `Vec<u32>`'s sortedness invariant,
+    /// pinned by `tests/digest_oracle.rs`'s `offs.is_sorted()` assertion).
+    offs: Vec<u32>,
+    /// Occurrence depths, index-paired 1:1 with `offs` (`depths[k]` is the tree
+    /// depth of the subtree at `offs[k]`) — same pairing the old inner
+    /// `(Vec<u32>, Vec<u16>)` pair carried per entry.
+    depths: Vec<u16>,
+}
 
-/// Subtree hash → (pre-order offsets, tree depths) inventory, sorted by hash —
-/// the verify-substrate half of a rep (see [`RepData::offsets`]).
-pub type SubtreeOffsets = Vec<SubtreeOffsetsEntry>;
+impl SubtreeOffsets {
+    /// Number of distinct hashes (rows) — same meaning as the old `Vec::len()`.
+    pub fn len(&self) -> usize {
+        self.hashes.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.hashes.is_empty()
+    }
+    /// The hash at row `i` (0-indexed, ascending order).
+    pub fn hash(&self, i: usize) -> u128 {
+        self.hashes[i]
+    }
+    /// This row's offsets and depths, index-paired — same shape as the old
+    /// per-entry `(&[u32], &[u16])`.
+    pub fn row(&self, i: usize) -> (&[u32], &[u16]) {
+        let s = self.row_starts[i] as usize;
+        let e = self.row_starts[i + 1] as usize;
+        (&self.offs[s..e], &self.depths[s..e])
+    }
+    /// Iterates rows as `(hash, offsets, depths)` — a drop-in replacement for the old
+    /// `.iter()` over `&(u128, Vec<u32>, Vec<u16>)`, except `hash` is now returned by
+    /// value (`u128: Copy`) instead of by reference.
+    pub fn iter(&self) -> impl Iterator<Item = (u128, &[u32], &[u16])> + '_ {
+        (0..self.hashes.len()).map(move |i| {
+            let (offs, depths) = self.row(i);
+            (self.hashes[i], offs, depths)
+        })
+    }
+}
 
 /// One unit's near-tier verify substrate — the [`RepData::offsets`] this pair carries —
 /// from its canonical tree. Lifted verbatim out of [`build_reps`] so the fused digest
@@ -228,22 +281,27 @@ pub fn rep_substrate(
         .map(|s| (s.hash, s.offset, depth_by_offset[s.offset as usize]))
         .collect();
     flat.sort_unstable();
-    let mut offsets: Vec<(u128, Vec<u32>, Vec<u16>)> = Vec::new();
+    let mut hashes: Vec<u128> = Vec::new();
+    let mut row_starts: Vec<u32> = Vec::new();
+    let mut offs: Vec<u32> = Vec::with_capacity(flat.len());
+    let mut depths: Vec<u16> = Vec::with_capacity(flat.len());
     for (h, o, d) in flat {
-        match offsets.last_mut() {
-            Some((last, offs, deps)) if *last == h => {
-                offs.push(o);
-                deps.push(d);
-            }
-            _ => offsets.push((h, vec![o], vec![d])),
+        if hashes.last() != Some(&h) {
+            hashes.push(h);
+            row_starts.push(offs.len() as u32);
         }
+        offs.push(o);
+        depths.push(d);
     }
-    offsets.shrink_to_fit();
-    for (_, offs, deps) in &mut offsets {
-        offs.shrink_to_fit();
-        deps.shrink_to_fit();
+    row_starts.push(offs.len() as u32);
+    hashes.shrink_to_fit();
+    row_starts.shrink_to_fit();
+    SubtreeOffsets {
+        hashes,
+        row_starts,
+        offs,
+        depths,
     }
-    offsets
 }
 
 /// Floor-`bag_min_subtree_tokens` deduplicated subtree-hash set, sorted ascending —
@@ -594,7 +652,7 @@ impl Retriever for Landmark {
                 let mut peaks: Vec<(u32, u128)> = rep
                     .offsets
                     .iter()
-                    .flat_map(|(h, offs, _)| offs.iter().map(move |o| (*o, *h)))
+                    .flat_map(|(h, offs, _)| offs.iter().map(move |o| (*o, h)))
                     .collect();
                 peaks.sort_unstable();
                 admitted_peaks.fetch_add(peaks.len(), std::sync::atomic::Ordering::Relaxed);
@@ -967,15 +1025,17 @@ fn shared_subtree_evidence<'a>(a: &'a RepData, b: &'a RepData) -> Vec<SharedSubt
     let mut ev = Vec::new();
     let (mut i, mut j) = (0usize, 0usize);
     while i < a.offsets.len() && j < b.offsets.len() {
-        match a.offsets[i].0.cmp(&b.offsets[j].0) {
+        match a.offsets.hash(i).cmp(&b.offsets.hash(j)) {
             std::cmp::Ordering::Less => i += 1,
             std::cmp::Ordering::Greater => j += 1,
             std::cmp::Ordering::Equal => {
+                let (offs_a, depths_a) = a.offsets.row(i);
+                let (offs_b, depths_b) = b.offsets.row(j);
                 ev.push(SharedSubtree {
-                    offs_a: &a.offsets[i].1,
-                    offs_b: &b.offsets[j].1,
-                    depths_a: &a.offsets[i].2,
-                    depths_b: &b.offsets[j].2,
+                    offs_a,
+                    offs_b,
+                    depths_a,
+                    depths_b,
                 });
                 i += 1;
                 j += 1;

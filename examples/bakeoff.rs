@@ -152,7 +152,7 @@ fn rare_peaks(rep: &RepData, df: &HashMap<u128, u32>, rare_cap: u32) -> Vec<(u32
         .offsets()
         .iter()
         .filter(|(h, _, _)| df.get(h).copied().unwrap_or(0) <= rare_cap)
-        .flat_map(|(h, offs, _)| offs.iter().map(move |o| (*o, *h)))
+        .flat_map(|(h, offs, _)| offs.iter().map(move |o| (*o, h)))
         .collect();
     peaks.sort_unstable();
     peaks
@@ -212,7 +212,7 @@ fn stream(rep: &RepData) -> Vec<u64> {
     let mut by_off: Vec<(u32, u128)> = rep
         .offsets()
         .iter()
-        .flat_map(|(h, offs, _)| offs.iter().map(move |o| (*o, *h)))
+        .flat_map(|(h, offs, _)| offs.iter().map(move |o| (*o, h)))
         .collect();
     by_off.sort_unstable();
     by_off.iter().map(|(_, h)| fold128(*h)).collect()
@@ -423,13 +423,15 @@ fn offset_histogram_passes(a: &RepData, b: &RepData, cfg: &Config) -> bool {
         if best >= needed {
             return true;
         }
-        match oa[i].0.cmp(&ob[j].0) {
+        match oa.hash(i).cmp(&ob.hash(j)) {
             std::cmp::Ordering::Less => i += 1,
             std::cmp::Ordering::Greater => j += 1,
             std::cmp::Ordering::Equal => {
+                let (offs_a, _) = oa.row(i);
+                let (offs_b, _) = ob.row(j);
                 hash_bins.clear();
-                for &va in oa[i].1.iter().take(4) {
-                    for &vb in ob[j].1.iter().take(4) {
+                for &va in offs_a.iter().take(4) {
+                    for &vb in offs_b.iter().take(4) {
                         let bin = (i64::from(va) - i64::from(vb)) / 4;
                         if !hash_bins.contains(&bin) {
                             hash_bins.push(bin);

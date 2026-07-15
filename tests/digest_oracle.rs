@@ -53,12 +53,12 @@ fn assert_digest_matches_tree(
     let mut got_flat: Vec<(u128, u32)> = d
         .offsets
         .iter()
-        .flat_map(|(h, offs, _)| offs.iter().map(move |o| (*h, *o)))
+        .flat_map(|(h, offs, _)| offs.iter().map(move |o| (h, *o)))
         .collect();
     got_flat.sort_unstable();
     assert_eq!(got_flat, inv_flat, "offsets inventory drift on {name}");
     let depths = depth_oracle(tree);
-    for (h, offs, deps) in &d.offsets {
+    for (h, offs, deps) in d.offsets.iter() {
         assert_eq!(offs.len(), deps.len(), "ragged offsets/depths on {name}");
         assert!(
             offs.is_sorted(),
