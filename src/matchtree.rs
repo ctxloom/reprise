@@ -738,6 +738,15 @@ const DF_CAP: usize = 50;
 /// therefore the identical `counts`. Verified byte-identical (SARIF `cmp` +
 /// stats-stripped JSON) on `self`, `fs`, and `linux/drivers/net`, and pinned by
 /// `partitioned_join_matches_monolithic_sort`.
+///
+/// The events/coalesce above are also scoped to **one partition at a time**, not
+/// accumulated across the whole corpus: a pair's shared hashes are themselves
+/// uniformly scattered across partitions (same reason a single hash's owner-run
+/// lands in one partition — the key is a pure function of the hash), so each
+/// partition's locally-coalesced counts are folded into a running total via
+/// `merge_counts`, which SUMS counts on a matching pair key rather than
+/// concatenating. See `shared_hash_split_across_partitions_sums_not_duplicates` for
+/// the pinned counter-example.
 fn shared_count_pairs(
     landmarks: &[Vec<u128>],
     owner_pair_window: usize,
@@ -774,6 +783,10 @@ fn shared_count_pairs_partitioned(
     let mut events: Vec<(u32, u32)> = Vec::new();
     let mut cursors: Vec<usize> = vec![0; n];
     let mut buf: Vec<(u128, u32)> = Vec::new();
+    // Running global total, folded in one hash-partition at a time. Sorted ascending
+    // by pair key throughout (an invariant `merge_counts` preserves), matching the
+    // order the old single global sort produced.
+    let mut counts: Vec<((usize, usize), usize)> = Vec::new();
 
     for p in 0..parts {
         // End of each unit's slice for this partition. The list is sorted and the key
@@ -804,6 +817,9 @@ fn shared_count_pairs_partitioned(
         cursors = ends;
         buf.par_sort_unstable();
 
+        // Scoped to THIS partition only — was never cleared before; that is the
+        // corpus-wide row this restructure removes.
+        events.clear();
         let mut run_start = 0usize;
         for k in 0..=buf.len() {
             if k < buf.len() && buf[k].0 == buf[run_start].0 {
@@ -839,22 +855,67 @@ fn shared_count_pairs_partitioned(
                 }
             }
         }
+
+        // Coalesce THIS partition's events locally (sound: every event pushed above
+        // was generated from a hash whose owner-run lives entirely inside this one
+        // partition pass — matchtree.rs's own argument for `buf`). Then FOLD into the
+        // running global total — a merge-by-key SUM, not a concatenation: the same
+        // pair (i, j) can share landmark hashes that land in *different* hash
+        // partitions (hashes are uniform xxh3_128 digests, so this is the common
+        // case at parts > 1, not an edge case), so a pair's total count is the sum of
+        // however many partitions contributed a nonzero partial.
+        events.par_sort_unstable();
+        let mut partial: Vec<((usize, usize), usize)> = Vec::new();
+        for &pair in events.iter() {
+            match partial.last_mut() {
+                Some((last, c)) if *last == (pair.0 as usize, pair.1 as usize) => *c += 1,
+                _ => partial.push(((pair.0 as usize, pair.1 as usize), 1)),
+            }
+        }
+        counts = merge_counts(counts, partial);
     }
     drop(buf);
     drop(cursors);
+    drop(events);
 
-    events.par_sort_unstable();
-    let mut counts: Vec<((usize, usize), usize)> = Vec::new();
-    for pair in events {
-        match counts.last_mut() {
-            Some((last, n)) if *last == (pair.0 as usize, pair.1 as usize) => *n += 1,
-            _ => counts.push(((pair.0 as usize, pair.1 as usize), 1)),
-        }
-    }
     // Push-grown to a doubling capacity; it is returned and held resident as the
     // landmark index, so trim the slack before it outlives this function.
     counts.shrink_to_fit();
     counts
+}
+
+/// Merge two pair-count lists, both sorted ascending by pair key, summing the count
+/// on a matching key. NOT a concatenation: see `shared_count_pairs_partitioned` for
+/// why the same pair can appear in more than one hash-partition's local coalesce.
+/// Preserves ascending order, matching the order the old single global sort produced
+/// (`(usize, usize)` tuple order is the same order `(u32, u32)` lexicographic sort
+/// produces after the `as usize` cast — casting is order-preserving).
+fn merge_counts(
+    a: Vec<((usize, usize), usize)>,
+    b: Vec<((usize, usize), usize)>,
+) -> Vec<((usize, usize), usize)> {
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    let (mut ai, mut bi) = (0usize, 0usize);
+    while ai < a.len() && bi < b.len() {
+        match a[ai].0.cmp(&b[bi].0) {
+            std::cmp::Ordering::Less => {
+                out.push(a[ai]);
+                ai += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                out.push(b[bi]);
+                bi += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                out.push((a[ai].0, a[ai].1 + b[bi].1));
+                ai += 1;
+                bi += 1;
+            }
+        }
+    }
+    out.extend_from_slice(&a[ai..]);
+    out.extend_from_slice(&b[bi..]);
+    out
 }
 
 /// O(1) pre-AU gate: divergence ≤ `max_divergence` is impossible when token
@@ -1373,5 +1434,34 @@ mod tests {
             seen.iter().all(|&b| b),
             "fixture does not reach every partition — the sweep would be vacuous"
         );
+    }
+
+    #[test]
+    fn shared_hash_split_across_partitions_sums_not_duplicates() {
+        // The WP-B crux, pinned directly: two units sharing hashes that land in
+        // DIFFERENT hash-partitions must produce ONE summed count tuple, not two.
+        // Construct two 128-bit hashes whose top bits differ so a small `parts`
+        // already routes them to different partitions (parts=4 ⇒ top 2 bits key).
+        let h1: u128 = 0x0000_0000_0000_0000_0000_0000_0000_0001; // top bits 00
+        let h2: u128 = 0x8000_0000_0000_0000_0000_0000_0000_0002; // top bits 10
+        // Unit 0 and unit 1 share BOTH hashes; unit 2 is unrelated noise so the
+        // fixture isn't trivially degenerate.
+        let lms = vec![
+            vec![h1, h2], // unit 0
+            vec![h1, h2], // unit 1
+            vec![h1],     // unit 2 (shares only h1)
+        ];
+        let parts = 4usize;
+        let got = shared_count_pairs_partitioned(&lms, 0, parts);
+        // Expect exactly ONE tuple for (0, 1), with count 2 (both shared hashes),
+        // and exactly one tuple for (0, 2) / (1, 2) with count 1 each — NOT two
+        // separate (0,1) tuples with count 1 apiece.
+        let pair01: Vec<_> = got.iter().filter(|(k, _)| *k == (0, 1)).collect();
+        assert_eq!(
+            pair01.len(),
+            1,
+            "pair (0,1) must coalesce to ONE tuple across partitions, got {pair01:?}"
+        );
+        assert_eq!(pair01[0].1, 2, "counts from different partitions must SUM");
     }
 }
