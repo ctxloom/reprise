@@ -2,9 +2,12 @@
 //! rivalry winner), offset-histogram verification, then anti-unification.
 //!
 //! Retrieval is the landmark retriever ALONE: **one candidate set, never a union.**
-//! `bag_set` is NOT a retrieval layer — it is a persisted `UnitDigest` field consumed
-//! by the retrieval bake-off's comparison retrievers (`examples/bakeoff.rs`), not by
-//! [`Landmark`] itself. Every offset-sorted subtree peak is admitted into the landmark
+//! `bag_set` is NOT a retrieval layer — it is a standalone bench-only helper
+//! (`matchtree::bag_set`) computed by the retrieval bake-off's comparison retrievers
+//! (`examples/bakeoff.rs`), not read by [`Landmark`] itself, and no longer part of
+//! `UnitDigest` (dead weight in production — 211 MB / 1.7% at drivers scale, zero
+//! production readers — eliminated; see `digest-bounding.md`, task `pink-list`).
+//! Every offset-sorted subtree peak is admitted into the landmark
 //! constellation; there is no document-frequency gate on peaks (D51 — the historical
 //! rarity gate never bound in practice and is deleted, not tuned).
 //!
@@ -90,7 +93,6 @@ pub struct RetrievalStats {
 /// pointer copy, not a walk.
 pub struct RepData<'d> {
     unit_idx: usize,
-    bag_set: std::borrow::Cow<'d, [u128]>,
     /// Subtree hash → (pre-order offsets, tree depths), the two parallel per
     /// hash and in ascending-offset order, sorted by hash: the verify cascade
     /// intersects two of these by a single linear merge, no hashing (M3b/D22 —
@@ -104,13 +106,6 @@ impl<'d> RepData<'d> {
     /// Index into the `units` slice this rep was built from.
     pub fn unit_idx(&self) -> usize {
         self.unit_idx
-    }
-    /// Floor-`bag_min_subtree_tokens` deduplicated subtree-hash set, sorted ascending.
-    /// Not consumed by [`Landmark`] (which reads `offsets` directly); available to any
-    /// `Retriever` building its own index, and to the bake-off's comparison retrievers.
-    /// Not itself a retrieval layer.
-    pub fn bag_set(&self) -> &[u128] {
-        &self.bag_set
     }
     /// Hash → (pre-order offsets, tree depths) inventory, sorted by hash, the two
     /// parallel per hash. The verify substrate; also the source a retriever derives
@@ -190,17 +185,15 @@ pub fn build_reps<'d>(
             .into_iter()
             .map(|idx| RepData {
                 unit_idx: idx,
-                bag_set: std::borrow::Cow::Borrowed(&digests[idx].bag_set),
                 offsets: std::borrow::Cow::Borrowed(&digests[idx].offsets),
             })
             .collect(),
         None => eligible
             .par_iter()
             .map(|&idx| {
-                let (bag_set, offsets) = rep_substrate(units[idx].tree.expect_resident(), cfg, li);
+                let offsets = rep_substrate(units[idx].tree.expect_resident(), li);
                 RepData {
                     unit_idx: idx,
-                    bag_set: std::borrow::Cow::Owned(bag_set),
                     offsets: std::borrow::Cow::Owned(offsets),
                 }
             })
@@ -215,18 +208,15 @@ pub type SubtreeOffsetsEntry = (u128, Vec<u32>, Vec<u16>);
 /// the verify-substrate half of a rep (see [`RepData::offsets`]).
 pub type SubtreeOffsets = Vec<SubtreeOffsetsEntry>;
 
-/// One unit's retrieval substrate — the (bag_set, offsets) pair [`RepData`] carries —
+/// One unit's near-tier verify substrate — the [`RepData::offsets`] this pair carries —
 /// from its canonical tree. Lifted verbatim out of [`build_reps`] so the fused digest
 /// pass ([`crate::digest`]) and `build_reps` share the ONE implementation (the digest
 /// invariant: existing functions, never a reimplementation).
 pub fn rep_substrate(
     tree: &crate::tree::NormNode,
-    cfg: &Config,
     li: &crate::intern::LabelInterner,
-) -> (Vec<u128>, SubtreeOffsets) {
-    // Histogram offsets use a finer inventory (floor 3) than `bag_set`
-    // (small units would otherwise starve the vote count); `bag_set`
-    // itself keeps the §9 floor.
+) -> SubtreeOffsets {
+    // Floor 3 (small units would otherwise starve the histogram vote count).
     let inv: Vec<Subtree> = fingerprint::subtree_inventory(tree, 3, HashMode::MaskedLocals, li);
     // Pre-order depth per node offset (same numbering as `walk_inventory`:
     // node before children), so each subtree's root depth is `depths[offset]`.
@@ -248,6 +238,21 @@ pub fn rep_substrate(
             _ => offsets.push((h, vec![o], vec![d])),
         }
     }
+    offsets
+}
+
+/// Floor-`bag_min_subtree_tokens` deduplicated subtree-hash set, sorted ascending —
+/// dev-only substrate for the retrieval bake-off's comparison retrievers
+/// (`examples/bakeoff.rs`: `minhash-lsh`, `sourcerer-rare`). The production landmark
+/// retriever never reads this (it reads [`RepData::offsets`] directly). Lifted out of
+/// [`rep_substrate`] when `bag_set` was dropped from `UnitDigest` — it was computed for
+/// every unit but had zero production readers (`digest-bounding.md`, task `pink-list`).
+pub fn bag_set(
+    tree: &crate::tree::NormNode,
+    cfg: &Config,
+    li: &crate::intern::LabelInterner,
+) -> Vec<u128> {
+    let inv: Vec<Subtree> = fingerprint::subtree_inventory(tree, 3, HashMode::MaskedLocals, li);
     let mut bag_set: Vec<u128> = inv
         .iter()
         .filter(|s| s.tokens >= cfg.thresholds.bag_min_subtree_tokens)
@@ -255,7 +260,7 @@ pub fn rep_substrate(
         .collect();
     bag_set.sort_unstable();
     bag_set.dedup();
-    (bag_set, offsets)
+    bag_set
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -296,8 +301,9 @@ fn near_groups_for_lang(
     // ONE candidate set. There is no second layer to union with: the retriever's output IS
     // the candidate set.
     //
-    // `bag_set` is NOT a candidate layer: it is a persisted `UnitDigest` field, consumed
-    // only by the retrieval bake-off's comparison retrievers, not by [`Landmark`].
+    // `bag_set` is NOT a candidate layer: it is a standalone bench-only helper
+    // (`matchtree::bag_set`), used only by the retrieval bake-off's comparison
+    // retrievers, not by [`Landmark`], and no longer part of `UnitDigest`.
     let mut candidates: BTreeSet<(usize, usize)> = BTreeSet::new();
     if cfg.retrieval.landmark_pairs {
         let retriever = select_retriever(&cfg.retrieval.retriever);

@@ -332,8 +332,9 @@ pub struct Thresholds {
     pub min_unit_tokens_ir: u32,
     pub min_seq_tokens: u32,
     /// Token floor for a subtree to enter `bag_set`. NOT a retrieval threshold: `bag_set`
-    /// is not itself a candidate layer — it is a persisted `UnitDigest` field consumed by
-    /// the retrieval bake-off's comparison retrievers (`examples/bakeoff.rs`).
+    /// is not itself a candidate layer — it is a standalone bench-only helper
+    /// (`matchtree::bag_set`) consumed by the retrieval bake-off's comparison retrievers
+    /// (`examples/bakeoff.rs`), not part of `UnitDigest`.
     pub bag_min_subtree_tokens: u32,
     /// **Not a retrieval threshold, and not read by the core at all.**
     ///

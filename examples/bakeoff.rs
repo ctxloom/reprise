@@ -13,7 +13,9 @@
 //! Retrievers (all `matchtree::Retriever` over the shared `RepData` substrate):
 //!   1. reprise-landmark  — incumbent: the real `matchtree::Landmark` (rare-peak
 //!      constellation triples), invoked through the production trait.
-//!   2. minhash-lsh       — bag-Jaccard over `RepData::bag_set`, MinHash sig + LSH banding.
+//!   2. minhash-lsh       — bag-Jaccard over the bake-off's own per-unit bag_set table
+//!      (`build_bag_sets`, since `bag_set` left `UnitDigest`/`RepData` — pink-list),
+//!      MinHash sig + LSH banding.
 //!   3. winnowing         — MOSS-style k-gram winnowing over the floor-3 ordered subtree
 //!      stream derived from `RepData::offsets`.
 //!   4. sourcerer-rare    — inverted rare-feature overlap (landmark's rare peaks WITHOUT the
@@ -92,6 +94,23 @@ fn build_digests(units: &[Unit], cfg: &Config, li: &LabelInterner) -> Vec<UnitDi
         .collect()
 }
 
+/// Corpus-wide, unit-idx-indexed bag_set table — the bake-off's OWN substrate for the two
+/// comparison retrievers that still need it (`minhash-lsh`, `sourcerer-rare`). `bag_set`
+/// was dropped from `UnitDigest`/`RepData` (pink-list: computed for every unit, zero
+/// production readers, 211 MB / 1.7% dead weight at drivers scale); the production
+/// landmark retriever never needed it, but these two bench-only retrievers do, so the
+/// bench computes its own copy here — once per corpus, via the extracted
+/// `matchtree::bag_set` helper, same math as before, just no longer riding in the digest
+/// every unit paid for. Trees are resident for the bake-off's whole run (`build_digests`
+/// above already relies on that via `expect_resident()`), so this is safe to compute
+/// once, up front, indexed exactly like `units`/`digests`.
+fn build_bag_sets(units: &[Unit], cfg: &Config, li: &LabelInterner) -> Vec<Vec<u128>> {
+    units
+        .iter()
+        .map(|u| matchtree::bag_set(u.tree.expect_resident(), cfg, li))
+        .collect()
+}
+
 // ============================ bench-side alternative retrievers ============================
 //
 // Each implements the SAME `matchtree::Retriever` trait the production landmark retriever
@@ -139,11 +158,13 @@ fn rare_peaks(rep: &RepData, df: &HashMap<u128, u32>, rare_cap: u32) -> Vec<(u32
     peaks
 }
 
-/// Corpus df over the floor-6 bag_set + the incumbent rare_cap.
-fn corpus_df(reps: &[RepData]) -> (HashMap<u128, u32>, u32) {
+/// Corpus df over the floor-6 bag_set + the incumbent rare_cap. `bag_sets` is the
+/// whole-corpus, unit-idx-indexed table `build_bag_sets` computes once (see its doc —
+/// `bag_set` left `RepData`/`UnitDigest` in the pink-list cleanup).
+fn corpus_df(reps: &[RepData], bag_sets: &[Vec<u128>]) -> (HashMap<u128, u32>, u32) {
     let mut df: HashMap<u128, u32> = HashMap::new();
     for rep in reps {
-        for &h in rep.bag_set() {
+        for &h in &bag_sets[rep.unit_idx()] {
             *df.entry(h).or_insert(0) += 1;
         }
     }
@@ -152,15 +173,16 @@ fn corpus_df(reps: &[RepData]) -> (HashMap<u128, u32>, u32) {
 
 // ---- sourcerer-rare (ablation: rare peaks, no triples) ----
 
-struct SourcererRare {
+struct SourcererRare<'b> {
     min_shared: usize,
+    bag_sets: &'b [Vec<u128>],
 }
-impl Retriever for SourcererRare {
+impl<'b> Retriever for SourcererRare<'b> {
     fn name(&self) -> &'static str {
         "sourcerer-rare"
     }
     fn candidates(&self, reps: &[RepData], _cfg: &Config, _stats: &mut RetrievalStats) -> RepPairs {
-        let (df, rare_cap) = corpus_df(reps);
+        let (df, rare_cap) = corpus_df(reps, self.bag_sets);
         let feats: Vec<Vec<u128>> = reps
             .par_iter()
             .map(|rep| {
@@ -294,11 +316,12 @@ fn minhash_sig(bag: &[u128], a: &[u64], b: &[u64]) -> Vec<u64> {
     sig
 }
 
-struct MinHashLsh {
+struct MinHashLsh<'b> {
     bands: usize,
     rows: usize,
+    bag_sets: &'b [Vec<u128>],
 }
-impl Retriever for MinHashLsh {
+impl<'b> Retriever for MinHashLsh<'b> {
     fn name(&self) -> &'static str {
         "minhash-lsh"
     }
@@ -307,7 +330,7 @@ impl Retriever for MinHashLsh {
         let (a, b) = minhash_params();
         let sigs: Vec<Vec<u64>> = reps
             .par_iter()
-            .map(|r| minhash_sig(r.bag_set(), &a, &b))
+            .map(|r| minhash_sig(&self.bag_sets[r.unit_idx()], &a, &b))
             .collect();
         let mut buckets: HashMap<u128, Vec<u32>> = HashMap::new();
         for (i, sig) in sigs.iter().enumerate() {
@@ -339,12 +362,16 @@ impl Retriever for MinHashLsh {
 
 // ============================ retriever registry (all real-trait) ============================
 
-fn retrievers() -> Vec<(&'static str, Box<dyn Retriever>)> {
+fn retrievers(bag_sets: &[Vec<u128>]) -> Vec<(&'static str, Box<dyn Retriever + '_>)> {
     vec![
         ("reprise-landmark", Box::new(matchtree::Landmark)),
         (
             "minhash-lsh",
-            Box::new(MinHashLsh { bands: 32, rows: 4 }), // thr ~ (1/32)^(1/4) ~ 0.42
+            Box::new(MinHashLsh {
+                bands: 32,
+                rows: 4,
+                bag_sets,
+            }), // thr ~ (1/32)^(1/4) ~ 0.42
         ),
         (
             "winnowing",
@@ -354,7 +381,13 @@ fn retrievers() -> Vec<(&'static str, Box<dyn Retriever>)> {
                 min_shared: 2,
             }),
         ),
-        ("sourcerer-rare", Box::new(SourcererRare { min_shared: 2 })),
+        (
+            "sourcerer-rare",
+            Box::new(SourcererRare {
+                min_shared: 2,
+                bag_sets,
+            }),
+        ),
     ]
 }
 
@@ -490,6 +523,7 @@ fn run_retriever(r: &dyn Retriever, lc: &LangCorpus<'_>, cfg: &Config) -> (PairS
 fn run_corpus<'d>(
     units: &[Unit],
     digests: &'d [UnitDigest],
+    bag_sets: &[Vec<u128>],
     cfg: &Config,
     li: &LabelInterner,
 ) -> CorpusRun<'d> {
@@ -503,7 +537,7 @@ fn run_corpus<'d>(
 
     let mut retr_pairs: HashMap<String, PairSet> = HashMap::new();
     let mut retr_cost: HashMap<String, Cost> = HashMap::new();
-    for (name, r) in retrievers() {
+    for (name, r) in retrievers(bag_sets) {
         let mut all = PairSet::new();
         let mut cost = Cost::default();
         for lc in &langs {
@@ -834,9 +868,13 @@ fn main() {
     }
     let n_units = units.len();
     let digests = build_digests(&units, &cfg, &label_interner);
-    let run = run_corpus(&units, &digests, &cfg, &label_interner);
+    let bag_sets = build_bag_sets(&units, &cfg, &label_interner);
+    let run = run_corpus(&units, &digests, &bag_sets, &cfg, &label_interner);
     let (accept, weak) = verify_union(&units, &run, &cfg, &label_interner);
-    let names: Vec<String> = retrievers().iter().map(|(n, _)| n.to_string()).collect();
+    let names: Vec<String> = retrievers(&bag_sets)
+        .iter()
+        .map(|(n, _)| n.to_string())
+        .collect();
 
     println!(
         "=== ORACLE A: verify-on-union (real Retriever trait)  (corpus: {} plain units, {:?}) ===",
@@ -931,7 +969,8 @@ fn main() {
     let syn_interner = reprise::intern::LabelInterner::new();
     let (syn_units, syn_pairs) = build_synthetic(&cfg, &syn_interner);
     let syn_digests = build_digests(&syn_units, &cfg, &syn_interner);
-    let syn_run = run_corpus(&syn_units, &syn_digests, &cfg, &syn_interner);
+    let syn_bag_sets = build_bag_sets(&syn_units, &cfg, &syn_interner);
+    let syn_run = run_corpus(&syn_units, &syn_digests, &syn_bag_sets, &cfg, &syn_interner);
     #[derive(Default)]
     struct BClass {
         near: Vec<(usize, usize)>,

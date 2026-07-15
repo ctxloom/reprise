@@ -34,7 +34,7 @@ fn depth_oracle(root: &NormNode) -> Vec<u16> {
 fn assert_digest_matches_tree(
     d: &UnitDigest,
     tree: &NormNode,
-    cfg: &Config,
+    _cfg: &Config,
     name: &str,
     li: &reprise::intern::LabelInterner,
 ) {
@@ -71,14 +71,6 @@ fn assert_digest_matches_tree(
             );
         }
     }
-    let mut bag: Vec<u128> = inv
-        .iter()
-        .filter(|s| s.tokens >= cfg.thresholds.bag_min_subtree_tokens)
-        .map(|s| s.hash)
-        .collect();
-    bag.sort_unstable();
-    bag.dedup();
-    assert_eq!(d.bag_set, bag, "bag_set drift on {name}");
 }
 
 #[test]

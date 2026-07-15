@@ -29,11 +29,6 @@ pub struct UnitDigest {
     /// and inline-exact tiers' ranking discount (they read `members[0]` only, but
     /// any unit — plain or variant — can be a bucket representative).
     pub boilerplate_mass: u32,
-    /// Floor-`bag_min_subtree_tokens` deduplicated subtree hashes, sorted ascending
-    /// (`RepData::bag_set`). Not a retrieval layer in its own right — consumed by the
-    /// retrieval bake-off's comparison retrievers (`examples/bakeoff.rs`), not by the
-    /// production landmark retriever.
-    pub bag_set: Vec<u128>,
     /// Near-tier verify substrate: subtree hash → (pre-order offsets, tree depths),
     /// sorted by hash (`RepData::offsets`).
     pub offsets: crate::matchtree::SubtreeOffsets,
@@ -84,10 +79,9 @@ pub fn compute(
     plain: bool,
     li: &crate::intern::LabelInterner,
 ) -> UnitDigest {
-    let (bag_set, offsets) = crate::matchtree::rep_substrate(tree, cfg, li);
+    let offsets = crate::matchtree::rep_substrate(tree, li);
     UnitDigest {
         boilerplate_mass: crate::ir::substance::boilerplate_mass(tree, li),
-        bag_set,
         offsets,
         seq_tokens: if plain {
             SeqSlot::Resident(crate::stream::unit_stream(tree, li))
