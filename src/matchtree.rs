@@ -24,6 +24,8 @@ use crate::report::Tier;
 use crate::unit::{Unit, base_of};
 use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::io::Write;
+use std::path::Path;
 
 pub struct NearGroup {
     /// Base-resolved member unit indices (a variant reports as its base).
@@ -123,6 +125,7 @@ struct VerifiedPair {
     chains: Vec<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn find_near_groups(
     units: &[Unit],
     digests: Option<&[crate::digest::UnitDigest]>,
@@ -131,6 +134,7 @@ pub fn find_near_groups(
     exact_pairs: &HashSet<(usize, usize)>,
     tree_pack: Option<&crate::pack::Pack<crate::tree::NormNode>>,
     li: &crate::intern::LabelInterner,
+    spill_dir: Option<&Path>,
 ) -> Vec<NearGroup> {
     let mut groups = Vec::new();
     let langs: HashSet<Lang> = units.iter().map(|u| u.lang).collect();
@@ -146,6 +150,7 @@ pub fn find_near_groups(
             exact_pairs,
             tree_pack,
             li,
+            spill_dir,
         ));
     }
     groups
@@ -336,6 +341,7 @@ fn near_groups_for_lang(
     exact_pairs: &HashSet<(usize, usize)>,
     tree_pack: Option<&crate::pack::Pack<crate::tree::NormNode>>,
     li: &crate::intern::LabelInterner,
+    spill_dir: Option<&Path>,
 ) -> Vec<NearGroup> {
     let ir = crate::unit::is_ir(lang, cfg);
     // The historical `LanguageProfile` is anti_unify's structural oracle ONLY on the historical
@@ -369,7 +375,7 @@ fn near_groups_for_lang(
     // retrievers, not by [`Landmark`], and no longer part of `UnitDigest`.
     let mut candidates: BTreeSet<(usize, usize)> = BTreeSet::new();
     if cfg.retrieval.landmark_pairs {
-        let retriever = select_retriever(&cfg.retrieval.retriever);
+        let retriever = select_retriever(&cfg.retrieval.retriever, spill_dir);
         candidates.extend(retriever.candidates(&reps, cfg, stats));
     }
     stats.candidates_total += candidates.len();
@@ -603,10 +609,10 @@ pub fn validate_retriever(name: &str) -> Result<(), String> {
 /// Resolve the `retrieval.retriever` selector to a retriever. Unknown values are
 /// rejected at config load ([`validate_retriever`]), so the fallback is unreachable
 /// in practice and exists only to keep the match total.
-fn select_retriever(name: &str) -> Box<dyn Retriever> {
+fn select_retriever<'a>(name: &str, spill_dir: Option<&'a Path>) -> Box<dyn Retriever + 'a> {
     match name {
-        "landmark" => Box::new(Landmark),
-        _ => Box::new(Landmark),
+        "landmark" => Box::new(Landmark { spill_dir }),
+        _ => Box::new(Landmark { spill_dir }),
     }
 }
 
@@ -624,9 +630,14 @@ fn select_retriever(name: &str) -> Box<dyn Retriever> {
 /// anchor mints is real. Flood control belongs at the candidate level below (the
 /// coverage-fraction gate), where pairwise evidence exists to weigh a match; a rarity
 /// gate acts on anchors, before any pair can be weighed.
-pub struct Landmark;
+pub struct Landmark<'a> {
+    /// Owner-partition spill directory for the join output (`None` ⇒ the in-memory
+    /// path, byte-identical to pre-spill). Set by the scan to the resolved pack dir;
+    /// small/under-gate scans and the bake-off pass `None`.
+    pub spill_dir: Option<&'a Path>,
+}
 
-impl Retriever for Landmark {
+impl Retriever for Landmark<'_> {
     fn name(&self) -> &'static str {
         "landmark"
     }
@@ -698,9 +709,14 @@ impl Retriever for Landmark {
         stats.landmark_index_size += landmarks.iter().map(Vec::len).sum::<usize>();
         stats.landmark_admitted_peaks += admitted_peaks.load(std::sync::atomic::Ordering::Relaxed);
         let mut out = Vec::new();
-        for ((i, j), shared) in shared_count_pairs(&landmarks, window) {
+        // The join streams `(pair, shared)` to this sink in ascending pair order
+        // (whether in-memory or owner-partition-spilled — I3), so `out`'s push order,
+        // the `stats` counter order, and every downstream byte are unchanged. The
+        // closure borrows `landmarks` immutably (coverage gate) and `stats`/`out`
+        // mutably; no other captures.
+        shared_count_pairs(&landmarks, window, self.spill_dir, |(i, j), shared| {
             if shared < shared_landmarks_min {
-                continue;
+                return;
             }
             // Coverage-fraction candidate gate (docs/substantiality-metric.md
             // §0.3): the shared constellation as a fraction of the smaller unit's
@@ -718,12 +734,12 @@ impl Retriever for Landmark {
                 let full_shared = intersect_count(&landmarks[i], &landmarks[j]);
                 if (full_shared as f64) / denom < coverage_min {
                     stats.candidates_landmark_coverage_gated += 1;
-                    continue;
+                    return;
                 }
             }
             stats.candidates_landmark += 1;
             out.push((i, j));
-        }
+        });
         out
     }
 }
@@ -810,10 +826,117 @@ const DF_CAP: usize = 50;
 /// `merge_counts`, which SUMS counts on a matching pair key rather than
 /// concatenating. See `shared_hash_split_across_partitions_sums_not_duplicates` for
 /// the pinned counter-example.
+/// Owner-partition spill of the join OUTPUT (the second D1 step). D1 partitioned
+/// the join's *input* by hash and WP-B scoped the *event buffer* per hash-partition;
+/// what still accumulated corpus-wide was the *output* `counts` (0.597 GB at drivers,
+/// plus a ~0.8 GB `merge_counts` transient — both MEASURED, chief-rope Stage 1). This
+/// routes each hash-partition's coalesced partials into owner-keyed files, then
+/// coalesces one owner-partition at a time, so at most ONE owner-partition's tuples
+/// are ever resident. Records are fixed-width 16 B LE `(u32 i, u32 j, u64 count)` —
+/// `i`, `j` are unit indices (`u32` by construction, widened to `usize` on read-back).
+///
+/// The files live in a unique `TempDir` under the resolved pack dir (never tmpfs —
+/// I5), auto-removed on drop, so an early return or panic cleans up too.
+struct OwnerSpill {
+    // Drop order: writers before `_tmp` so files close before the dir is removed.
+    writers: Vec<std::io::BufWriter<std::fs::File>>,
+    paths: Vec<std::path::PathBuf>,
+    _tmp: tempfile::TempDir,
+}
+
+impl OwnerSpill {
+    /// One file per owner-partition, created eagerly under a fresh subdir of `dir`.
+    fn new(dir: &Path, owner_parts: usize) -> std::io::Result<Self> {
+        let tmp = tempfile::Builder::new().prefix("join-").tempdir_in(dir)?;
+        let mut writers = Vec::with_capacity(owner_parts);
+        let mut paths = Vec::with_capacity(owner_parts);
+        for q in 0..owner_parts {
+            let p = tmp.path().join(format!("owner-{q}.bin"));
+            writers.push(std::io::BufWriter::new(std::fs::File::create(&p)?));
+            paths.push(p);
+        }
+        Ok(Self {
+            writers,
+            paths,
+            _tmp: tmp,
+        })
+    }
+
+    /// Append a partition's coalesced `partial` to the owner files. `partial` is
+    /// sorted by pair key and `oq` is monotone in the smaller owner `i`, so each
+    /// owner-partition's tuples are a CONTIGUOUS slice — split by scanning, not
+    /// re-sorting. ENOSPC here is unrecoverable (partials are consumed streaming),
+    /// so it panics with context, matching the tree pack's serialize stance.
+    fn route(&mut self, partial: &[((usize, usize), usize)], oq: impl Fn(usize) -> usize) {
+        let mut start = 0;
+        while start < partial.len() {
+            let q = oq(partial[start].0.0);
+            let mut end = start;
+            while end < partial.len() && oq(partial[end].0.0) == q {
+                end += 1;
+            }
+            let w = &mut self.writers[q];
+            for &((i, j), c) in &partial[start..end] {
+                w.write_all(&(i as u32).to_le_bytes())
+                    .and_then(|()| w.write_all(&(j as u32).to_le_bytes()))
+                    .and_then(|()| w.write_all(&(c as u64).to_le_bytes()))
+                    .expect("owner-spill write (ENOSPC?)");
+            }
+            start = end;
+        }
+    }
+
+    /// Coalesce each owner-partition and stream it to `sink` in ascending owner-key
+    /// order (I3), summing counts on equal pair keys within a partition (I1). Emits
+    /// the identical global (i, j)-ascending sequence the in-memory `counts` did.
+    fn drain(mut self, mut sink: impl FnMut((usize, usize), usize)) {
+        for w in &mut self.writers {
+            w.flush().expect("owner-spill flush (ENOSPC?)");
+        }
+        self.writers.clear(); // close files before reading
+        for path in &self.paths {
+            let bytes = std::fs::read(path).expect("owner-spill read-back");
+            let mut recs: Vec<((usize, usize), usize)> = bytes
+                .chunks_exact(16)
+                .map(|r| {
+                    let i = u32::from_le_bytes(r[0..4].try_into().unwrap()) as usize;
+                    let j = u32::from_le_bytes(r[4..8].try_into().unwrap()) as usize;
+                    let c = u64::from_le_bytes(r[8..16].try_into().unwrap()) as usize;
+                    ((i, j), c)
+                })
+                .collect();
+            recs.sort_unstable();
+            // Adjacent-coalesce SUMMING (I1): a pair's tuples arrive from many hash
+            // partitions, all routed here because `oq` keys on `i` alone.
+            let mut cur: Option<((usize, usize), usize)> = None;
+            for ((i, j), c) in recs {
+                match &mut cur {
+                    Some((k, acc)) if *k == (i, j) => *acc += c,
+                    _ => {
+                        if let Some((k, acc)) = cur.take() {
+                            sink(k, acc);
+                        }
+                        cur = Some(((i, j), c));
+                    }
+                }
+            }
+            if let Some((k, acc)) = cur {
+                sink(k, acc);
+            }
+        }
+    }
+}
+
+/// Stream the shared-landmark pair counts to `sink` as `(pair, shared_count)` in
+/// ascending pair order. `spill_dir` present + a large output ⇒ the join output is
+/// owner-partition-spilled (bounded resident); otherwise the in-memory path runs
+/// (byte-identical to the pre-spill code). See [`OwnerSpill`].
 fn shared_count_pairs(
     landmarks: &[Vec<u128>],
     owner_pair_window: usize,
-) -> Vec<((usize, usize), usize)> {
+    spill_dir: Option<&Path>,
+    sink: impl FnMut((usize, usize), usize),
+) {
     // Partition the hash space by high bits. Landmarks are xxh3_128 digests, so they
     // are uniform and a top-bits split is even; `TARGET` then bounds the working
     // buffer regardless of corpus size (drivers: 105.5M occurrences → 32 partitions
@@ -821,19 +944,53 @@ fn shared_count_pairs(
     const TARGET: usize = 4 << 20;
     let total: usize = landmarks.iter().map(Vec::len).sum();
     let parts = (total / TARGET).max(1).next_power_of_two();
-    shared_count_pairs_partitioned(landmarks, owner_pair_window, parts)
+    // Owner-partition count: 1 (in-memory) unless a spill dir is available. Derived
+    // from `total` as a pre-join proxy for the unknown output size `counts.len`
+    // (MEASURED counts.len ≈ 0.23·total at drivers), targeting ~counts.len/16 ≈ 1.5M
+    // output tuples per owner-partition: drivers 106M → 16, net 25M → 4, fs 10M → 2.
+    // Over-partitioning only lowers per-partition residency, so the proxy is safe.
+    const OWNER_TARGET: usize = 8 << 20;
+    let owner_parts = match spill_dir {
+        Some(_) => (total / OWNER_TARGET).max(1).next_power_of_two(),
+        None => 1,
+    };
+    shared_count_pairs_partitioned(
+        landmarks,
+        owner_pair_window,
+        parts,
+        owner_parts,
+        spill_dir,
+        sink,
+    )
 }
 
-/// `shared_count_pairs` with the partition count pinned. `parts` is a pure
-/// space/time knob and **must not be observable in the result** — that is the whole
-/// claim, and `partitioned_join_matches_monolithic_sort` holds it down by sweeping
-/// `parts` against a reference monolithic sort.
+/// `shared_count_pairs` with both partition counts pinned and the output streamed to
+/// `sink`. `parts` (hash-partitions) and `owner_parts` (output owner-partitions) are
+/// pure space/time knobs and **must not be observable in the result** — the whole
+/// claim, held down by `partitioned_join_matches_monolithic_sort` sweeping BOTH axes
+/// against a reference monolithic sort (I4).
+///
+/// The owner axis (I1/I2/I3): a pair `(i, j)`, `i < j`, is routed to owner-partition
+/// `oq(i) = (i·owner_parts)/n` — a pure function of the pair's SMALLER owner, so
+/// owner-partitions partition the pair-key space (I2: each pair lands in exactly one,
+/// making cross-partition CONCATENATION sound — the dual of the hash axis, where a
+/// pair scatters across partitions and must be SUMMED). Within one owner-partition a
+/// pair's tuples still arrive from many HASH partitions and MUST be summed, never
+/// concatenated (I1 — the WP-B crux, generalized). `oq` is monotone in `i`, so
+/// emitting owner-partitions in ascending order, each internally sorted, reproduces
+/// the identical global `(i, j)`-ascending sequence the in-memory `counts` produced
+/// (I3: byte-identity by construction). `owner_parts == 1` (or no `spill_dir`) ⇒ the
+/// in-memory `merge_counts` path, unchanged from the pre-spill code.
 fn shared_count_pairs_partitioned(
     landmarks: &[Vec<u128>],
     owner_pair_window: usize,
     parts: usize,
-) -> Vec<((usize, usize), usize)> {
+    owner_parts: usize,
+    spill_dir: Option<&Path>,
+    mut sink: impl FnMut((usize, usize), usize),
+) {
     debug_assert!(parts.is_power_of_two());
+    debug_assert!(owner_parts.is_power_of_two());
     let n = landmarks.len();
     // Because the key is monotone in the hash and each list is sorted, a unit's
     // contribution to a partition is a **contiguous slice** of its list — found by
@@ -842,6 +999,23 @@ fn shared_count_pairs_partitioned(
     // `parts == 1` ⇒ `shift == 128`, which would overflow the shift; `checked_shr`
     // folds that case to the single partition 0.
     let key = |h: u128| -> usize { h.checked_shr(shift).unwrap_or(0) as usize };
+
+    // Owner-partition routing key (I2/I3): monotone in the smaller owner, equal-width
+    // in unit index. `n == 0` cannot reach here (callers hold ≥2 units); guard the
+    // divide anyway so a degenerate call folds to partition 0.
+    // `n == 0` cannot reach here (callers hold ≥2 units); `checked_div` folds that
+    // degenerate case to partition 0 rather than dividing by zero.
+    let oq = |i: usize| -> usize { (i * owner_parts).checked_div(n).unwrap_or(0) };
+    // Spill the output only with a dir AND more than one owner-partition; else the
+    // in-memory `counts`/`merge_counts` path runs (byte-identical to pre-spill). If
+    // the spill dir cannot be opened, fall back to in-memory rather than fail (a
+    // decision made BEFORE the hash loop, so partials are never stranded).
+    let mut spill = match spill_dir {
+        Some(dir) if owner_parts > 1 => OwnerSpill::new(dir, owner_parts)
+            .map_err(|e| eprintln!("warning: owner-spill disabled ({e}); joining in-memory"))
+            .ok(),
+        _ => None,
+    };
 
     let mut events: Vec<(u32, u32)> = Vec::new();
     let mut cursors: Vec<usize> = vec![0; n];
@@ -935,16 +1109,33 @@ fn shared_count_pairs_partitioned(
                 _ => partial.push(((pair.0 as usize, pair.1 as usize), 1)),
             }
         }
-        counts = merge_counts(counts, partial);
+        // Route the OUTPUT: owner-partition spill (bounded resident) or the
+        // in-memory running fold. `partial` is sorted by pair key, so `route`
+        // finds each owner-partition's contiguous slice without re-sorting.
+        if let Some(spill) = spill.as_mut() {
+            spill.route(&partial, oq);
+        } else {
+            counts = merge_counts(counts, partial);
+        }
     }
     drop(buf);
     drop(cursors);
     drop(events);
 
-    // Push-grown to a doubling capacity; it is returned and held resident as the
-    // landmark index, so trim the slack before it outlives this function.
-    counts.shrink_to_fit();
-    counts
+    match spill {
+        // Spill path: coalesce+stream one owner-partition at a time (I1/I3). Neither
+        // the full `counts` nor the `merge_counts` transient is ever resident.
+        Some(spill) => spill.drain(sink),
+        None => {
+            // Push-grown to a doubling capacity; trim the slack, then stream the
+            // globally-sorted counts to the sink in the identical order the return
+            // value used to carry.
+            counts.shrink_to_fit();
+            for (pair, shared) in counts {
+                sink(pair, shared);
+            }
+        }
+    }
 }
 
 /// Merge two pair-count lists, both sorted ascending by pair key, summing the count
@@ -1450,6 +1641,22 @@ mod tests {
         lms
     }
 
+    /// Drive the sink-based join into a Vec so tests compare shapes against
+    /// `monolithic_reference`. `owner_parts > 1` needs a spill dir (a `TempDir`).
+    fn collect_join(
+        lms: &[Vec<u128>],
+        window: usize,
+        parts: usize,
+        owner_parts: usize,
+        spill_dir: Option<&Path>,
+    ) -> Vec<((usize, usize), usize)> {
+        let mut v = Vec::new();
+        shared_count_pairs_partitioned(lms, window, parts, owner_parts, spill_dir, |k, c| {
+            v.push((k, c))
+        });
+        v
+    }
+
     #[test]
     fn partitioned_join_matches_monolithic_sort() {
         // THE claim behind deleting the 3.375 GB `entries` array: the partition count
@@ -1470,14 +1677,20 @@ mod tests {
                 "fixture produced no pairs at window={window}"
             );
             // parts=1 is the monolithic shape; 64 splits the fixture ~140 ways per
-            // partition. Every one must agree, byte for byte.
+            // partition. Sweep BOTH axes (I4): every (parts, owner_parts) must agree,
+            // byte for byte. owner_parts=1 is the in-memory path; >1 spills.
+            let tmp = tempfile::tempdir().unwrap();
             for &parts in &[1usize, 2, 4, 8, 16, 64] {
-                let got = shared_count_pairs_partitioned(&lms, window, parts);
-                assert_eq!(
-                    got, want,
-                    "partition count is observable in the output \
-                     (window={window}, parts={parts}) — the total-order argument is broken"
-                );
+                for &owner_parts in &[1usize, 2, 4, 8] {
+                    let dir = (owner_parts > 1).then(|| tmp.path());
+                    let got = collect_join(&lms, window, parts, owner_parts, dir);
+                    assert_eq!(
+                        got, want,
+                        "partition count is observable in the output \
+                         (window={window}, parts={parts}, owner_parts={owner_parts}) — \
+                         the total-order argument is broken"
+                    );
+                }
             }
         }
     }
@@ -1517,7 +1730,7 @@ mod tests {
             vec![h1],     // unit 2 (shares only h1)
         ];
         let parts = 4usize;
-        let got = shared_count_pairs_partitioned(&lms, 0, parts);
+        let got = collect_join(&lms, 0, parts, 1, None);
         // Expect exactly ONE tuple for (0, 1), with count 2 (both shared hashes),
         // and exactly one tuple for (0, 2) / (1, 2) with count 1 each — NOT two
         // separate (0,1) tuples with count 1 apiece.
@@ -1528,5 +1741,63 @@ mod tests {
             "pair (0,1) must coalesce to ONE tuple across partitions, got {pair01:?}"
         );
         assert_eq!(pair01[0].1, 2, "counts from different partitions must SUM");
+    }
+
+    #[test]
+    fn owner_partition_sums_hashes_split_across_hash_partitions() {
+        // I1 on the OWNER axis: a pair whose shared hashes land in DIFFERENT hash-
+        // partitions, while the pair lands in ONE owner-partition, must coalesce to a
+        // single summed tuple across the spilled owner-partition files — not one
+        // tuple per hash-partition chunk (the silent-recall bug this axis re-opens).
+        let h1: u128 = 0x0000_0000_0000_0000_0000_0000_0000_0001; // hash-part 00
+        let h2: u128 = 0x8000_0000_0000_0000_0000_0000_0000_0002; // hash-part 10
+        // n=3, owner_parts=2 ⇒ oq(0)=0, oq(1)=0, oq(2)=1: pair (0,1) → owner-part 0,
+        // receiving BOTH its hash-partition chunks; the pair must sum, not duplicate.
+        let lms = vec![vec![h1, h2], vec![h1, h2], vec![h1]];
+        let tmp = tempfile::tempdir().unwrap();
+        let got = collect_join(&lms, 0, 4, 2, Some(tmp.path()));
+        let pair01: Vec<_> = got.iter().filter(|(k, _)| *k == (0, 1)).collect();
+        assert_eq!(
+            pair01.len(),
+            1,
+            "hash-split chunks must SUM within an owner-partition, got {pair01:?}"
+        );
+        assert_eq!(
+            pair01[0].1, 2,
+            "counts from different hash-partitions must SUM"
+        );
+        // Full result (order included, I3) equals the monolithic reference.
+        assert_eq!(got, monolithic_reference(&lms, 0));
+    }
+
+    #[test]
+    fn owner_parts_one_is_the_in_memory_identity() {
+        // The identity control: owner_parts=1 takes the in-memory path whether or not
+        // a spill dir is present, reproducing the monolithic reference exactly.
+        let lms = fixture();
+        for &window in &[0usize, 4, 8] {
+            let want = monolithic_reference(&lms, window);
+            let tmp = tempfile::tempdir().unwrap();
+            assert_eq!(collect_join(&lms, window, 8, 1, Some(tmp.path())), want);
+            assert_eq!(collect_join(&lms, window, 8, 1, None), want);
+        }
+    }
+
+    #[test]
+    fn owner_spill_leaves_no_files_behind() {
+        // I5 lifecycle: the join's `TempDir` is removed on drop, so the resolved
+        // spill dir is empty again after the call (success path; Drop-based cleanup
+        // covers early-return/panic too).
+        let lms = fixture();
+        let tmp = tempfile::tempdir().unwrap();
+        let _ = collect_join(&lms, 0, 8, 4, Some(tmp.path()));
+        let leftover: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "owner-spill left files under the spill dir: {leftover:?}"
+        );
     }
 }

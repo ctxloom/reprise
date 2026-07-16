@@ -364,7 +364,11 @@ impl<'b> Retriever for MinHashLsh<'b> {
 
 fn retrievers(bag_sets: &[Vec<u128>]) -> Vec<(&'static str, Box<dyn Retriever + '_>)> {
     vec![
-        ("reprise-landmark", Box::new(matchtree::Landmark)),
+        // The bench joins in-memory (no owner-partition spill): `spill_dir: None`.
+        (
+            "reprise-landmark",
+            Box::new(matchtree::Landmark { spill_dir: None }),
+        ),
         (
             "minhash-lsh",
             Box::new(MinHashLsh {

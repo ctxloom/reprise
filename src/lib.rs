@@ -762,6 +762,12 @@ pub fn scan_source(
     // exit from `scan()` below — success, an early `?` return, or a panic —
     // covering the REST of the scan (inline variant spilling, near-tier,
     // sequence tier) exactly as it always has.
+    // The near-tier join's owner-partition output spill (chief-rope) co-locates
+    // under the same resolved pack dir (never tmpfs — matchtree I5). Available only
+    // for the owned default dir; an explicit `[memory] pack_dir` override or the
+    // temp fallback joins in-memory. `None` ⇒ owner_parts = 1, byte-identical to
+    // the pre-spill path.
+    let join_spill_dir = pack_dir_owned.clone();
     let _pack_dir_cleanup = PackDirCleanup(pack_dir_owned);
 
     // ---- P5: best-effort inliner (spec §5.4) — variants appended, tagged ----
@@ -992,6 +998,7 @@ pub fn scan_source(
         &exact_pairs,
         packs.as_ref().map(|p| &p.trees),
         &label_interner,
+        join_spill_dir.as_deref(),
     );
     phase("near", &mut stats, Instant::now());
 
