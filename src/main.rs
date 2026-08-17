@@ -90,6 +90,12 @@ enum Command {
         #[arg(long)]
         verbose: bool,
     },
+    /// Print this binary's name and version.
+    Version {
+        /// Output format: terminal | json.
+        #[arg(long, default_value = "terminal")]
+        format: String,
+    },
 }
 
 /// Exit-code epilogue for `check` help (spec §8 / DECISIONS.md D20f, D33).
@@ -110,6 +116,30 @@ fn emit(text: &str, broken_pipe_code: i32) -> anyhow::Result<()> {
             std::process::exit(broken_pipe_code)
         }
         result => Ok(result?),
+    }
+}
+
+/// The ctxloom family's companion-version contract: every binary in the family
+/// answers `<binary> version --format json` with exactly {"name","version"} and
+/// NOTHING else on stdout, because ctxloom inventories its companions at boot by
+/// parsing that stream as one JSON document — a banner or a log line breaks the
+/// probe. `terminal` reproduces clap's own `--version` rendering (`{name}
+/// {version}`) so the two renderings can never disagree, and both read the single
+/// source of truth for the value, CARGO_PKG_VERSION.
+fn render_version(format: &str) -> anyhow::Result<String> {
+    #[derive(serde::Serialize)]
+    struct Info<'a> {
+        name: &'a str,
+        version: &'a str,
+    }
+    let info = Info {
+        name: env!("CARGO_PKG_NAME"),
+        version: env!("CARGO_PKG_VERSION"),
+    };
+    match format {
+        "terminal" => Ok(format!("{} {}\n", info.name, info.version)),
+        "json" => Ok(format!("{}\n", serde_json::to_string(&info)?)),
+        other => bail!("unknown format `{other}` (expected: terminal, json)"),
     }
 }
 
@@ -217,6 +247,11 @@ fn run() -> anyhow::Result<i32> {
                 }
             }
             Ok(gate_code)
+        }
+        Command::Version { format } => {
+            // `version` is always clean, so a broken pipe exits 0 too.
+            emit(&render_version(&format)?, 0)?;
+            Ok(0)
         }
     }
 }
