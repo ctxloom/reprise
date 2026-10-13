@@ -847,6 +847,8 @@ keeping the rest — falls to `reprise:ignore` pragmas or an actual cleanup.
 reintroduce the derived artifact D40 killed; a source pragma is reviewable,
 co-located, and survives refactors. Semantics: the unit stays covered by every
 tier; IU findings whose TOUCHED members all carry the pragma report as info.
+(Widened by D71, 2026-09-09: the same rule now also demotes `new` and
+`worsened`.)
 (b) **`git archive` fallback** for base-state extraction: `git worktree add`
 failed in the field on a multi-worktree clone (".git/index: Not a directory",
 unreproducible); archive reads only objects — no per-checkout admin state.
@@ -1362,3 +1364,36 @@ core helper is now the only one.
 branch, the gate stays quiet; while the branch carries a finding, it keeps reporting — which is what
 a drift gate is for. Base state is SHA-keyed and cached, so the extra scope costs one cached base
 scan.
+
+## D71 — `reprise:accept-drift` waives the duplication gates too, not only inconsistent-update (2026-09-09)
+
+**The report.** A deliberate duplication could not be landed. The pragma set had two levers and
+neither fit: `reprise:ignore` drops the unit from the corpus outright — so those copies can never be
+checked against each other again — and `reprise:accept-drift` was scoped to `inconsistent-update`
+alone (D41), which does nothing for the `new` and `worsened` findings a fresh duplicate actually
+fires. The only way to land intentional duplication was to go blind to it.
+
+**Measured before changed.** The reported cause — "exclusion comments are read from HEAD, not from
+the new code" — was false. `check` scans the INDEX (D52), and a pragma introduced in the same change
+IS read: `reprise:ignore` written alongside a new duplicate suppresses both `new` and `worsened`
+(measured; now pinned by `ignore_in_the_same_change_suppresses_the_finding_entirely`). The existing
+`accept_drift_pragma_demotes_iu_to_info` test placed its pragma before the baseline commit, which is
+where the HEAD-only impression came from — nothing covered a pragma introduced *with* the
+duplication. Two real constraints hid behind that story: the `new`/`worsened` paths consulted **no
+pragma at all**, and a pragma left unstaged is invisible — by design, since `check` judges the
+prospective commit and not the checkout (`a_pragma_that_is_only_in_the_working_tree_does_not_waive_
+the_gate`).
+
+**Decision.** `accept_drift` now gates `new` and `worsened` on the rule IU already used: the finding
+is demoted to info when **every touched member** carries the pragma. Requiring every member of the
+group was rejected — it forces edits to untouched pre-existing copies merely to add one, and those
+edits then make them touched. A separate `reprise:accept-duplicate` marker was rejected as
+vocabulary growth for what is one idea: "this divergence is reviewed."
+
+**The trade accepted.** One marker now carries two waivers, so a unit marked to permit a deliberate
+copy also stops IU on that unit from failing. That is a genuine loss of precision, taken because the
+alternative on offer was `reprise:ignore`, which loses strictly more: an ignored unit is not merely
+un-gated, it is un-indexed and cannot be a member of anyone's group. Under `accept-drift` the copies
+stay fully covered and every finding still REPORTS as info, so `scan` and `check` both keep showing
+them. If field use turns up people who want the duplication waived while IU still gates, that split
+is what would justify a second marker.

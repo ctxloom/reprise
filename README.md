@@ -180,18 +180,25 @@ skipped — keep the pragma adjacent to the unit in that case.)
 **`reprise:ignore` — drop the unit entirely.** The unit is removed from **every
 tier**: it is never normalized, matched, or reported, and it cannot be a member
 of anyone else's group either (it simply isn't in the corpus). Use it for code
-that is duplicated *on purpose* and should never be flagged — a generated shim, a
-deliberately parallel implementation.
+that should never be looked at — a generated shim, vendored source. For
+duplication that is deliberate but still worth tracking, reach for
+`accept-drift` below instead: `ignore` also throws away any chance of ever
+noticing that the copies have diverged.
 
 **`reprise:accept-drift` — keep coverage, waive the gate.** The unit stays
 **fully covered** — indexed, matched, and reported like any other. The pragma
-changes only the `check` gate: when a change edits some members of a duplicate
-group but not others (an `inconsistent-update`), the finding **reports as
-information instead of failing CI** — but only when *every touched member* of the
-group carries `accept-drift`. Touch a member that is **not** marked and the
-finding fails as usual. It is the reviewed, source-located way to say "this copy
-is allowed to diverge" (D41), and needs no separate accept file to drift out of
-sync with the git-ref baseline.
+changes only the `check` gate: the finding **reports as information instead of
+failing CI**. It covers all three gating findings — `inconsistent-update` (a
+change edited some members of a group but not others), `new` (a duplicate group
+that did not exist at the base ref) and `worsened` (a copy added to a group that
+did) — but only when *every touched member* carries `accept-drift`. Touch a
+member that is **not** marked and the finding fails as usual. It is the reviewed,
+source-located way to say "this duplication is deliberate" (D41, D71), and needs
+no separate accept file to drift out of sync with the git-ref baseline.
+
+Write it **alongside** the duplication you are introducing: `check` reads the
+git index, so a pragma in the same commit counts. A pragma left unstaged does
+not — `check` judges the prospective commit, never the working tree.
 
 Neither pragma hides silently: the **suppressed count** is printed in the scan
 summary (`… 0 suppressed …`), so ignores can't accumulate unnoticed.
