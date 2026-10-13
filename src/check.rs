@@ -38,13 +38,16 @@ fn spans_overlap(a: (u32, u32), b: (u32, u32)) -> bool {
     a.0 <= b.1 && b.0 <= a.1
 }
 
+/// Does any of `file`'s ranges in `ranges` overlap `span`?
+fn any_overlap(ranges: &HashMap<String, Vec<(u32, u32)>>, file: &str, span: (u32, u32)) -> bool {
+    ranges
+        .get(file)
+        .is_some_and(|rs| rs.iter().any(|&r| spans_overlap(r, span)))
+}
+
 impl DiffMap {
     pub fn touches(&self, file: &str, span: (u32, u32)) -> bool {
-        self.deleted.contains(file)
-            || self
-                .hunks
-                .get(file)
-                .is_some_and(|ranges| ranges.iter().any(|&r| spans_overlap(r, span)))
+        self.deleted.contains(file) || any_overlap(&self.hunks, file, span)
     }
 
     pub fn file_touched(&self, file: &str) -> bool {
@@ -57,18 +60,8 @@ impl DiffMap {
     /// does not touch the unit that abuts the deletion point.
     fn touches_member(&self, file: &str, span: (u32, u32), base_span: (u32, u32)) -> bool {
         self.deleted.contains(file)
-            || self.edits(file, span)
-            || self
-                .removals
-                .get(file)
-                .is_some_and(|rs| rs.iter().any(|&old| spans_overlap(old, base_span)))
-    }
-
-    /// Did the diff add lines overlapping new-side `span`?
-    fn edits(&self, file: &str, span: (u32, u32)) -> bool {
-        self.edits
-            .get(file)
-            .is_some_and(|rs| rs.iter().any(|&r| spans_overlap(r, span)))
+            || any_overlap(&self.edits, file, span)
+            || any_overlap(&self.removals, file, base_span)
     }
 }
 
