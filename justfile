@@ -3,6 +3,12 @@ default: test
 build:
     cargo build --workspace
 
+# Remove build artifacts (target/) — reclaims compiled deps + binaries. The
+# target dir is the single largest disk consumer in a Rust checkout; this is
+# the space-reclaim recipe. Rebuild with `just build`.
+clean:
+    cargo clean
+
 # ===== Version management (versionator) =====
 #
 # Releases are merge-triggered: bump the version here, open a PR, merge. CI's
