@@ -27,6 +27,11 @@ pub struct DiffMap {
     hunks: HashMap<String, Vec<(u32, u32)>>,
     /// Files the diff deletes: their baseline members count as touched.
     deleted: HashSet<String>,
+    /// Root-relative file → new-side ranges of hunks that ADD lines (exact,
+    /// no deletion adjacency).
+    edits: HashMap<String, Vec<(u32, u32)>>,
+    /// Root-relative file → OLD-side (base) line ranges every hunk removes.
+    removals: HashMap<String, Vec<(u32, u32)>>,
 }
 
 fn spans_overlap(a: (u32, u32), b: (u32, u32)) -> bool {
@@ -44,6 +49,26 @@ impl DiffMap {
 
     pub fn file_touched(&self, file: &str) -> bool {
         self.deleted.contains(file) || self.hunks.contains_key(file)
+    }
+
+    /// Did the diff edit the live unit at new-side `span`, or delete lines of
+    /// its base-side `base_span`? Unlike [`touches`](Self::touches), a pure
+    /// deletion is judged on the base side, so deleting a neighbouring unit
+    /// does not touch the unit that abuts the deletion point.
+    fn touches_member(&self, file: &str, span: (u32, u32), base_span: (u32, u32)) -> bool {
+        self.deleted.contains(file)
+            || self.edits(file, span)
+            || self
+                .removals
+                .get(file)
+                .is_some_and(|rs| rs.iter().any(|&old| spans_overlap(old, base_span)))
+    }
+
+    /// Did the diff add lines overlapping new-side `span`?
+    fn edits(&self, file: &str, span: (u32, u32)) -> bool {
+        self.edits
+            .get(file)
+            .is_some_and(|rs| rs.iter().any(|&r| spans_overlap(r, span)))
     }
 }
 
@@ -134,23 +159,32 @@ fn parse_diff(text: &str) -> DiffMap {
         if let Some(rest) = line.strip_prefix("@@ ") {
             in_header = false;
             let Some(file) = &current else { continue };
-            let Some(plus) = rest.split_whitespace().find(|w| w.starts_with('+')) else {
+            let side = |sign: char| {
+                let w = rest.split_whitespace().find(|w| w.starts_with(sign))?;
+                let nums = &w[1..];
+                match nums.split_once(',') {
+                    Some((s, c)) => s.parse::<u32>().ok().zip(c.parse::<u32>().ok()),
+                    None => nums.parse::<u32>().ok().map(|s| (s, 1)),
+                }
+            };
+            let Some((start, count)) = side('+') else {
                 continue;
             };
-            let nums = &plus[1..];
-            let parsed = match nums.split_once(',') {
-                Some((s, c)) => s.parse::<u32>().ok().zip(c.parse::<u32>().ok()),
-                None => nums.parse::<u32>().ok().map(|s| (s, 1)),
-            };
-            let Some((start, count)) = parsed else {
-                continue;
-            };
-            let range = if count == 0 {
+            let new = (count > 0).then(|| (start, start + count - 1));
+            if let Some((ostart, ocount)) = side('-').filter(|&(_, c)| c > 0) {
+                map.removals
+                    .entry(file.clone())
+                    .or_default()
+                    .push((ostart, ostart + ocount - 1));
+            }
+            let range = match new {
+                Some(r) => {
+                    map.edits.entry(file.clone()).or_default().push(r);
+                    r
+                }
                 // Pure deletion: the removal point sits between new-side
                 // lines `start` and `start+1` — both are adjacent to it.
-                (start.max(1), start + 1)
-            } else {
-                (start, start + count - 1)
+                None => (start.max(1), start + 1),
             };
             map.hunks.entry(file.clone()).or_default().push(range);
         }
@@ -485,17 +519,40 @@ pub fn run(
                 // fallback (select_unit; tacky-muck).
                 let unit = units_by_file
                     .get(&bm.file)
-                    .and_then(|us| select_unit(us, bm, &e.fingerprint, fp_guarded));
+                    .and_then(|us| select_unit(us, bm, &e.fingerprint, fp_guarded))
+                    // A span-fallback map onto a unit that is ITSELF a sibling
+                    // member (by name) is not this member: with the member
+                    // deleted, an identical sibling shifts into its old lines.
+                    .filter(|u| {
+                        u.name == bm.name
+                            || !e.members.iter().any(|o| {
+                                o.file == bm.file
+                                    && !o.name.is_empty()
+                                    && o.name != "<anon>"
+                                    && o.name == u.name
+                            })
+                    });
                 let (is_touched, line_span) = if region {
                     // Regions: span-precise — the diff must intersect the run
                     // itself, not merely the enclosing unit (D39).
                     (diff.touches(&bm.file, bm.line_span), bm.line_span)
                 } else {
                     match unit {
-                        Some(u) => (diff.touches(&bm.file, u.line_span), u.line_span),
-                        // Unmapped member: touched iff its file was (deleted or
-                        // rewritten past recognition — both are edits).
-                        None => (diff.file_touched(&bm.file), bm.line_span),
+                        // Judge a deletion on the BASE side: deleting the
+                        // neighbouring member does not touch the sibling that
+                        // abuts the deletion point.
+                        Some(u) => (
+                            diff.touches_member(&bm.file, u.line_span, bm.line_span),
+                            u.line_span,
+                        ),
+                        // Unmapped: nothing live is identifiably this member —
+                        // it was deleted (or rewritten past recognition, i.e.
+                        // replaced by a different unit). Either way it has
+                        // LEFT the group: removing a copy is the dedup this
+                        // check recommends, not a one-sided edit of the group
+                        // (explicit-muster). It is neither touched nor
+                        // untouched; the live members alone decide.
+                        None => continue,
                     }
                 };
                 let member = Member {
@@ -804,6 +861,15 @@ deleted file mode 100644
         assert!(!map.touches("src/a.rs", (42, 45)));
         assert!(map.touches("src/dead.rs", (3, 7)));
         assert!(!map.file_touched("src/other.rs"));
+        // touches_member judges a pure deletion on the BASE side: the unit
+        // abutting the deletion point (new 41.., base 31..) is not touched;
+        // a unit whose base lines were removed is.
+        assert!(!map.touches_member("src/a.rs", (41, 45), (31, 35)));
+        assert!(map.touches_member("src/a.rs", (38, 40), (28, 30)));
+        // Added lines touch by their new-side range.
+        assert!(map.touches_member("src/a.rs", (14, 20), (100, 101)));
+        assert!(!map.touches_member("src/a.rs", (15, 20), (100, 101)));
+        assert!(map.touches_member("src/dead.rs", (3, 7), (3, 7)));
     }
 
     // ---- bold-yelp: base-state key folds the version legs ----

@@ -399,6 +399,102 @@ fn consolidating_a_dup_group_into_one_helper_does_not_fire_inconsistent_update()
     assert!(!report.failed(), "{:#?}", report.findings);
 }
 
+/// One file holding a committed 3-member family followed by an unrelated fn.
+fn single_file_family_repo() -> TempDir {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let src = format!(
+        "{}{}{}{}",
+        family_member(0),
+        family_member(1),
+        family_member(2),
+        UNRELATED
+    );
+    fs::write(root.join("dup.rs"), &src).unwrap();
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "t@example.com"]);
+    git(root, &["config", "user.name", "t"]);
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "baseline"]);
+    dir
+}
+
+/// Regression (false positive, explicit-muster): DELETING one copy of a
+/// duplicate group and leaving the others byte-identical is the remedy the
+/// check recommends, not an incomplete edit. The deleted member is unmapped;
+/// it used to count as "touched" (its file has a hunk), and the deletion's
+/// adjacency range also touched the sibling that shifted up into its place,
+/// so the survivors split touched/untouched and inconsistent-update fired.
+#[test]
+fn deleting_one_dup_member_in_file_does_not_fire_inconsistent_update() {
+    let dir = single_file_family_repo();
+    let root = dir.path();
+    // Delete the MIDDLE member: the sibling below it abuts the deletion point.
+    let src = format!("{}{}{}", family_member(0), family_member(2), UNRELATED);
+    fs::write(root.join("dup.rs"), &src).unwrap();
+    stage_all(root);
+    let report = reprise::check::run(root, &Config::default(), "HEAD", None).unwrap();
+    assert!(
+        !report
+            .findings
+            .iter()
+            .any(|f| f.kind == "inconsistent-update"),
+        "deleting one copy must not fire inconsistent-update: {:#?}",
+        report.findings
+    );
+    assert!(!report.failed(), "{:#?}", report.findings);
+}
+
+/// Same, with each member in its own file and the deletion being a whole file.
+#[test]
+fn deleting_one_dup_member_file_does_not_fire_inconsistent_update() {
+    let dir = git_repo_with_family();
+    let root = dir.path();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "init"]);
+    fs::remove_file(root.join("m1.rs")).unwrap();
+    stage_all(root);
+    let report = reprise::check::run(root, &Config::default(), "HEAD", None).unwrap();
+    assert!(
+        !report
+            .findings
+            .iter()
+            .any(|f| f.kind == "inconsistent-update"),
+        "deleting one copy's file must not fire inconsistent-update: {:#?}",
+        report.findings
+    );
+    assert!(!report.failed(), "{:#?}", report.findings);
+}
+
+/// A deletion does not launder a real incomplete edit: delete one member AND
+/// edit another so it diverges — the edited survivor vs its untouched sibling
+/// is still a one-sided change, and must fire naming only live members.
+#[test]
+fn deleting_one_member_and_editing_another_still_fires_inconsistent_update() {
+    let dir = single_file_family_repo();
+    let root = dir.path();
+    // m0 uses lit2 = 90*5 = 450.
+    let edited0 = family_member(0).replace("> 450", "> 999");
+    assert_ne!(edited0, family_member(0), "edit did not apply");
+    let src = format!("{}{}{}", edited0, family_member(2), UNRELATED);
+    fs::write(root.join("dup.rs"), &src).unwrap();
+    stage_all(root);
+    let report = reprise::check::run(root, &Config::default(), "HEAD", None).unwrap();
+    let iu: Vec<_> = report
+        .findings
+        .iter()
+        .filter(|f| f.kind == "inconsistent-update")
+        .collect();
+    assert_eq!(iu.len(), 1, "{:#?}", report.findings);
+    let f = iu[0];
+    assert!(f.fails);
+    assert!(report.failed());
+    let touched: Vec<&str> = f.touched.iter().map(|m| m.name.as_str()).collect();
+    let untouched: Vec<&str> = f.untouched.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(touched, ["process_batch_0"], "{f:#?}");
+    assert_eq!(untouched, ["process_batch_2"], "{f:#?}");
+}
+
 #[test]
 fn baselined_untouched_findings_are_exempt() {
     let repo = git_repo_with_family();
