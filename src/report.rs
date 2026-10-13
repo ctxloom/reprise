@@ -260,7 +260,9 @@ pub struct UnitSummary {
     /// span-overlap fallback tell "same duplicate that moved/renamed" from
     /// "deleted; an unrelated function now occupies those lines".
     pub fingerprint: String,
-    /// `reprise:accept-drift` (D41): IU on this unit reports as info.
+    /// `reprise:accept-drift` (D41, D71): the `check` gates on this unit report
+    /// as info — inconsistent-update, and the `new`/`worsened` duplication
+    /// gates — while the unit stays covered by every tier.
     pub accept_drift: bool,
 }
 

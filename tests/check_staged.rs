@@ -241,3 +241,42 @@ fn a_bare_check_defaults_to_the_merge_base_with_the_default_branch() {
          merge-base with `master`/`main`.\nstdout: {stdout}\nstderr: {stderr}"
     );
 }
+
+/// The same rule applies to the exemption pragmas, and it is the one that
+/// surprises people: a `reprise:accept-drift` / `reprise:ignore` marker living
+/// only in the working tree is NOT in the prospective commit, so `check` does
+/// not honour it. Stage the marker and the gate lifts. (The pragma need not
+/// exist at the base ref — `tests/check_baseline.rs` pins that half.)
+#[test]
+fn a_pragma_that_is_only_in_the_working_tree_does_not_waive_the_gate() {
+    let dir = repo_with_committed_family();
+    let root = dir.path();
+
+    // A fourth copy, staged WITHOUT the marker.
+    let copy = family_member(3);
+    fs::write(root.join("m3.rs"), &copy).unwrap();
+    git(root, &["add", "-A"]);
+
+    // The marker is added afterwards and never staged.
+    fs::write(
+        root.join("m3.rs"),
+        copy.replacen('\n', "\n// reprise:accept-drift\n", 1),
+    )
+    .unwrap();
+
+    let report = reprise::check::run(root, &Config::default(), "HEAD", None).unwrap();
+    assert!(
+        report.failed(),
+        "an unstaged pragma is not in the commit and must not waive the gate: {:#?}",
+        report.findings
+    );
+
+    // Staging the same marker lifts it.
+    git(root, &["add", "-A"]);
+    let report = reprise::check::run(root, &Config::default(), "HEAD", None).unwrap();
+    assert!(
+        !report.failed(),
+        "a STAGED pragma must waive the gate: {:#?}",
+        report.findings
+    );
+}

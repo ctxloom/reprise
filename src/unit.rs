@@ -77,8 +77,8 @@ pub struct Unit {
     pub token_count: u32,
     pub parse_degraded: bool,
     pub is_test: bool,
-    /// `reprise:accept-drift` pragma (D41): one-sided edits to this unit
-    /// report inconsistent-update as info instead of failing.
+    /// `reprise:accept-drift` pragma (D41, D71): `check`'s inconsistent-update
+    /// and `new`/`worsened` gates on this unit report as info instead of failing.
     pub accept_drift: bool,
     pub fingerprint: u128,
     /// The canonical tree (resident, or spilled to the scan pack over the
@@ -244,9 +244,11 @@ impl FileUnitsWire {
 /// arguments remain unhandled).
 ///
 /// - `reprise:ignore` — suppress the unit from ALL tiers.
-/// - `reprise:accept-drift` — the unit stays fully covered, but a one-sided
-///   edit to it no longer FAILS inconsistent-update (reports as info): the
-///   reviewed, source-located, D40-compatible way to accept divergence.
+/// - `reprise:accept-drift` — the unit stays fully covered, but the `check`
+///   gates no longer FAIL on it (they report as info): inconsistent-update on a
+///   one-sided edit, and the `new`/`worsened` duplication gates. The reviewed,
+///   source-located, D40-compatible way to accept deliberate duplication and
+///   divergence, where `reprise:ignore` accepts it by going blind to it.
 fn pragma_line(lines: &[&str], first_line: u32) -> Option<u32> {
     let has_pragma = |ln: u32| {
         ln >= 1

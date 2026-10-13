@@ -305,6 +305,21 @@ fn select_unit<'a>(
     })
 }
 
+/// A CURRENT-report group member -> the unit it lives in. Unit-tier members
+/// carry their unit's own span, so an exact span match settles it; region
+/// members are line RUNS inside a unit, so fall back to the tightest unit that
+/// encloses the run. A run spanning more than one unit maps to none, and an
+/// unmapped member is never treated as accepted.
+fn unit_for_member<'a>(us: &[&'a UnitSummary], m: &Member) -> Option<&'a UnitSummary> {
+    if let Some(u) = us.iter().copied().find(|u| u.line_span == m.line_span) {
+        return Some(u);
+    }
+    us.iter()
+        .copied()
+        .filter(|u| u.line_span.0 <= m.line_span.0 && m.line_span.1 <= u.line_span.1)
+        .min_by_key(|u| u.line_span.1 - u.line_span.0)
+}
+
 /// Version legs that MUST bust the base-state snapshot when they move — the
 /// exact set the per-file cache key folds in (`src/cache.rs`). The per-file
 /// cache invalidates on a grammar / extraction / IR-scheme / tool-version bump,
@@ -611,12 +626,26 @@ pub fn run(
         if g.tier == Tier::ExactRegion && g.token_count < cfg.report.micro_region_tokens {
             continue;
         }
-        let touched: Vec<Member> = g
+        let touched_raw: Vec<&Member> = g
             .members
             .iter()
             .filter(|m| diff.touches(&rel(&m.file), m.line_span))
-            .map(&rel_member)
             .collect();
+        let touched: Vec<Member> = touched_raw.iter().copied().map(&rel_member).collect();
+        // `reprise:accept-drift` on every TOUCHED member is the reviewed,
+        // source-located record that this duplication is deliberate, and it
+        // waives the DUPLICATION gates (`new` / `worsened`) exactly as it
+        // waives inconsistent-update. The finding still reports as info and the
+        // unit stays covered by every tier -- that is the whole difference from
+        // `reprise:ignore`, which drops the unit from the corpus and with it
+        // any chance of ever noticing the copies diverge.
+        let touched_accepts = !touched_raw.is_empty()
+            && touched_raw.iter().all(|m| {
+                units_by_file
+                    .get(&rel(&m.file))
+                    .and_then(|us| unit_for_member(us, m))
+                    .is_some_and(|u| u.accept_drift)
+            });
         // Baseline identity: fingerprint key + at least one member overlap
         // (guards against key collisions between disjoint groups).
         let entry = by_fp.get(g.fingerprint.as_str()).and_then(|es| {
@@ -634,7 +663,7 @@ pub fn run(
             if !touched.is_empty() {
                 findings.push(CheckFinding {
                     kind: "new".into(),
-                    fails: fails(g.tier),
+                    fails: fails(g.tier) && !touched_accepts,
                     group: rel_group(g),
                     touched,
                     untouched: Vec::new(),
@@ -675,7 +704,7 @@ pub fn run(
             }
             findings.push(CheckFinding {
                 kind: "worsened".into(),
-                fails: fails(g.tier),
+                fails: fails(g.tier) && !touched_accepts,
                 group: rel_group(g),
                 touched,
                 untouched: Vec::new(),

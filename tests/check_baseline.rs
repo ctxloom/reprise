@@ -944,6 +944,123 @@ fn accept_drift_pragma_demotes_iu_to_info() {
     );
 }
 
+// ---------- D41 widening: accept-drift waives the DUPLICATION gates
+// (`new` / `worsened`), not only inconsistent-update ----------
+
+/// `family_member` starts with a newline, and a blank line ends the upward
+/// pragma scan by design — so the marker must sit directly above the `fn`.
+fn with_pragma(src: &str, pragma: &str) -> String {
+    src.replacen('\n', &format!("\n// {pragma}\n"), 1)
+}
+
+/// Deliberate duplication is introduced TOGETHER WITH its exemption, so the
+/// pragma exists only in the new code and never at the base ref. `check` reads
+/// the index, so the marker in the prospective commit is what counts.
+#[test]
+fn accept_drift_in_the_same_change_demotes_new_group_to_info() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    fs::write(root.join("seed.rs"), UNRELATED).unwrap();
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "t@example.com"]);
+    git(root, &["config", "user.name", "t"]);
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "baseline"]);
+
+    // A group wholly absent from the base ref, every copy marked.
+    for n in 0..2 {
+        let text = with_pragma(&family_member(n), "reprise:accept-drift");
+        fs::write(root.join(format!("n{n}.rs")), text).unwrap();
+    }
+    stage_all(root);
+    let report = reprise::check::run(root, &Config::default(), "HEAD", None).unwrap();
+    let new: Vec<_> = report.findings.iter().filter(|f| f.kind == "new").collect();
+    assert_eq!(
+        new.len(),
+        1,
+        "the duplication still REPORTS: {:#?}",
+        report.findings
+    );
+    assert!(!new[0].fails, "accept-drift demotes a new group to info");
+    assert!(!report.failed());
+
+    // Control: the same duplication unmarked gates as before.
+    for n in 0..2 {
+        fs::write(root.join(format!("n{n}.rs")), family_member(n)).unwrap();
+    }
+    stage_all(root);
+    let report = reprise::check::run(root, &Config::default(), "HEAD", None).unwrap();
+    assert!(
+        report.failed(),
+        "unmarked new duplication must still gate: {:#?}",
+        report.findings
+    );
+}
+
+/// A copy added to a group that ALREADY exists at base is `worsened`. Marking
+/// only the added (touched) copy waives the gate: the pre-existing untouched
+/// members need no edit — the same `touched_accepts` rule IU uses.
+#[test]
+fn accept_drift_on_the_added_copy_demotes_worsened_to_info() {
+    let repo = git_repo_with_family();
+    let root = repo.path();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "baseline"]);
+
+    let marked = with_pragma(&family_member(3), "reprise:accept-drift");
+    fs::write(root.join("m3.rs"), &marked).unwrap();
+    stage_all(root);
+    let report = reprise::check::run(root, &Config::default(), "HEAD", None).unwrap();
+    let worsened: Vec<_> = report
+        .findings
+        .iter()
+        .filter(|f| f.kind == "worsened")
+        .collect();
+    assert_eq!(
+        worsened.len(),
+        1,
+        "the added copy still REPORTS: {:#?}",
+        report.findings
+    );
+    assert!(
+        !worsened[0].fails,
+        "accept-drift on the touched member demotes worsened to info"
+    );
+    assert!(!report.failed());
+
+    // Control: the same added copy unmarked gates.
+    fs::write(root.join("m3.rs"), family_member(3)).unwrap();
+    stage_all(root);
+    let report = reprise::check::run(root, &Config::default(), "HEAD", None).unwrap();
+    assert!(
+        report.failed(),
+        "unmarked added copy must still gate: {:#?}",
+        report.findings
+    );
+}
+
+/// The contrast with `reprise:ignore`, also introduced in the same change: it
+/// removes the unit from the corpus outright, so the group never forms and
+/// NOTHING is reported — where accept-drift keeps the finding visible as info.
+#[test]
+fn ignore_in_the_same_change_suppresses_the_finding_entirely() {
+    let repo = git_repo_with_family();
+    let root = repo.path();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "baseline"]);
+
+    let marked = with_pragma(&family_member(3), "reprise:ignore");
+    fs::write(root.join("m3.rs"), &marked).unwrap();
+    stage_all(root);
+    let report = reprise::check::run(root, &Config::default(), "HEAD", None).unwrap();
+    assert!(
+        report.findings.is_empty(),
+        "ignore removes the unit, so no finding at all: {:#?}",
+        report.findings
+    );
+    assert!(!report.failed());
+}
+
 // ---- git-env-scrub: hook-injected GIT_INDEX_FILE must not leak into
 // reprise's own git children and clobber the CALLER's real index ----
 
