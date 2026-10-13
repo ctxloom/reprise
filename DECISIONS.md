@@ -286,8 +286,17 @@ added), or divergence increased beyond `DIVERGENCE_EPS = 0.01`. (d)
 **Inconsistent-update findings are computed from the baseline state + diff**,
 not from current groups: a group whose members drifted past `max_divergence`
 (and thus vanished from the current scan) still fires — that is the fault
-window §6 exists for. Baseline members map to current units via (b); an
-unmapped member in an edited/deleted file counts as touched. (e) When an
+window §6 exists for. Baseline members map to current units via (b). An
+unmapped member — deleted, or rewritten past recognition into a different unit
+— has LEFT the group and counts as neither touched nor untouched; the live
+members alone decide consistency. (Amended 2026-10-13, explicit-muster: it
+used to count as touched, so deleting one copy of a group — the remedy the check
+recommends — fired a false inconsistent-update against the untouched survivors.
+A span-overlap map onto a unit that is itself a sibling member is likewise
+rejected, and a pure deletion touches a member only if it removes lines of that
+member's BASE span — not via the new-side adjacency that `touches` uses.) A
+deletion does not launder a real one-sided edit: delete one member and edit
+another, and the edited survivor against its untouched siblings still fires. (e) When an
 inconsistent-update finding already reports a group's drift, the same group is
 not re-emitted as `worsened` unless a member was also added; untouched
 baselined groups with divergence growth are emitted as non-failing `drifting`
