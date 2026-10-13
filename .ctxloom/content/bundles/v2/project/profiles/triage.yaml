@@ -1,0 +1,8 @@
+description: "Triage: judge whether a deferred task's revive condition has fired. Domain context above all — whether a trigger like \"once the near-tier join is partitioned\" has actually fired is answerable only by someone who knows what this project's terms mean. No behavioural guidance: it is rendering a verdict, not writing code."
+tags:
+  - triage
+  - ctxloom-internal
+bundles:
+  - https://github.com/benjaminabbitt/ctxloom-personal@bundles/decision-log
+  - https://github.com/benjaminabbitt/ctxloom-personal@bundles/working-context
+  - https://github.com/ctxloom/ctxloom-default@bundles/taskloom

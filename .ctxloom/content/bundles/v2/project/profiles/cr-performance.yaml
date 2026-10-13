@@ -1,0 +1,9 @@
+description: "Code review, performance lens (Rust). Single-lens member for an agent_run fan-out. This project is memory-bound before it is CPU-bound: peak RSS is the headline number and it is stable to <1%, while wall time on the dev box drifts +/-50% batch to batch. Findings that assert a speedup must name a within-run ratio or an interleaved A/B control, never a bare wall-clock comparison."
+tags:
+  - code-review
+  - performance
+  - rust
+bundles:
+  - https://github.com/ctxloom/ctxloom-default@bundles/code-review-base#fragments/conduct
+  - https://github.com/ctxloom/ctxloom-default@bundles/code-review-performance#fragments/general
+  - https://github.com/ctxloom/ctxloom-default@bundles/rust-development#fragments/rust

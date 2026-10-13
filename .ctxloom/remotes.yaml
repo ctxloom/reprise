@@ -1,0 +1,8 @@
+schema_version: 1
+remotes:
+    ctxloom-default:
+        name: ""
+        url: https://github.com/ctxloom/ctxloom-default
+    personal:
+        name: ""
+        url: https://github.com/benjaminabbitt/ctxloom-personal

@@ -1,0 +1,46 @@
+{
+  "instructions": [
+    ".opencode/ctxloom-context.md"
+  ],
+  "mcp": {
+    "ctxloom": {
+      "type": "local",
+      "command": [
+        "/home/babbitt/go/bin/ctxloom",
+        "mcp",
+        "serve"
+      ],
+      "enabled": true
+    },
+    "sequential-thinking": {
+      "type": "local",
+      "command": [
+        "npx",
+        "-y",
+        "@modelcontextprotocol/server-sequential-thinking"
+      ],
+      "enabled": true
+    },
+    "serena": {
+      "type": "local",
+      "command": [
+        "serena",
+        "start-mcp-server",
+        "--context",
+        "claude-code",
+        "--project-from-cwd",
+        "--open-web-dashboard",
+        "false"
+      ],
+      "enabled": true
+    },
+    "taskloom": {
+      "type": "local",
+      "command": [
+        "taskloom",
+        "mcp"
+      ],
+      "enabled": true
+    }
+  }
+}

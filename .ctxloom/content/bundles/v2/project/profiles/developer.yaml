@@ -1,0 +1,9 @@
+description: "Delegated implementer: the full working context plus escalation discipline. A coordinator spawns this via agent_run for work it does not do itself; the escalation fragment is what keeps a child from deciding a structural or interface change alone."
+tags:
+  - rust
+  - developer
+  - subagent
+parents:
+  - default
+bundles:
+  - https://github.com/ctxloom/ctxloom-default@bundles/agent-roles#fragments/developer-escalation

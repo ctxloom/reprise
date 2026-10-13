@@ -1,0 +1,13 @@
+description: "Reader / searcher: go find out and report back. Carries navigation (serena's LSP-backed symbol lookup) and domain vocabulary, and deliberately NOT the behavioural standards — a finder is not writing code, so linting and testing rules are dead weight in its context and dilute what it is for."
+tags:
+  - reader
+  - finder
+  - subagent
+# NO parent on `default` — that is the point. Inheriting the working profile
+# would drag in code-quality, testing and developer-mindset, none of which a
+# lookup agent acts on.
+bundles:
+  - https://github.com/ctxloom/ctxloom-default@bundles/agent-roles#fragments/finder
+  - https://github.com/benjaminabbitt/ctxloom-personal@bundles/serena
+  - https://github.com/benjaminabbitt/ctxloom-personal@bundles/decision-log
+  - https://github.com/benjaminabbitt/ctxloom-personal@bundles/working-context

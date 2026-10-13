@@ -22,7 +22,7 @@ Scan the current project and discover matching ctxloom content from configured r
   for what is already installed locally.
 - **Consumption is CLI and reference-only.** You author a local profile that
   references remote content (`ctxloom profile create <name> --parent <ref>` for a
-  remote profile, or `-b <ref>` for a bundle), then `ctxloom remote pull` fetches
+  remote profile, or `-b <ref>` for a bundle), then `ctxloom deps pull` fetches
   the referenced bundles/profiles and updates the lockfile.
 
 ## Steps
@@ -54,13 +54,13 @@ Scan the current project and discover matching ctxloom content from configured r
      (e.g. `ctxloom profile create go-dev --parent ctxloom-default/go-developer`)
    - Reference a remote bundle (or one fragment):
      `ctxloom profile create <name> -b <pull_ref>` (optionally `#fragments/<frag>`)
-   - Run `ctxloom remote pull` afterward so every bundle/profile a profile
+   - Run `ctxloom deps pull` afterward so every bundle/profile a profile
      references is fetched into the cache and the lockfile is updated.
    - To pin a specific content version, append a git tag or commit SHA to the
      ref with `@`: `ctxloom-default/go-developer@v1.2.0`. Unpinned refs track
      the remote's default branch.
    - Make a profile the default context by binding it into an agent and pointing
-     `default_agent` at it (`ctxloom agent set dev --profiles <name>` then
+     `default_agent` at it (`ctxloom agent create dev --profiles <name>` then
      `ctxloom agent default dev`), so a bare `ctxloom run` loads it automatically.
      An agent's profiles are a list; each may be a local name or a remote ref.
 
@@ -70,6 +70,6 @@ Scan the current project and discover matching ctxloom content from configured r
 2. Detect go.mod + Dockerfile -> `search_library` with `tag:golang`, then `tag:docker`
 3. Spot the `go-developer` profile and `go-ai-practices`/`container` bundles in the results
 4. Present matches grouped by remote, let the user choose
-5. `ctxloom profile create go-dev --parent ctxloom-default/go-developer`, then run `ctxloom remote pull`
+5. `ctxloom profile create go-dev --parent ctxloom-default/go-developer`, then run `ctxloom deps pull`
 
 If the user says "skip", acknowledge and let them know they can run `/discover` again later.

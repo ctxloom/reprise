@@ -1,0 +1,9 @@
+description: "Code review, structural lens (Rust). Single-lens member for an agent_run fan-out. The standing structural question here is the two-axis rule: converge the TOOLING aggressively (one algorithm over the shared IR, not a per-language copy), but treat cross-language BEHAVIOURAL convergence as best-effort and never force a universal vocabulary. Flag per-language reimplementations of a shared algorithm; equally, flag a new shared IR node that has not passed the recurrence x exact-equality gate."
+tags:
+  - code-review
+  - structural
+  - rust
+bundles:
+  - https://github.com/ctxloom/ctxloom-default@bundles/code-review-base#fragments/conduct
+  - https://github.com/ctxloom/ctxloom-default@bundles/code-review-structural#fragments/general
+  - https://github.com/ctxloom/ctxloom-default@bundles/rust-development#fragments/rust

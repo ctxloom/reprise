@@ -17,7 +17,6 @@
 
 # local agent/session tool state — never commit
 .claude/
-.ctxloom/
 .codex/
 .mcp.json
 .mcp.json.*

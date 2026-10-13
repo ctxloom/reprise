@@ -1,0 +1,9 @@
+description: "Code review, correctness lens (Rust). Single-lens member for an agent_run fan-out. In this codebase the sharp edges are offset/depth arithmetic in the near-tier verify cascade, the inliner's depth and size caps (the size cap is also the PRECISION guard), memo/cache invalidation, and anything whose failure shows up as a manufactured or missed clone rather than a crash."
+tags:
+  - code-review
+  - correctness
+  - rust
+bundles:
+  - https://github.com/ctxloom/ctxloom-default@bundles/code-review-base#fragments/conduct
+  - https://github.com/ctxloom/ctxloom-default@bundles/code-review-correctness#fragments/general
+  - https://github.com/ctxloom/ctxloom-default@bundles/rust-development#fragments/rust

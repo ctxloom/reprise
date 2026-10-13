@@ -1,0 +1,7 @@
+description: "Distiller: compress sessions and bundle content. Domain vocabulary so a summary reads in this project's own terms (landmark, near-tier, AU, SIMILARITY-IR, the measure-first rule) rather than generically. No behavioural guidance — instructions like \"write tests first\" distort a summariser rather than helping it."
+tags:
+  - distiller
+  - ctxloom-internal
+bundles:
+  - https://github.com/benjaminabbitt/ctxloom-personal@bundles/decision-log
+  - https://github.com/benjaminabbitt/ctxloom-personal@bundles/working-context

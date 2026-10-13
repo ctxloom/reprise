@@ -1,0 +1,40 @@
+description: "reprise working profile: the context a bare `ctxloom run` assembles. Parents the personal rust-developer composition (which itself carries the ctxloom-default conduct/sequential-thinking baseline, code-quality, core-practices, developer-mindset, rust-test-support-pattern, just and containers), then adds this project's own surface — Rust language practices, the tooling companions actually installed here (ltk, taskloom, reprise, serena), and the artifacts this repo is organised around (DECISIONS.md, the docs/ design corpus, .gitmodules, .versionator.yaml, .github/)."
+tags:
+  - default
+  - rust
+  - working
+# A LOCAL profile (owned and editable in this project's .ctxloom), not a bare
+# remote reference.
+#
+# The baseline is wired EXPLICITLY here, not inherited. rust-developer composes
+# `ctxloom-default@bundles/default` for it, but that aggregate does not resolve:
+# the fetcher looks for `.ctxloom/content/bundles/default.yaml` while the remote
+# stores bundles at `ctxloom/bundles/`, so the pull drops it and everything it
+# carried. sequential-thinking is therefore named directly below.
+#
+# `conduct` is NOT referenced because it DOES NOT EXIST upstream — zero files
+# match it anywhere in ctxloom-default at 62b6ed5, despite `search_library` and
+# the remote `contents` resource both advertising it. Those serve a stale index.
+# Re-add it here only after confirming the bundle is actually in the tree.
+parents:
+  - https://github.com/benjaminabbitt/ctxloom-personal@bundles/rust-development#profiles/rust-developer
+bundles:
+  # Baseline that the broken `default` aggregate was supposed to supply.
+  - https://github.com/ctxloom/ctxloom-default@bundles/sequential-thinking
+  # Language practices: rust-developer composes the personal side; the upstream
+  # practices bundle (fragments `rust` and `bacon`) is a separate pull.
+  - https://github.com/ctxloom/ctxloom-default@bundles/rust-development
+  # Tooling that is actually on PATH / wired in this project.
+  - https://github.com/ctxloom/ctxloom-default@bundles/ltk
+  - https://github.com/ctxloom/ctxloom-default@bundles/taskloom
+  - https://github.com/ctxloom/ctxloom-default@bundles/reprise
+  - https://github.com/benjaminabbitt/ctxloom-personal@bundles/serena
+  # Repo-shaped content, each matched to a file that exists here.
+  - https://github.com/ctxloom/ctxloom-default@bundles/versionator
+  - https://github.com/ctxloom/ctxloom-default@bundles/git-submodule
+  - https://github.com/benjaminabbitt/ctxloom-personal@bundles/github
+  - https://github.com/benjaminabbitt/ctxloom-personal@bundles/docs-authoring
+  - https://github.com/benjaminabbitt/ctxloom-personal@bundles/decision-log
+  - https://github.com/benjaminabbitt/ctxloom-personal@bundles/source-organization
+  - https://github.com/benjaminabbitt/ctxloom-personal@bundles/code-walkthrough
+  - https://github.com/benjaminabbitt/ctxloom-personal@bundles/working-context

@@ -4,16 +4,16 @@ description: "recover"
 ---
 
 
-Recover context from the session before the last `/clear`.
+Recover the context that `/clear` wiped from THIS session. `/clear` empties the
+context window but does not end the session — the work you are recovering still
+lives in the current session's still-growing transcript.
 
 ## Steps
 
-1. Use the ctxloom MCP tool "get_previous_session" to retrieve the previous session:
-   - ctxloom resolves the previous session for this project at read time from the
-     backend's transcript store (the most-recent session before the current one).
-     No process tracking is involved.
-   - If the session hasn't been distilled, it will be distilled on-the-fly
-   - Returns the distilled essence of the previous session
+1. Use the ctxloom MCP tool "recover_session" to retrieve the current session:
+   - ctxloom resolves the current (still-live) session at read time and
+     re-distills its still-growing transcript. No process tracking is involved.
+   - Returns the distilled essence of the current session.
 
 2. If successful (content is returned), review the restored context and summarize:
    - What was being worked on
@@ -23,5 +23,5 @@ Recover context from the session before the last `/clear`.
 
 3. Ask: "I've recovered context from before the clear. Ready to continue?"
 
-If no previous session is found:
-"No previous session found for this project."
+If nothing is recovered:
+"No recoverable context found for this session."

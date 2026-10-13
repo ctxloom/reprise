@@ -1,0 +1,9 @@
+description: "Code review, testing lens (Rust). Single-lens member for an agent_run fan-out. Two project-specific traps to hunt: a test pinned to the very data its model was fit to (the calibration-set tautology, which once hid a 5x error) and process-global state leaking between tests. An IR promotion needs its invariants written red-before-green on a REAL corpus — equivalent spellings converge AND genuinely different code stays distinct."
+tags:
+  - code-review
+  - testing
+  - rust
+bundles:
+  - https://github.com/ctxloom/ctxloom-default@bundles/code-review-base#fragments/conduct
+  - https://github.com/ctxloom/ctxloom-default@bundles/code-review-testing#fragments/general
+  - https://github.com/ctxloom/ctxloom-default@bundles/rust-development#fragments/rust

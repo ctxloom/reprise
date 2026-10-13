@@ -1,0 +1,9 @@
+description: "Code review, maintainability lens (Rust). Single-lens member for an agent_run fan-out. The project's first rule is instrument-first: where a mechanism's value is unmeasurable, the fix is a counter, not an argument. Flag any claim in a comment or doc that states a number without saying whether it was measured or estimated, and any mechanism added or kept with no counter that would reveal it doing nothing."
+tags:
+  - code-review
+  - maintainability
+  - rust
+bundles:
+  - https://github.com/ctxloom/ctxloom-default@bundles/code-review-base#fragments/conduct
+  - https://github.com/ctxloom/ctxloom-default@bundles/code-review-maintainability#fragments/general
+  - https://github.com/ctxloom/ctxloom-default@bundles/rust-development#fragments/rust

@@ -1,0 +1,75 @@
+agents:
+  coordinator:
+    llm: claude-design
+    profiles:
+      - default
+    runtime: host
+  cr-correctness:
+    llm: claude-code
+    profiles:
+      - cr-correctness
+    runtime: host
+  cr-maintainability:
+    llm: claude-code
+    profiles:
+      - cr-maintainability
+    runtime: host
+  cr-performance:
+    llm: claude-code
+    profiles:
+      - cr-performance
+    runtime: host
+  cr-structural:
+    llm: claude-code
+    profiles:
+      - cr-structural
+    runtime: host
+  cr-testing:
+    llm: claude-code
+    profiles:
+      - cr-testing
+    runtime: host
+  default:
+    llm: claude-code
+    profiles:
+      - default
+    runtime: host
+  developer:
+    llm: claude-code
+    profiles:
+      - developer
+    runtime: container-rootless
+  distiller:
+    llm: claude-fast
+    profiles:
+      - distiller
+    runtime: host
+  finder:
+    llm: claude-fast
+    profiles:
+      - reader
+    runtime: host
+  triage:
+    llm: claude-code
+    profiles:
+      - triage
+    runtime: host
+config:
+  use_distilled: true
+default_agent: coordinator
+dirty_tree_handler: commit
+llm:
+  configs:
+    claude-code:
+      model: claude-opus-4-8
+      type: claude-code
+    claude-design:
+      model: claude-fable-5
+      type: claude-code
+    claude-fast:
+      model: claude-haiku-4-5-20251001
+      type: claude-code
+  defaults:
+    fast: claude-fast
+    primary: claude-code
+schema_version: 7
